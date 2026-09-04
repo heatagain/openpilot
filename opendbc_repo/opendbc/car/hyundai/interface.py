@@ -47,6 +47,17 @@ class CarInterface(CarInterfaceBase):
     hda2 = hda2 or params.get_int("CanfdHDA2") > 0
     CAN = CanBus(None, fingerprint, hda2)
 
+    # Bosch already streams objects on the rewired radar/camera bus. Select one
+    # observed receive bus; Panda connector names must not be treated as src IDs.
+    # Prefer the current camera wiring, while supporting recorded src=1 wiring.
+    if candidate == CAR.HYUNDAI_ELANTRA and not ret.flags & HyundaiFlags.CANFD:
+      for bus in (CAN.CAM, CAN.ACAN):
+        if all(fingerprint.get(bus, {}).get(addr) == 8 for addr in range(0x601, 0x613)):
+          ret.extFlags |= HyundaiExtFlags.BOSCH_RADAR.value
+          if bus == CAN.ACAN:
+            ret.extFlags |= HyundaiExtFlags.BOSCH_RADAR_BUS1.value
+          break
+
     if ret.flags & HyundaiFlags.CANFD:
       # Shared configuration for CAN-FD cars
       ret.alphaLongitudinalAvailable = True #candidate not in (CANFD_UNSUPPORTED_LONGITUDINAL_CAR | CANFD_RADAR_SCC_CAR)
@@ -259,14 +270,15 @@ class CarInterface(CarInterfaceBase):
 
     Params().put_int('LongitudinalPersonalityMax', 4)
 
-    if CP.openpilotLongitudinalControl and not (CP.flags & HyundaiFlags.CANFD_CAMERA_SCC):
+    params = Params()
+    bosch_passive = bool(CP.extFlags & HyundaiExtFlags.BOSCH_RADAR) and params.get_int("EnableRadarTracks") > 0
+    if CP.openpilotLongitudinalControl and not (CP.flags & HyundaiFlags.CANFD_CAMERA_SCC) and not bosch_passive:
       addr, bus = 0x7d0, 0
       if CP.flags & HyundaiFlags.CANFD_HDA2.value:
         addr, bus = 0x730, CanBus(CP).ECAN
       disable_ecu(can_recv, can_send, bus=bus, addr=addr, com_cont_req=b'\x28\x83\x01')
 
-    params = Params()
-    if params.get_int("EnableRadarTracks") > 0 and not CP.flags & HyundaiFlags.CANFD:
+    if params.get_int("EnableRadarTracks") > 0 and not CP.flags & HyundaiFlags.CANFD and not bosch_passive:
       result = enable_radar_tracks(CP, can_recv, can_send)
       params.put_bool("EnableRadarTracksResult", result)
 

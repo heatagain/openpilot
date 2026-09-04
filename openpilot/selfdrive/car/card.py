@@ -76,7 +76,7 @@ class Car:
   def __init__(self, CI=None, RI=None) -> None:
     self.can_sock = messaging.sub_sock('can', timeout=20)
     self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents', 'carrotMan', 'longitudinalPlan',
-                                   'radarState', 'modelV2', 'drivingModelData', 'customReservedRawData0'])
+                                   'radarState', 'modelV2', 'drivingModelData', 'customReservedRawData0', 'livePose'])
     self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'liveTracks'])
 
     self.can_rcv_cum_timeout_counter = 0
@@ -237,6 +237,19 @@ class Car:
     if can_rcv_valid and REPLAY:
       self.can_log_mono_time = messaging.log_from_bytes(can_strs[0]).logMonoTime
 
+    if getattr(self.RI, 'bosch', None) is not None:
+      bosch_now_ns = sm_done_ns
+      if REPLAY:
+        # A drained CAN batch can span multiple log timestamps. Keep a Bosch
+        # receive clock at its newest packet without changing the control clock.
+        self.bosch_can_log_mono_time = max([getattr(self, 'bosch_can_log_mono_time', 0)] +
+                                          [timestamp_ns for timestamp_ns, _ in can_list])
+        bosch_now_ns = self.bosch_can_log_mono_time
+      self.RI.set_bosch_context(
+        bosch_now_ns,
+        self.sm['livePose'] if self.sm.valid['livePose'] else None, self.sm.logMonoTime['livePose'],
+        self.sm['modelV2'] if self.sm.valid['modelV2'] else None, self.sm.logMonoTime['modelV2'],
+      )
     RD: structs.RadarDataT | None = self.RI.update_carrot(CS.vEgo, CS.aEgo, rcv_time, can_list)
     radar_done_ns = time.monotonic_ns()
     #self.t2 = time.monotonic()
