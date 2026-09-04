@@ -462,6 +462,126 @@ def _bosch_advance(x: float, y: float, velocity: float, dt: float, yaw_rate: flo
   return c * x + s * y, -s * x + c * y
 
 
+def _bosch_raw_unique_component(rows, columns, row_edges, column_edges, unmatched_cost):
+  # Each real match replaces one birth and one miss, so maximizing the sum of
+  # (2*unmatched_cost - edge_cost) is exactly the augmented objective minus a
+  # constant. A unique real matching is independent of all dummy assignments.
+  reward = 2 * unmatched_cost
+  margin = 1e-12 * max(1.0, abs(reward)) * (len(rows) + len(columns) + 1)
+  if not math.isfinite(margin):
+    return None
+
+  # Distinct strict vertex-best choices attain the sum of independent upper
+  # bounds. This certifies the unique optimum, even in a large component.
+  for vertices, adjacency, transposed in ((rows, row_edges, False), (columns, column_edges, True)):
+    matching = {}
+    used = set()
+    for vertex in vertices:
+      best, second, partner = 0.0, -math.inf, None
+      for other, cost in adjacency[vertex]:
+        saving = reward - cost
+        if saving > best:
+          best, second, partner = saving, best, other
+        elif saving > second:
+          second = saving
+      if best - second <= margin or (partner is not None and partner in used):
+        break
+      if partner is not None:
+        used.add(partner)
+        if transposed:
+          matching[vertex] = partner
+        else:
+          matching[partner] = vertex
+    else:
+      return matching
+
+  # Exact bounded optional matching DP. Keep the runner-up, including equal
+  # optima; ambiguous or numerically indistinguishable results use the original
+  # full solver to retain that backend's deterministic tie behavior.
+  if min(len(rows), len(columns)) > 6 or max(len(rows), len(columns)) > 12:
+    return None
+  transposed = len(rows) < len(columns)
+  small, large = (rows, columns) if transposed else (columns, rows)
+  bits = {vertex: 1 << i for i, vertex in enumerate(small)}
+  adjacency = column_edges if transposed else row_edges
+  options = [[(bits[other], reward - cost,
+               (vertex, other) if transposed else (other, vertex))
+              for other, cost in adjacency[vertex]] for vertex in large]
+  memo = {}
+
+  def solve(index, occupied):
+    if index == len(options):
+      return 0.0, -math.inf, ()
+    key = (index, occupied)
+    cached = memo.get(key)
+    if cached is not None:
+      return cached
+    best, second, matching = solve(index + 1, occupied)
+    for bit, saving, pair in options[index]:
+      if occupied & bit:
+        continue
+      child_best, child_second, child_matching = solve(index + 1, occupied | bit)
+      candidate = saving + child_best
+      if candidate > best:
+        best, second, matching = candidate, best, (pair,) + child_matching
+      elif candidate > second:
+        second = candidate
+      runner_up = saving + child_second
+      if runner_up > second:
+        second = runner_up
+    result = (best, second, matching)
+    memo[key] = result
+    return result
+
+  best, second, matching = solve(0, 0)
+  return dict(matching) if best - second > margin else None
+
+
+def _bosch_raw_assignment(n, m, row_edges, column_edges, unmatched_cost):
+  components = []
+  visited_rows, visited_columns = set(), set()
+  for first in range(n):
+    if not row_edges[first] or first in visited_rows:
+      continue
+    rows, columns, pending = [], [], [first]
+    while pending:
+      vertex = pending.pop()
+      if vertex >= 0:
+        if vertex in visited_rows:
+          continue
+        visited_rows.add(vertex)
+        rows.append(vertex)
+        pending.extend(~column for column, _ in row_edges[vertex] if column not in visited_columns)
+      else:
+        column = ~vertex
+        if column in visited_columns:
+          continue
+        visited_columns.add(column)
+        columns.append(column)
+        pending.extend(row for row, _ in column_edges[column] if row not in visited_rows)
+    components.append((rows, columns))
+  largest = max((len(rows) + len(columns) for rows, columns in components), default=0)
+  assignment = {}
+  for rows, columns in components:
+    result = _bosch_raw_unique_component(rows, columns, row_edges, column_edges, unmatched_cost)
+    if result is None:
+      # Do not solve a tied component in isolation: dummy paths and global row
+      # order can affect SciPy/NumPy's chosen tie. Rebuild the exact old matrix.
+      costs = np.full((n + m, n + m), np.inf)
+      for row, edges in enumerate(row_edges):
+        costs[row, m + row] = unmatched_cost
+        for column, cost in edges:
+          costs[row, column] = cost
+      for column in range(m):
+        costs[n + column, column] = unmatched_cost
+      costs[n:, m:] = 0.0
+      ri, ci = bosch_linear_sum_assignment(costs)
+      assignment = {int(column): int(row) for row, column in zip(ri, ci) if row < n and column < m}
+      return assignment, len(components), largest, 0, True
+    assignment.update(result)
+  return assignment, len(components), largest, len(components), False
+
+
 class BoschRawTrackManager:
   """Optimal one-to-one association across all slots with internal coasting.
 
@@ -485,6 +605,10 @@ class BoschRawTrackManager:
     self.last_timestamp_ns: int | None = None
     self._update_count = 0
     self._states: dict[int, _BoschRawState] = {}
+    self.last_pair_possible = self.last_pair_candidates = 0
+    self.last_component_count = self.last_largest_component = 0
+    self.last_fast_components = 0
+    self.last_solver_fallback = False
     self.stats = {name: 0 for name in (
       "updates", "detections", "created", "deleted", "assignments",
       "cross_slot", "recovered", "coasted_track_scans", "max_active",
@@ -524,46 +648,81 @@ class BoschRawTrackManager:
           if timestamp_ns - state.last_seen_scan_ns <= coast_ns]
     expired_count = len(self._states) - len(retained)
     dt = 0.0 if self.last_timestamp_ns is None else (timestamp_ns - self.last_timestamp_ns) / 1e9
-    predicted = [_bosch_advance(state.x, state.y, state.track.v_rel, dt, yaw_rate) for state in retained]
-    observed = [_bosch_advance(point.d_rel, point.y_rel, point.v_rel,
-              (timestamp_ns - point.timestamp_ns) / 1e9, yaw_rate) for point in current]
+    angle = 0.0 if yaw_rate is None else yaw_rate * dt
+    cosine, sine = math.cos(angle), math.sin(angle)
+    predicted = []
+    for state in retained:
+      x = state.x + state.track.v_rel * dt
+      predicted.append((cosine * x + sine * state.y, -sine * x + cosine * state.y))
+    observed = []
+    rotations = {}
+    for point in current:
+      rotation = rotations.get(point.timestamp_ns)
+      if rotation is None:
+        sample_dt = (timestamp_ns - point.timestamp_ns) / 1e9
+        angle = 0.0 if yaw_rate is None else yaw_rate * sample_dt
+        rotation = (sample_dt, math.cos(angle), math.sin(angle))
+        rotations[point.timestamp_ns] = rotation
+      sample_dt, cosine, sine = rotation
+      x = point.d_rel + point.v_rel * sample_dt
+      observed.append((cosine * x + sine * point.y_rel, -sine * x + cosine * point.y_rel))
     n, m = len(retained), len(current)
-    # Explicit births and misses keep a feasible solution even if every real
-    # edge is forbidden. Never solve then discard ungated forced matches.
-    costs = np.full((n + m, n + m), np.inf)
-    pending_stats = {"gated_pairs": 0, "distance_rejections": 0, "speed_rejections": 0, "bearing_rejections": 0}
-    for row, (state, (pred_x, pred_y)) in enumerate(zip(retained, predicted)):
-      costs[row, m + row] = config.unmatched_cost
-      for col, (point, (obs_x, obs_y)) in enumerate(zip(current, observed)):
+    predicted_bearings = [math.atan2(y, x) for x, y in predicted]
+    observed_bearings = [math.atan2(y, x) for x, y in observed]
+    row_edges, column_edges = [[] for _ in range(n)], [[] for _ in range(m)]
+    distance_pairs = speed_rejections = bearing_rejections = gated_pairs = 0
+    order = sorted(range(m), key=lambda col: observed[col][0])
+    lower = upper = 0
+    window_gate = math.nextafter(config.distance_gate_m, math.inf)
+    for row in sorted(range(n), key=lambda row: predicted[row][0]):
+      state = retained[row]
+      pred_x = predicted[row][0]
+      # Cover values whose subtraction rounds onto the gate, including when
+      # pred_x - gate cancels to zero. The actual gate below stays unchanged.
+      minimum = math.nextafter(pred_x - window_gate, -math.inf)
+      maximum = math.nextafter(pred_x + window_gate, math.inf)
+      while lower < m and observed[order[lower]][0] < minimum:
+        lower += 1
+      upper = max(upper, lower)
+      while upper < m and observed[order[upper]][0] <= maximum:
+        upper += 1
+      for index in range(lower, upper):
+        col = order[index]
+        point = current[col]
+        obs_x = observed[col][0]
         delta_d = abs(obs_x - pred_x)
+        if delta_d > config.distance_gate_m:
+          continue
+        distance_pairs += 1
         delta_v = abs(point.v_rel - state.track.v_rel)
-        angle = math.atan2(obs_y, obs_x) - math.atan2(pred_y, pred_x)
+        if delta_v > config.speed_gate_mps:
+          speed_rejections += 1
+          continue
+        angle = observed_bearings[col] - predicted_bearings[row]
         delta_bearing = abs(math.atan2(math.sin(angle), math.cos(angle)))
         gate = config.bearing_gate_rad(max(0.0, min(pred_x, obs_x)))
-        if delta_d > config.distance_gate_m:
-          pending_stats["distance_rejections"] += 1
-        elif delta_v > config.speed_gate_mps:
-          pending_stats["speed_rejections"] += 1
-        elif delta_bearing > gate:
-          pending_stats["bearing_rejections"] += 1
+        if delta_bearing > gate:
+          bearing_rejections += 1
         else:
-          pending_stats["gated_pairs"] += 1
+          gated_pairs += 1
           cost = ((delta_d / config.distance_gate_m)**2 + (delta_v / config.speed_gate_mps)**2 + (delta_bearing / gate)**2) / 3
           if state.track.slot == point.slot:
             cost = max(0.0, cost - config.same_slot_bonus)
-          costs[row, col] = cost
-    for col in range(m):
-      costs[n + col, col] = config.unmatched_cost
-    costs[n:, m:] = 0.0
-    assignment = {}
-    if n + m:
-      rows, columns = bosch_linear_sum_assignment(costs)
-      assignment = {int(col): int(row) for row, col in zip(rows, columns) if row < n and col < m}
+          row_edges[row].append((col, cost))
+          column_edges[col].append((row, cost))
+    assignment, components, largest, fast_components, fallback = _bosch_raw_assignment(
+      n, m, row_edges, column_edges, config.unmatched_cost,
+    )
+    pending_stats = {"gated_pairs": gated_pairs, "distance_rejections": n * m - distance_pairs,
+                     "speed_rejections": speed_rejections, "bearing_rejections": bearing_rejections}
     births = m - len(assignment)
     if self.next_id + births - 1 > BOSCH_MAX_RAW_TRACK_ID:
       raise OverflowError("raw return Int32 ID space exhausted; IDs must not wrap or be reused")
 
     # Commit only after all validation and assignment have succeeded.
+    self.last_pair_possible, self.last_pair_candidates = n * m, distance_pairs
+    self.last_component_count, self.last_largest_component = components, largest
+    self.last_fast_components, self.last_solver_fallback = fast_components, fallback
     self._update_count += 1
     self._states = {}
     for state, (x, y) in zip(retained, predicted):
@@ -685,7 +844,26 @@ class BoschObjectGroupManager:
     self.pairs: dict[tuple[int, int], _BoschPairEvidence] = {}
     self.states: dict[int, _BoschPhysicalState] = {}
     self.stats = Counter()
-    self.last_diagnostics = []
+    self.last_pair_possible = self.last_pair_candidates = 0
+    self.last_conflicts = self.last_direct_carries = self.last_multi_count = 0
+
+  @property
+  def last_diagnostics(self):
+    # Research/debug consumers can request the old representation. Production
+    # needs neither per-pair dictionaries nor rejection strings each scan.
+    c = self.config
+    result = []
+    for key, evidence in sorted(self.pairs.items()):
+      samples = evidence.samples
+      if samples[-1][0] != self.now_ns:
+        continue
+      stable = (abs(samples[-1][1])-min(abs(s[1]) for s in samples) <= c.max_relative_distance_growth_m and
+                abs(samples[-1][2])-min(abs(s[2]) for s in samples) <= c.max_relative_lateral_growth_m)
+      mature = (len(samples) >= c.min_pair_observations and
+                (self.now_ns-samples[0][0])/1e9 + 1e-6 >= c.min_pair_span_s)
+      reason = 'relative_motion_drift' if not stable else ('geometry' if mature else 'insufficient_temporal_evidence')
+      result.append(dict(a=key[0], b=key[1], compatible=stable and mature, reason=reason))
+    return result
 
   def _geometry(self, a, b, v_ego):
     c = self.config
@@ -745,93 +923,157 @@ class BoschObjectGroupManager:
     raw_tracks = tuple(sorted(raw_tracks, key=lambda r: r.raw_track_id))
     self.now_ns = timestamp_ns
     c = self.config
+    coast_ns = round(c.coast_s * 1e9)
     for pid in list(self.states):
       state = self.states[pid]
-      if timestamp_ns - state.observation.timestamp_ns > round(c.coast_s * 1e9):
+      if timestamp_ns - state.observation.timestamp_ns > coast_ns:
         del self.states[pid]
         self.stats['deleted'] += 1
       else:
         state.member_last_seen = {rid: ns for rid, ns in state.member_last_seen.items()
-                     if timestamp_ns - ns <= round(c.coast_s * 1e9)}
+                     if timestamp_ns - ns <= coast_ns}
+
+    n = len(raw_tracks)
+    ids = [r.raw_track_id for r in raw_tracks]
+    distances = [r.d_rel for r in raw_tracks]
+    lateral = [r.y_rel for r in raw_tracks]
+    velocities = [r.v_rel for r in raw_tracks]
+    raw_index = {rid: i for i, rid in enumerate(ids)}
     for pair in list(self.pairs):
-      if timestamp_ns - self.pairs[pair].samples[-1][0] > c.evidence_window_s * 1e9:
+      i, j = raw_index.get(pair[0]), raw_index.get(pair[1])
+      # The old all-pairs loop cleared evidence immediately when two observed
+      # members failed distance. Preserve this even outside the new window.
+      if (timestamp_ns - self.pairs[pair].samples[-1][0] > c.evidence_window_s * 1e9 or
+          (i is not None and j is not None and abs(distances[i]-distances[j]) > c.distance_diameter_m)):
         del self.pairs[pair]
 
-    compatible = set()
-    self.last_diagnostics = []
-    for a, b in combinations(raw_tracks, 2):
-      key = (a.raw_track_id, b.raw_track_id)
-      geometry, reason = self._geometry(a, b, v_ego)
-      if not geometry:
-        self.pairs.pop(key, None)
-        self.stats['pair_rejected_' + reason] += 1
-        continue
-      evidence = self.pairs.setdefault(key, _BoschPairEvidence())
-      if evidence.samples and timestamp_ns - evidence.samples[-1][0] > c.pair_max_gap_s * 1e9:
-        evidence.samples.clear()
-      evidence.samples.append((timestamp_ns, a.d_rel-b.d_rel, a.y_rel-b.y_rel))
-      while timestamp_ns - evidence.samples[0][0] > c.evidence_window_s * 1e9:
-        evidence.samples.popleft()
-      ds = [s[1] for s in evidence.samples]
-      ys = [s[2] for s in evidence.samples]
-      # The segment15 flatbed's new return converges from 1.25m to .4m
-      # lateral separation. A max-minus-min history test split it because
-      # of OLD larger separation despite current geometry improving.
-      # Test widening from a recent minimum instead; complete-link still
-      # imposes the absolute d/y/v diameter on every current member pair.
-      stable = (abs(ds[-1])-min(abs(x) for x in ds) <= c.max_relative_distance_growth_m and
-           abs(ys[-1])-min(abs(x) for x in ys) <= c.max_relative_lateral_growth_m)
-      mature = (len(evidence.samples) >= c.min_pair_observations and
-           (timestamp_ns-evidence.samples[0][0])/1e9 + 1e-6 >= c.min_pair_span_s)
-      if stable and mature:
-        compatible.add(key)
-      else:
-        reason = 'relative_motion_drift' if not stable else 'insufficient_temporal_evidence'
-      self.last_diagnostics.append(dict(a=key[0], b=key[1], compatible=stable and mature, reason=reason))
+    compatible = [0] * n
+    pair_cost = [0.] * (n*n)
+    distance_order = sorted(range(n), key=distances.__getitem__)
+    ground_speeds = [abs(v+v_ego) for v in velocities] if math.isfinite(v_ego) else None
+    pair_candidates = lateral_rejections = velocity_rejections = motion_rejections = 0
+    for position, a in enumerate(distance_order):
+      for following in range(position+1, n):
+        b = distance_order[following]
+        if distances[b]-distances[a] > c.distance_diameter_m:
+          break
+        pair_candidates += 1
+        i, j = (a, b) if a < b else (b, a)
+        key = (ids[i], ids[j])
+        delta_d, delta_y = distances[i]-distances[j], lateral[i]-lateral[j]
+        delta_v = abs(velocities[i]-velocities[j])
+        if abs(delta_y) > c.lateral_diameter_m:
+          lateral_rejections += 1
+          self.pairs.pop(key, None)
+          continue
+        if delta_v > c.velocity_diameter_mps:
+          velocity_rejections += 1
+          self.pairs.pop(key, None)
+          continue
+        if (ground_speeds is not None and min(ground_speeds[i], ground_speeds[j]) <= c.stationary_speed_mps
+            and max(ground_speeds[i], ground_speeds[j]) >= c.moving_speed_mps):
+          motion_rejections += 1
+          self.pairs.pop(key, None)
+          continue
+        evidence = self.pairs.get(key)
+        if evidence is None:
+          evidence = self.pairs[key] = _BoschPairEvidence()
+        samples = evidence.samples
+        if samples and timestamp_ns - samples[-1][0] > c.pair_max_gap_s * 1e9:
+          samples.clear()
+        samples.append((timestamp_ns, delta_d, delta_y))
+        while timestamp_ns - samples[0][0] > c.evidence_window_s * 1e9:
+          samples.popleft()
+        # Widening from a recent minimum, not old larger converging separation.
+        stable = (abs(delta_d)-min(abs(s[1]) for s in samples) <= c.max_relative_distance_growth_m and
+                  abs(delta_y)-min(abs(s[2]) for s in samples) <= c.max_relative_lateral_growth_m)
+        mature = (len(samples) >= c.min_pair_observations and
+                  (timestamp_ns-samples[0][0])/1e9 + 1e-6 >= c.min_pair_span_s)
+        if stable and mature:
+          compatible[i] |= 1 << j
+          compatible[j] |= 1 << i
+          cost = abs(delta_d)/c.distance_diameter_m + abs(delta_y)/c.lateral_diameter_m + delta_v/c.velocity_diameter_mps
+          pair_cost[i*n+j] = pair_cost[j*n+i] = cost
+    self.last_pair_possible = n*(n-1)//2
+    self.last_pair_candidates = pair_candidates
+    self.stats['pair_rejected_distance_diameter'] += self.last_pair_possible-pair_candidates
+    self.stats['pair_rejected_lateral_diameter'] += lateral_rejections
+    self.stats['pair_rejected_velocity_diameter'] += velocity_rejections
+    self.stats['pair_rejected_stationary_moving_conflict'] += motion_rejections
 
     owner = {rid: pid for pid, state in self.states.items() for rid in state.member_last_seen}
-    clusters = [[r] for r in raw_tracks]
+    previous = sorted(self.states)
+    owner_bits = {pid: 1 << i for i, pid in enumerate(previous)}
+    clusters = [[i] for i in range(n)]
+    cluster_masks = [1 << i for i in range(n)]
+    cluster_compatible = [compatible[i] | cluster_masks[i] for i in range(n)]
+    cluster_owners = [owner_bits.get(owner.get(rid), 0) for rid in ids]
     while True:
-      choices = []
+      best = None
       for i, a in enumerate(clusters):
+        if not cluster_compatible[i] & ~cluster_masks[i]:
+          continue  # No compatible neighbor: singleton/group cannot merge.
         for j in range(i+1, len(clusters)):
           b = clusters[j]
           if len(a)+len(b) > c.max_members:
             continue
-          if not all(tuple(sorted((x.raw_track_id, y.raw_track_id))) in compatible for x in a for y in b):
+          if cluster_compatible[i] & cluster_masks[j] != cluster_masks[j]:
             continue
-          # Prefer existing membership; then the tightest complete-link pair.
-          continuity = any(owner.get(x.raw_track_id) is not None and owner.get(x.raw_track_id) == owner.get(y.raw_track_id)
-                  for x in a for y in b)
-          cost = max(abs(x.d_rel-y.d_rel)/c.distance_diameter_m +
-               abs(x.y_rel-y.y_rel)/c.lateral_diameter_m +
-               abs(x.v_rel-y.v_rel)/c.velocity_diameter_mps for x in a for y in b)
-          choices.append((not continuity, cost, i, j))
-      if not choices:
+          # Same complete-link cost and original cluster-index tie order.
+          cost = max(pair_cost[x*n+y] for x in a for y in b)
+          choice = (not (cluster_owners[i] & cluster_owners[j]), cost, i, j)
+          if best is None or choice < best:
+            best = choice
+      if best is None:
         break
-      _, _, i, j = min(choices)
+      _, _, i, j = best
       clusters[i] += clusters.pop(j)
+      cluster_masks[i] |= cluster_masks.pop(j)
+      cluster_compatible[i] &= cluster_compatible.pop(j)
+      cluster_owners[i] |= cluster_owners.pop(j)
 
-    previous = sorted(self.states)
     assigned = {}
+    self.last_conflicts = self.last_direct_carries = 0
     if previous and clusters:
-      # Only membership-supported physical associations are allowed. Raw
-      # tracking already handles cross-slot prediction/kinematic matching.
-      scores = np.zeros((len(clusters), len(previous)+len(clusters)))
-      for i, cluster in enumerate(clusters):
-        members = {m.raw_track_id for m in cluster}
-        for j, pid in enumerate(previous):
-          state = self.states[pid]
-          overlap = members.intersection(state.member_last_seen)
-          if overlap:
-            scores[i, j] = (10*len(overlap) +
-                    3*(state.observation.representative_raw_track_id in members) +
-                    min(state.observation.age_scans, 1000)*1e-5 + 1/(pid+1))
-      ri, ci = bosch_linear_sum_assignment(-scores)
-      assigned = {int(i): previous[int(j)] for i, j in zip(ri, ci) if j < len(previous) and scores[i, j] > 0}
+      # In a conflict-free graph every positive overlap edge must be selected;
+      # zero-score dummy assignments cannot affect an output identity. Keep
+      # the original whole solver on any merge/split, including its tie order.
+      claims = {}
+      ambiguous = set()
+      for i, mask in enumerate(cluster_owners):
+        if not mask:
+          continue
+        if mask & (mask-1):
+          ambiguous.add(i)
+        remaining = mask
+        while remaining:
+          bit = remaining & -remaining
+          if bit in claims:
+            ambiguous.update((i, claims[bit]))
+          else:
+            claims[bit] = i
+          remaining ^= bit
+      self.last_conflicts = len(ambiguous)
+      if not ambiguous:
+        assigned = {i: previous[mask.bit_length()-1] for i, mask in enumerate(cluster_owners) if mask}
+        self.last_direct_carries = len(assigned)
+      else:
+        scores = np.zeros((len(clusters), len(previous)+len(clusters)))
+        for i, cluster in enumerate(clusters):
+          members = {ids[k] for k in cluster}
+          for j, pid in enumerate(previous):
+            state = self.states[pid]
+            overlap = members.intersection(state.member_last_seen)
+            if overlap:
+              scores[i, j] = (10*len(overlap) +
+                      3*(state.observation.representative_raw_track_id in members) +
+                      min(state.observation.age_scans, 1000)*1e-5 + 1/(pid+1))
+        ri, ci = bosch_linear_sum_assignment(-scores)
+        assigned = {int(i): previous[int(j)] for i, j in zip(ri, ci) if j < len(previous) and scores[i, j] > 0}
 
     result = []
-    current_ids = {r.raw_track_id for r in raw_tracks}
+    current_ids = set(ids)
+    vision_supported = [self._vision_support(r, vision) for r in raw_tracks] if vision else [False] * n
     for i, cluster in enumerate(clusters):
       pid = assigned.get(i)
       old = self.states.get(pid)
@@ -841,31 +1083,35 @@ class BoschObjectGroupManager:
           raise OverflowError('physical Int32 ID space exhausted; no reuse')
         pid, self.next_id = self.next_id, self.next_id+1
         self.stats['created'] += 1
-      candidates = sorted(cluster, key=lambda m: m.raw_track_id)
+      candidates = [raw_tracks[k] for k in sorted(cluster)]
+      member_ids = {m.raw_track_id for m in candidates}
+      if prior and len(candidates) > 1:
+        dt = (timestamp_ns-prior.timestamp_ns)/1e9
+        angle = -(yaw_rate or 0.)*dt
+        dx = prior.d_rel + prior.v_rel*dt
+        ca, sa = math.cos(angle), math.sin(angle)
+        px = dx*ca-prior.y_rel*sa
+        py = dx*sa+prior.y_rel*ca
+      elif not prior and len(candidates) > 1:
+        median = float(np.median([m.d_rel for m in candidates]))
       def representative_cost(m):
         if prior:
-          dt = (timestamp_ns-prior.timestamp_ns)/1e9
-          angle = -(yaw_rate or 0.)*dt
-          dx = prior.d_rel + prior.v_rel*dt
-          px = dx*math.cos(angle)-prior.y_rel*math.sin(angle)
-          py = dx*math.sin(angle)+prior.y_rel*math.cos(angle)
           continuity = abs(m.d_rel-px) + .5*abs(m.y_rel-py) + .5*abs(m.v_rel-prior.v_rel)
           # Observed state wins over OEM changes; these are only ties.
           return (continuity, m.raw_track_id != prior.representative_raw_track_id,
-              not self._vision_support(m, vision), m.slot != oem_slot, -m.age_scans, m.raw_track_id)
+              not vision_supported[raw_index[m.raw_track_id]], m.slot != oem_slot, -m.age_scans, m.raw_track_id)
         # Initially prefer a robust actual member near the group median.
-        median = float(np.median([x.d_rel for x in candidates]))
-        return (abs(m.d_rel-median), False, not self._vision_support(m, vision), m.slot != oem_slot, -m.age_scans, m.raw_track_id)
-      rep = min(candidates, key=representative_cost)
+        return (abs(m.d_rel-median), False, not vision_supported[raw_index[m.raw_track_id]], m.slot != oem_slot, -m.age_scans, m.raw_track_id)
+      rep = candidates[0] if len(candidates) == 1 else min(candidates, key=representative_cost)
       obj = BoschPhysicalObject(pid, timestamp_ns, tuple(candidates), rep.raw_track_id,
                 rep.d_rel, rep.y_rel, rep.v_rel, any(m.slot == oem_slot for m in candidates),
-                any(self._vision_support(m, vision) for m in candidates),
+                any(vision_supported[k] for k in cluster),
                 (prior.age_scans+1 if prior else 1),
                 'temporal_complete_link' if len(candidates)>1 else 'single_return')
       last_seen = dict(old.member_last_seen) if old else {}
       # A raw member currently assigned elsewhere cannot belong to this ID.
       for rid in list(last_seen):
-        if rid in current_ids and rid not in {m.raw_track_id for m in candidates}:
+        if rid in current_ids and rid not in member_ids:
           del last_seen[rid]
       last_seen.update({m.raw_track_id: timestamp_ns for m in candidates})
       self.states[pid] = _BoschPhysicalState(obj, last_seen)
@@ -894,6 +1140,7 @@ class BoschObjectGroupManager:
         self.stats['absorbed'] += 1
     self.stats['scans'] += 1
     self.stats['output_objects'] += len(result)
+    self.last_multi_count = sum(len(obj.members) > 1 for obj in result)
     return tuple(sorted(result, key=lambda obj: obj.physical_track_id))
 
 
@@ -903,9 +1150,69 @@ class BoschPhysicalTracker:
     self.group_manager = BoschObjectGroupManager(group_config)
 
   def update(self, timestamp_ns, detections, *, yaw_rate=None, v_ego=math.nan, oem_slot=None, vision=()):
+    start_ns = time.perf_counter_ns()
     raw = self.raw_manager.update(timestamp_ns, detections, yaw_rate=yaw_rate)
-    return self.group_manager.update(timestamp_ns, raw, yaw_rate=yaw_rate, v_ego=v_ego,
-                    oem_slot=oem_slot, vision=vision)
+    raw_done_ns = time.perf_counter_ns()
+    result = self.group_manager.update(timestamp_ns, raw, yaw_rate=yaw_rate, v_ego=v_ego,
+                                      oem_slot=oem_slot, vision=vision)
+    self.raw_elapsed_ns = raw_done_ns - start_ns
+    self.physical_elapsed_ns = time.perf_counter_ns() - raw_done_ns
+    return result
+
+
+class _BoschStaticOffPathFilter:
+  """Stateless publication subset; raw/physical tracking remains untouched."""
+  def __init__(self):
+    from openpilot.selfdrive.carrot.radar_motion.predictor import model_path_y
+    self._path_y = model_path_y
+
+  def update(self, objects, timestamp_ns, v_ego, path=()):
+    # Provider supplies only causal, fresh paths. Unknown context is fail-open.
+    if (not math.isfinite(v_ego) or len(path) < 2
+        or not all(math.isfinite(x) and math.isfinite(y) for x, y in path)
+        or not all(path[i][0] < path[i + 1][0] for i in range(len(path) - 1))):
+      return objects
+    kept = []
+    for obj in objects:
+      speed = abs(obj.v_rel + v_ego)  # Representative velocity, not member votes.
+      if (obj.oem_selected or obj.vision_supported or not math.isfinite(speed)
+          or speed > 0.6  # Includes uncertain 0.6–1.4 m/s and moving objects.
+          or not path[0][0] <= obj.d_rel <= path[-1][0]):
+        kept.append(obj)
+        continue
+      offset = obj.y_rel - self._path_y(path, obj.d_rel)
+      if not math.isfinite(offset) or abs(offset) <= 3.0:
+        kept.append(obj)
+    return objects if len(kept) == len(objects) else tuple(kept)
+
+
+def bosch_fill_point(point, obj, v_ego):
+  point.trackId = obj.physical_track_id
+  point.dRel, point.yRel, point.vRel = obj.d_rel, obj.y_rel, obj.v_rel
+  point.aRel = point.yvRel = point.aLead = point.jLead = math.nan
+  point.vLead = v_ego + obj.v_rel
+  point.radarSource = 'frontRadar'
+  point.trackState = 0
+  point.measured = True
+
+
+def bosch_append_points(radar, objects, v_ego, now_ns):
+  """Append directly to the final native list, retaining SCC aliasing safety."""
+  if not objects:
+    return
+  previous = [point.to_dict() for point in radar.points]
+  offset = len(previous)
+  points = radar.init('points', offset + len(objects))
+  for index, values in enumerate(previous):
+    points[index] = values
+  for index, obj in enumerate(objects, offset):
+    point = points[index]
+    bosch_fill_point(point, obj, v_ego)
+    representative = next(member for member in obj.members if member.raw_track_id == obj.representative_raw_track_id)
+    # Read the native Float32 fields before projection, exactly as the original
+    # temporary RadarData path did. This also preserves rounding for test inputs.
+    age_s = (now_ns - representative.timestamp_ns) * 1e-9
+    point.dRel += point.vRel * age_s
 
 
 def bosch_to_native_radar_data(objects: Sequence[BoschPhysicalObject], timestamp_ns: int, *, v_ego=math.nan,
@@ -927,13 +1234,7 @@ def bosch_to_native_radar_data(objects: Sequence[BoschPhysicalObject], timestamp
   radar.errors.canError = not complete
   radar.errors.wrongConfig = unsupported
   for p, obj in zip(radar.init('points', len(objects)), objects):
-    p.trackId = obj.physical_track_id
-    p.dRel, p.yRel, p.vRel = obj.d_rel, obj.y_rel, obj.v_rel
-    p.aRel = p.yvRel = p.aLead = p.jLead = math.nan
-    p.vLead = v_ego+obj.v_rel
-    p.radarSource = 'frontRadar'
-    p.trackState = 0
-    p.measured = True
+    bosch_fill_point(p, obj, v_ego)
   return radar
 
 
@@ -974,14 +1275,22 @@ def bosch_make_points(objects, v_ego=math.nan):
 
 
 class BoschRadarProvider:
-  def __init__(self, bus: int):
+  def __init__(self, bus: int, *, qualification=True):
     self.bus = bus
     self.tracker = BoschPhysicalTracker()
+    self.qualifier = _BoschStaticOffPathFilter() if qualification else None
     self.can_error = False
     self.wrong_config = False
     self.last_scan_timestamp_ns = None
-    self.debug_snapshot = {}
-    self.slot_to_ids = {}
+    self._debug_objects = ()
+    self._debug_phase_ns = None
+    self._debug_closed_ns = None
+    self._debug_tick = None
+    self._debug_complete = False
+    self._debug_oem_word = None
+    self._debug_oem_slot = None
+    self._debug_oem_matches = 0
+    self._debug_timeout = False
     self._frames = []
     self._anchors = []
     self._order = 0
@@ -990,8 +1299,88 @@ class BoschRadarProvider:
     self._last_closed_anchor_ns = None
     self._last_output_ns = None
     self._pending_error = False
+    self._perf_raw = self._perf_qualified = 0
+    self._reset_perf()
 
-  def update(self, can_packets, now_ns: int, v_ego: float, yaw_rate_left=None, vision=()):
+  def _reset_perf(self):
+    self._perf_scans = 0
+    self._perf_raw_sum = self._perf_raw_max = 0
+    self._perf_physical_sum = self._perf_physical_max = 0
+    self._perf_qualify_sum = self._perf_qualify_max = 0
+    self._perf_total_sum = self._perf_total_max = 0
+    self._perf_native_count = self._perf_native_sum = self._perf_native_max = 0
+    self._perf_raw_pairs = self._perf_raw_possible = 0
+    self._perf_physical_pairs = self._perf_physical_possible = 0
+    self._perf_components = self._perf_largest_component = self._perf_fallbacks = self._perf_conflicts = 0
+
+  def record_native_time(self, elapsed_ns):
+    self._perf_native_count += 1
+    self._perf_native_sum += elapsed_ns
+    self._perf_native_max = max(self._perf_native_max, elapsed_ns)
+
+  def perf_message(self):
+    """Format/reset only at the 1 Hz logging boundary, never once per scan.
+
+    total is decode + tracking + qualification per completed scan. Native list
+    append is measured separately at its publication cadence. This excludes
+    other card work, log I/O and modeld; it is not a whole-device CPU estimate.
+    Pair/component/conflict values are interval totals, object counts are last.
+    """
+    scale = 1e-6 / max(self._perf_scans, 1)
+    raw = self.tracker.raw_manager
+    physical = self.tracker.group_manager
+    backend = 'numpy' if bosch_linear_sum_assignment is bosch_numpy_linear_sum_assignment else 'scipy'
+    message = (
+      f'BoschPerf solver={backend} scans={self._perf_scans} raw={self._perf_raw} raw_active={raw.active_count} '
+      f'physical={len(self._debug_objects)} qualified={self._perf_qualified} '
+      f'suppressed={len(self._debug_objects) - self._perf_qualified} '
+      f'multi={physical.last_multi_count} '
+      f'pairs_raw={self._perf_raw_pairs}/{self._perf_raw_possible} '
+      f'pairs_physical={self._perf_physical_pairs}/{self._perf_physical_possible} '
+      f'raw_ms_avg={self._perf_raw_sum * scale:.3f} raw_ms_max={self._perf_raw_max * 1e-6:.3f} '
+      f'physical_ms_avg={self._perf_physical_sum * scale:.3f} physical_ms_max={self._perf_physical_max * 1e-6:.3f} '
+      f'qualify_ms_avg={self._perf_qualify_sum * scale:.3f} qualify_ms_max={self._perf_qualify_max * 1e-6:.3f} '
+      f'total_ms_avg={self._perf_total_sum * scale:.3f} total_ms_max={self._perf_total_max * 1e-6:.3f} '
+      f'native_ms_avg={self._perf_native_sum * 1e-6 / max(self._perf_native_count, 1):.3f} '
+      f'native_ms_max={self._perf_native_max * 1e-6:.3f} '
+      f'raw_components={self._perf_components} largest_raw_component={self._perf_largest_component} '
+      f'raw_fallbacks={self._perf_fallbacks} physical_conflicts={self._perf_conflicts} '
+      f'can_error={int(self.can_error)}'
+    )
+    self._reset_perf()
+    return message
+
+  @property
+  def slot_to_ids(self):
+    return {member.slot: (member.raw_track_id, obj.physical_track_id)
+            for obj in self._debug_objects for member in obj.members}
+
+  @property
+  def debug_snapshot(self):
+    # The production caller logs at 1 Hz; no nested representation is built on
+    # the 10 Hz scan path. Replay can still request the full mapping explicitly.
+    if self._debug_timeout:
+      return {'bus': self.bus, 'timeout': True, 'last_scan_timestamp_ns': self.last_scan_timestamp_ns,
+              'objects': [], 'slot_to_ids': {}}
+    if self._debug_phase_ns is None:
+      return {}
+    return {
+      'bus': self.bus, 'phase_ns': self._debug_phase_ns, 'scan_timestamp_ns': self.last_scan_timestamp_ns,
+      'closed_ns': self._debug_closed_ns, 'tick': self._debug_tick, 'complete': self._debug_complete,
+      'can_error': self.can_error, 'wrong_config': self.wrong_config,
+      'oem_word': self._debug_oem_word, 'oem_selected_slot': self._debug_oem_slot,
+      'oem_match_count': self._debug_oem_matches, 'slot_to_ids': self.slot_to_ids,
+      'objects': [{'physicalTrackId': obj.physical_track_id,
+                   'rawTrackIds': [member.raw_track_id for member in obj.members],
+                   'slots': list(obj.member_slots),
+                   'measurement_ns': [member.timestamp_ns for member in obj.members],
+                   'representative_rawTrackId': obj.representative_raw_track_id,
+                   'representative_slot': next(member.slot for member in obj.members
+                                               if member.raw_track_id == obj.representative_raw_track_id),
+                   'oem_selected': obj.oem_selected} for obj in self._debug_objects],
+    }
+
+  def update(self, can_packets, now_ns: int, v_ego: float, yaw_rate_left=None, vision=(), *, path=(), path_ns=None):
     """Consume (receive_ns, [(address, payload, src), ...]) CAN packets.
 
     Return None when no window has closed, otherwise only freshly observed
@@ -1025,13 +1414,15 @@ class BoschRadarProvider:
         else:
           self._frames.append(_BoschCanFrame(timestamp_ns, address, payload, self._order))
           self._order += 1
-    self._anchors.sort()
+    if len(self._anchors) > 1:
+      self._anchors.sort()
     output = None
     while self._anchors and self._anchors[0][0] + BOSCH_WINDOW_NS <= now_ns:
       phase_ns, tick = self._anchors[0]
       assigned, retained = [], []
       for frame in self._frames:
-        closest = min(self._anchors, key=lambda anchor: abs(anchor[0] - frame.timestamp_ns))[0]
+        closest = (phase_ns if len(self._anchors) == 1 else
+                   min(self._anchors, key=lambda anchor: abs(anchor[0] - frame.timestamp_ns))[0])
         if closest == phase_ns and abs(phase_ns - frame.timestamp_ns) <= BOSCH_WINDOW_NS:
           assigned.append(frame)
         else:
@@ -1039,24 +1430,30 @@ class BoschRadarProvider:
       self._frames = retained
       self._anchors.pop(0)
       self._last_closed_anchor_ns = phase_ns
-      output = self._finish_scan(phase_ns, tick, assigned, v_ego, yaw_rate_left, vision)
+      # Context must be fresh at receipt and close to this particular scan, also
+      # when a batch closes several old windows. No path extrapolation in time.
+      scan_path = path if (path_ns is not None and 0 <= now_ns - path_ns <= 200_000_000
+                           and phase_ns - 200_000_000 <= path_ns <= phase_ns + BOSCH_WINDOW_NS) else ()
+      output = self._finish_scan(phase_ns, tick, assigned, v_ego, yaw_rate_left, vision, scan_path)
       self._last_output_ns = now_ns
 
     # Preserve the pre-anchor half-window. Pending future anchors may already
     # own older frames when update() receives a large batch.
-    oldest = min([now_ns] + [ns for ns, _ in self._anchors]) - BOSCH_WINDOW_NS
-    self._frames = [frame for frame in self._frames if frame.timestamp_ns >= oldest]
+    oldest = (self._anchors[0][0] if self._anchors else now_ns) - BOSCH_WINDOW_NS
+    if self._frames:
+      self._frames = [frame for frame in self._frames if frame.timestamp_ns >= oldest]
     since = self.last_scan_timestamp_ns if self.last_scan_timestamp_ns is not None else self._start_ns
     if now_ns - since >= BOSCH_STALE_NS and (output is not None or self._last_output_ns is None or now_ns - self._last_output_ns >= BOSCH_OUTPUT_INTERVAL_NS):
       self.can_error = True
-      self.slot_to_ids = {}
-      self.debug_snapshot = {'bus': self.bus, 'timeout': True, 'last_scan_timestamp_ns': self.last_scan_timestamp_ns,
-                             'objects': [], 'slot_to_ids': {}}
+      self._debug_objects = ()
+      self._debug_timeout = True
+      self._perf_raw = self._perf_qualified = 0
       self._last_output_ns = now_ns
       return ()
     return output
 
-  def _finish_scan(self, phase_ns, tick, frames, v_ego, yaw_rate_left, vision):
+  def _finish_scan(self, phase_ns, tick, frames, v_ego, yaw_rate_left, vision, path=()):
+    start_ns = time.perf_counter_ns()
     bucket = {}
     malformed = self._pending_error or any(len(frame.payload) != 8 for frame in frames)
     self._pending_error = False
@@ -1084,7 +1481,8 @@ class BoschRadarProvider:
     if previous_ns is not None:
       if availability_ns <= previous_ns:
         self.can_error = True
-        self.slot_to_ids = {}
+        self._debug_objects = ()
+        self._perf_raw = self._perf_qualified = 0
         return ()
       fresh = [detection for detection in detections if detection.timestamp_ns > previous_ns]
       malformed |= len(fresh) != len(detections)
@@ -1098,22 +1496,39 @@ class BoschRadarProvider:
     self.last_scan_timestamp_ns = availability_ns
     self.can_error = not complete or malformed or unsupported
     self.wrong_config = unsupported
-    self.slot_to_ids = {member.slot: (member.raw_track_id, obj.physical_track_id) for obj in objects for member in obj.members}
-    self.debug_snapshot = {
-      'bus': self.bus, 'phase_ns': phase_ns, 'scan_timestamp_ns': availability_ns,
-      'closed_ns': self._last_now_ns, 'tick': tick, 'complete': complete,
-      'can_error': self.can_error, 'wrong_config': self.wrong_config,
-      'oem_word': oem_word, 'oem_selected_slot': oem_slot, 'oem_match_count': len(matches),
-      'slot_to_ids': self.slot_to_ids,
-      'objects': [{'physicalTrackId': obj.physical_track_id,
-                   'rawTrackIds': [member.raw_track_id for member in obj.members],
-                   'slots': list(obj.member_slots),
-                   'measurement_ns': [member.timestamp_ns for member in obj.members],
-                   'representative_rawTrackId': obj.representative_raw_track_id,
-                   'representative_slot': next(member.slot for member in obj.members if member.raw_track_id == obj.representative_raw_track_id),
-                   'oem_selected': obj.oem_selected} for obj in objects],
-    }
-    return objects
+    self._debug_objects = objects
+    self._debug_phase_ns = phase_ns
+    self._debug_closed_ns = self._last_now_ns
+    self._debug_tick = tick
+    self._debug_complete = complete
+    self._debug_oem_word = oem_word
+    self._debug_oem_slot = oem_slot
+    self._debug_oem_matches = len(matches)
+    self._debug_timeout = False
+    qualify_start_ns = time.perf_counter_ns()
+    qualified = self.qualifier.update(objects, availability_ns, v_ego, path) if self.qualifier is not None else objects
+    done_ns = time.perf_counter_ns()
+    qualify_ns, total_ns = done_ns - qualify_start_ns, done_ns - start_ns
+    raw, physical = self.tracker.raw_manager, self.tracker.group_manager
+    self._perf_scans += 1
+    self._perf_raw, self._perf_qualified = len(detections), len(qualified)
+    self._perf_raw_sum += self.tracker.raw_elapsed_ns
+    self._perf_raw_max = max(self._perf_raw_max, self.tracker.raw_elapsed_ns)
+    self._perf_physical_sum += self.tracker.physical_elapsed_ns
+    self._perf_physical_max = max(self._perf_physical_max, self.tracker.physical_elapsed_ns)
+    self._perf_qualify_sum += qualify_ns
+    self._perf_qualify_max = max(self._perf_qualify_max, qualify_ns)
+    self._perf_total_sum += total_ns
+    self._perf_total_max = max(self._perf_total_max, total_ns)
+    self._perf_raw_pairs += raw.last_pair_candidates
+    self._perf_raw_possible += raw.last_pair_possible
+    self._perf_physical_pairs += physical.last_pair_candidates
+    self._perf_physical_possible += physical.last_pair_possible
+    self._perf_components += raw.last_component_count
+    self._perf_largest_component = max(self._perf_largest_component, raw.last_largest_component)
+    self._perf_fallbacks += int(raw.last_solver_fallback)
+    self._perf_conflicts += physical.last_conflicts
+    return qualified
 
 # End Bosch MRRevo14F passive radar
 
@@ -1153,6 +1568,8 @@ class RadarInterface(RadarInterfaceBase):
     self._bosch_now_ns = 0
     self._bosch_debug_ns = 0
     self._bosch_context = None
+    self._bosch_path_ns = None
+    self._bosch_path = ()
     if self.radar_tracks and CP.extFlags & HyundaiExtFlags.BOSCH_RADAR:
       CAN = CanBus(CP)
       bus = CAN.ACAN if CP.extFlags & HyundaiExtFlags.BOSCH_RADAR_BUS1 else CAN.CAM
@@ -1260,12 +1677,19 @@ class RadarInterface(RadarInterfaceBase):
         pose.inputsOK and pose.sensorsOK and angular is not None and angular.valid and math.isfinite(angular.z)):
       yaw = -float(angular.z)
     cues = ()
-    if model is not None and 0 <= now_ns - model_ns <= 200_000_000 and model.leadsV3:
-      lead = model.leadsV3[0]
-      if lead.x and lead.y:
-        # Same model-to-radar coordinates as the existing primary matcher.
-        cues = (BoschVisionCue(float(lead.x[0]) - 1.52, -float(lead.y[0]), float(lead.prob)),)
-    self._bosch_context = (int(now_ns), yaw, cues)
+    path = ()
+    if model is not None and 0 <= now_ns - model_ns <= 200_000_000:
+      if model.leadsV3:
+        lead = model.leadsV3[0]
+        if lead.x and lead.y:
+          # Same model-to-radar coordinates as the existing primary matcher.
+          cues = (BoschVisionCue(float(lead.x[0]) - 1.52, -float(lead.y[0]), float(lead.prob)),)
+      if self._bosch_path_ns != model_ns:
+        position = getattr(model, 'position', None)
+        self._bosch_path = tuple(zip(position.x, position.y)) if position is not None else ()
+        self._bosch_path_ns = model_ns
+      path = self._bosch_path
+    self._bosch_context = (int(now_ns), yaw, cues, path, model_ns)
 
   def update_carrot(self, v_ego, a_ego, rcv_time, can_packets):
     # Keep the legacy SCC/corner MyTrack processing intact. Bosch objects are
@@ -1274,19 +1698,10 @@ class RadarInterface(RadarInterfaceBase):
     ret = super().update_carrot(v_ego, a_ego, rcv_time, can_packets)
     if ret is not None and self.bosch is not None:
       scan_ns = self.bosch.last_scan_timestamp_ns
-      points = []
       if scan_ns is not None and 0 <= self._bosch_now_ns - scan_ns <= BOSCH_SAMPLE_HOLD_NS:
-        points = self._bosch_make_points(self._bosch_objects, self.v_ego)
-        # liveTracks timestamps this publication. Align the latest 10 Hz
-        # observation to the preserved 20 Hz SCC cadence, just as DPath aligns
-        # a received scan to a model frame. Do not invent lateral dynamics.
-        for point, obj in zip(points, self._bosch_objects):
-          representative = next(member for member in obj.members if member.raw_track_id == obj.representative_raw_track_id)
-          age_s = (self._bosch_now_ns - representative.timestamp_ns) * 1e-9
-          point.dRel += point.vRel * age_s
-      # Snapshot before replacing the Cap'n Proto list: its existing builders
-      # otherwise alias the storage being replaced, corrupting SCC points.
-      ret.points = [point.to_dict() for point in ret.points] + [point.to_dict() for point in points]
+        start_ns = time.perf_counter_ns()
+        bosch_append_points(ret, self._bosch_objects, self.v_ego, self._bosch_now_ns)
+        self.bosch.record_native_time(time.perf_counter_ns() - start_ns)
     return ret
 
   def update(self, can_strings):
@@ -1300,16 +1715,16 @@ class RadarInterface(RadarInterfaceBase):
 
     track_ready = False
     if self.bosch is not None:
-      now_ns, yaw, cues = self._bosch_context or (time.monotonic_ns(), None, ())
+      now_ns, yaw, cues, path, path_ns = self._bosch_context or (time.monotonic_ns(), None, (), (), None)
       self._bosch_now_ns = now_ns
       self._bosch_context = None
       objects = self.bosch.update(can_strings, now_ns=now_ns, v_ego=self.v_ego,
-                                  yaw_rate_left=yaw, vision=cues)
+                                  yaw_rate_left=yaw, vision=cues, path=path, path_ns=path_ns)
       if objects is not None:
         self._bosch_objects = objects
         track_ready = True
         if now_ns - self._bosch_debug_ns >= 1_000_000_000:
-          carlog.info("BoschRadar %s", self.bosch.debug_snapshot)
+          carlog.info(self.bosch.perf_message())
           self._bosch_debug_ns = now_ns
     if self.radar_tracks and self.rcp_tracks is not None:
       vls_t = self.rcp_tracks.update(can_strings)
