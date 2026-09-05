@@ -174,7 +174,7 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 
 `TrafficLightDetectMode`는 `0` 미사용, `1` 정지만 감지, `2` 정지와 출발을 모두 감지합니다. 모델 판단에 의존하므로 운전자가 항상 직접 확인해야 합니다.
 
-### 크루즈·차간 — 31개
+### 크루즈·차간 — 전체 31개, 현대·기아·제네시스 28개
 
 아래 표의 **세부 구역 제목을 누르면** 실제 코드 기준의 계산 방식, 값의 방향과 주의사항을 설명한 페이지로 이동합니다.
 
@@ -183,7 +183,7 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 | [가속 성향·드라이브 모드](cruise-gap.md#driving-mode) | `MyDrivingMode`, `MyDrivingModeAuto` | 연비, 안전, 일반, 고속 모드와 자동 전환 |
 | [가속 성향·속도별 가속값](cruise-gap.md#acceleration-table) | `CruiseMaxVals0`, `CruiseMaxVals1`, `CruiseMaxVals2`, `CruiseMaxVals3`, `CruiseMaxVals4`, `CruiseMaxVals5`, `CruiseMaxVals6` | 속도 구간별 최대 가속 성향 |
 | [정차·재출발](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `VEgoStopping`, `AChangeCostStarting` | 정지 위치, 정지 진입과 재출발 특성 |
-| [가감속 튜닝](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | 기본 Kp/Ki/Kf `100/0/100`과 차량 반응 지연 |
+| [가감속 튜닝](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | 현기차는 Kp/Ki/Kf `100/0/100` 고정·숨김, 다른 브랜드는 조정 가능 |
 | [차간거리](cruise-gap.md#following-gap) | `TFollowGap1`, `TFollowGap2`, `TFollowGap3`, `TFollowGap4`, `DynamicTFollow`, `DynamicTFollowLC`, `EnableSpeedTF`, `TFollowDecelBoost` | 차간 단계별 시간, 동적 차간과 감속 여유 |
 | [선행차 반응](cruise-gap.md#lead-response) | `LeadAccelResponse`, `JLeadFactor3`, `RadarReactionFactor` | TF1 앞차 가속과 선행차 변화에 대한 반응 특성 |
 | [당근 크루즈](cruise-gap.md#carrot-cruise) | `CruiseEcoControl`, `CarrotCruiseDecel`, `CarrotCruiseAtcDecel` | 연비 제어와 당근 크루즈 감속 특성 |
@@ -192,9 +192,9 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 
 `TFollowGap1`~`TFollowGap4`는 저장값에 `0.01초`를 곱한 시간 간격입니다. 값을 줄이면 선행차와 가까워집니다. `DynamicTFollow` 관련 기능은 고정 차간에서 기준 동작을 확인한 다음 적용하세요.
 
-`LeadAccelResponse`는 차간 1단계에서만 앞차의 출발·가속을 따라가는 민첩성을 0~5단계로 조절합니다. 1~2단계는 완화형입니다. 안정된 레이더 앞차가 가속하지만 MPC 소스가 `cruise`로 바뀐 경우 3단계는 최종 `CruiseMaxVals` 상한의 최대 55%를 사용하는 일상 균형형, 4단계는 최대 80%와 설정된 `TFollowGap1`을 기본 목표로 사용하는 강한 거리유지형, 시험용 5단계는 최대 100%와 제한된 가속 오버슈트를 사용하는 가속추종형입니다. 앞차 가속이나 설정속도 여유가 끝나면 즉시 기존 제어로 돌아갑니다. 적용 조건과 단계별 제한은 [선행차 반응 설명](cruise-gap.md#lead-response)을 확인하세요.
+`LeadAccelResponse`는 차간 1단계에서만 앞차의 출발·가속을 따라가는 MPC 민첩성을 0~5단계로 조절합니다. 1단계는 약한 반응, 2단계는 완만한 반응, 3단계는 일상적으로 조금 급한 경쾌함, 4단계는 급한 추종, 시험용 5단계는 최대 추종입니다. 단계가 높을수록 MPC의 활성 가속변화 비용과 jerk 비용을 낮춰 `vTargetNow`와 `aTarget`이 함께 더 빠르게 상승하며, `CruiseMaxVals`·곡선·끼어들기·위험거리 상한은 그대로 유지합니다. 설정 TF에 도달하거나 앞차 가속이 끝나면 즉시 기존 MPC 비용과 감속 제어로 돌아갑니다. 적용 조건과 단계별 비용은 [선행차 반응 설명](cruise-gap.md#lead-response)을 확인하세요.
 
-`LongTuning*`, `LongActuatorDelay`, `StoppingAccel`은 openpilot이 가감속을 제어하는 차량에서 직접적인 영향을 줄 수 있는 고급 항목입니다. 순정 ACC 차량에서는 관련 없는 항목도 있습니다.
+`LongTuning*`, `LongActuatorDelay`, `StoppingAccel`은 openpilot이 가감속을 제어하는 차량에서 직접적인 영향을 줄 수 있는 고급 항목입니다. 현대·기아·제네시스에서는 `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`가 안전값 `100/0/100`으로 고정되어 설정 화면에 나오지 않으며, 순정 ACC 차량에서는 관련 없는 항목도 있습니다.
 
 <a id="vehicle-hardware"></a>
 ## 차량·하드웨어
@@ -215,7 +215,7 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 
 - `HyundaiCameraSCC`: 현대·기아 차량의 롱컨, 크루즈 동기화와 CAN FD 배선 구성에 따라 모드가 달라집니다.
 - `CanfdHDA2`: HDA2 차량에서만 활성화합니다.
-- `EnableRadarTracks`: `-2`는 비전 전용 시험, `-1`은 비전 매칭 없이 SCC를 항상 사용, `0`은 SCC-비전 매칭, `1`은 SCC 없이 프런트 레이더-비전 매칭, `2`는 프런트 레이더와 저속 SCC-비전 매칭, `3`은 프런트 레이더-비전 매칭 실패 시 SCC 강제 사용입니다. 매칭 모드는 실패 시 확률 `0.40` 이상인 중앙 비전을 사용하고, `-1`·`3`은 SCC가 없을 때만 비전으로 전환합니다. 강제 SCC는 횡좌표를 무시합니다. 레거시 Mando 레이더의 32·64슬롯 차이는 자동 처리합니다.
+- `EnableRadarTracks`: `-2`는 비전 전용 시험, `-1`은 비전 매칭 없이 SCC를 항상 사용, `0`은 SCC-비전 매칭, `1`은 SCC 없이 프런트 레이더-비전 매칭, `2`는 프런트 레이더와 저속 SCC-비전 매칭, `3`은 프런트 레이더-비전 매칭 실패 시 SCC 강제 사용입니다. 매칭 모드는 실패 시 확률 `0.40` 이상인 중앙 비전을 사용하고, `-1`·`3`은 SCC가 없을 때만 비전으로 전환합니다. 강제 SCC는 횡좌표를 무시합니다. 레거시 Mando 레이더의 32·64슬롯 차이는 자동 처리합니다. 새 정지 전방 리드는 비전 또는 동일 물체의 코너 검출로 확인해야 하며, 전방 레이더의 연속 관측만으로 승인하지 않습니다.
 - `CarrotRadarMode`: 전방·코너 레이더로 차량의 움직임을 계속 추적해 끼어드는 차량을 감지하고, 카메라 영상과 레이더 정보를 새로운 방식으로 맞춰 앞차를 선택합니다. 코너 레이더와 레이더 트랙 기능이 모두 없는 차량에서는 기존 방식과 동일하게 동작합니다. 가감속 동작이 달라질 수 있으므로 검증을 마친 동일 차량에서만 켭니다. 변경값은 다음 OnRoad가 시작될 때 고정되므로, 변경 후 현재 주행을 끝내고 차량을 재시동하거나 기기를 재부팅해야 적용됩니다. 기존 `RadarMotionMode` 값은 업데이트 후 처음 시작할 때 새 이름으로 한 번 자동 이관됩니다.
 - `CarrotRadarCutInSensitivity`: 당근레이더모드 전용 CUT-IN 감도입니다. `0`은 사용 안 함, `1`은 둔감, `3`은 보통(기본값), `5`는 아주 민감이며 `2`와 `4`는 중간 단계입니다. 단계 `1`~`5`는 실제 측정 움직임이 각각 `0.50`, `0.40`, `0.35`, `0.25`, `0.20초` 계속될 때 확정하며, 물리 미래 예측시간은 5.0초로 고정합니다. 전방 레이더의 최근 실측 이력에서 0.50m 이상 강한 단방향 진입이 확인되면 timestamp 양자화로 확정을 놓치지 않도록 최대 20Hz 레이더 한 프레임만 반영하며, 작은 인접 차로 흔들림에는 적용하지 않습니다. 기존 레이더모드와 `EnableCornerRadar`에는 영향을 주지 않습니다. 다음 OnRoad 시작 때 읽으므로 변경 후 차량을 재시동하거나 기기를 재부팅해야 적용됩니다.
 - `DisableDM`: 운전자 모니터링을 비활성화할 수 있는 안전 관련 항목이며 재부팅이 필요합니다.

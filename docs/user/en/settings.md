@@ -172,14 +172,14 @@ A lower `AutoNaviSpeedDecelRate` begins slowing farther away. `AutoNaviSpeedSafe
 
 `TrafficLightDetectMode` is `0` off, `1` stop detection, or `2` stop and go detection. This is model-based assistance; the driver must always verify the signal.
 
-### Cruise and following gap — 31 settings
+### Cruise and following gap — 31 settings overall, 28 on Hyundai/Kia/Genesis
 
 | Section | Parameters | Purpose |
 |---|---|---|
 | [Driving mode](cruise-gap.md#driving-mode) | `MyDrivingMode`, `MyDrivingModeAuto` | Eco, safe, normal, high-speed modes and automatic selection |
 | [Speed-based acceleration](cruise-gap.md#acceleration-table) | `CruiseMaxVals0` through `CruiseMaxVals6` | Maximum acceleration tendency by speed band |
 | [Stopping and restarting](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `VEgoStopping`, `AChangeCostStarting` | Stop position, stop entry, and restart behavior |
-| [Longitudinal tuning](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | Default Kp/Ki/Kf `100/0/100` and vehicle-response delay |
+| [Longitudinal tuning](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | Hyundai/Kia/Genesis hide fixed `100/0/100` gains; other brands can adjust them |
 | [Following gap](cruise-gap.md#following-gap) | `TFollowGap1` through `TFollowGap4`, `DynamicTFollow`, `DynamicTFollowLC`, `EnableSpeedTF`, `TFollowDecelBoost` | Gap times, dynamic gap, and deceleration margin |
 | [Lead response](cruise-gap.md#lead-response) | `LeadAccelResponse`, `JLeadFactor3`, `RadarReactionFactor` | TF1 acceleration and other responses to lead-vehicle changes |
 | [Carrot cruise](cruise-gap.md#carrot-cruise) | `CruiseEcoControl`, `CarrotCruiseDecel`, `CarrotCruiseAtcDecel` | Economy control and cruise deceleration limits |
@@ -188,9 +188,9 @@ A lower `AutoNaviSpeedDecelRate` begins slowing farther away. `AutoNaviSpeedSafe
 
 `TFollowGap1` through `TFollowGap4` are stored in hundredths of a second. Lower values reduce the time gap. Establish a stable fixed-gap baseline before enabling `DynamicTFollow` features.
 
-`LeadAccelResponse` adjusts how quickly the vehicle follows a lead starting or accelerating at following-distance level 1. Levels 1–2 are gentle. When a stable radar lead accelerates but MPC changes to a `cruise` source, level 3 is the everyday balance and may use up to 55% of the final `CruiseMaxVals` envelope; level 4 provides strong gap control with up to 80% and uses configured `TFollowGap1` as its base target; test level 5 may use up to 100% with bounded acceleration overshoot. Normal control resumes immediately when lead acceleration or set-speed headroom ends. See [Lead-vehicle response](cruise-gap.md#lead-response) for its activation gates and per-level limits.
+`LeadAccelResponse` adjusts MPC responsiveness to a lead starting or accelerating at following-distance level 1. Level 1 is weak, level 2 is mild, level 3 is the brisk everyday choice, level 4 is urgent follow, and test level 5 is maximum follow. Higher levels reduce MPC's active acceleration-change and jerk costs so `vTargetNow` and `aTarget` rise together, while the `CruiseMaxVals`, curve, cut-in, and danger-distance limits remain intact. Normal MPC costs and deceleration behavior resume immediately when configured TF is reached or lead acceleration ends. See [Lead-vehicle response](cruise-gap.md#lead-response) for activation gates and per-level costs.
 
-`LongTuning*`, `LongActuatorDelay`, and `StoppingAccel` are advanced settings that directly affect vehicles using openpilot longitudinal control. Some have no effect when stock ACC remains responsible for acceleration and braking.
+`LongTuning*`, `LongActuatorDelay`, and `StoppingAccel` are advanced settings that directly affect vehicles using openpilot longitudinal control. Hyundai, Kia, and Genesis fix `LongTuningKpV`, `LongTuningKiV`, and `LongTuningKf` at the safe `100/0/100` values and hide them from settings. Some parameters have no effect when stock ACC remains responsible for acceleration and braking.
 
 <a id="vehicle-hardware"></a>
 ## Vehicle and hardware
@@ -211,7 +211,7 @@ These 16 settings describe the car, harness, and device hardware configuration. 
 
 See [Radar tracks and corner radar](radar.md) before changing radar modes.
 
-For dPath RadarD, `EnableRadarTracks=-2` is the vision-only experiment; `-1` always uses SCC without vision matching; `0` matches SCC to vision; `1` matches front radar without SCC; `2` matches front radar plus low-speed SCC; and `3` uses SCC unconditionally after front-radar/vision matching fails. Matching modes use central vision at probability `0.40` or higher when matching fails. Modes `-1` and `3` use vision only when SCC is absent, and ignore the lateral coordinate of an SCC selected unconditionally. Legacy Mando radar variants with 32 or 64 slots are handled automatically.
+For dPath RadarD, `EnableRadarTracks=-2` is the vision-only experiment; `-1` always uses SCC without vision matching; `0` matches SCC to vision; `1` matches front radar without SCC; `2` matches front radar plus low-speed SCC; and `3` uses SCC unconditionally after front-radar/vision matching fails. Matching modes use central vision at probability `0.40` or higher when matching fails. Modes `-1` and `3` use vision only when SCC is absent, and ignore the lateral coordinate of an SCC selected unconditionally. Legacy Mando radar variants with 32 or 64 slots are handled automatically. A new stationary front lead requires vision or a matching corner detection; continuous front-radar observation alone cannot authorize it.
 
 `CarrotRadarMode` continuously tracks vehicles with the front and corner radars to detect cut-ins, then matches camera and radar information in a new way to select the vehicle ahead. On vehicles with neither corner-radar nor radar-track support, it behaves the same as the existing mode. It can change acceleration and braking, so enable it only on the same vehicle after completing validation. The value is latched when the next OnRoad session starts, so end the current drive and restart the vehicle or reboot the device after changing it. The previous `RadarMotionMode` value is migrated to the new name once on the first startup after updating.
 
