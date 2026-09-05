@@ -1166,21 +1166,31 @@ class _BoschStaticOffPathFilter:
     from openpilot.selfdrive.carrot.radar_motion.predictor import model_path_y
     self._path_y = model_path_y
 
-  def update(self, objects, timestamp_ns, v_ego, path=()):
-    # Provider supplies only causal, fresh paths. Unknown context is fail-open.
-    if (not math.isfinite(v_ego) or len(path) < 2
-        or not all(math.isfinite(x) and math.isfinite(y) for x, y in path)
-        or not all(path[i][0] < path[i + 1][0] for i in range(len(path) - 1))):
+  def update(self, objects, timestamp_ns, v_ego, path=(), yaw_rate=None):
+    # Unknown ego speed remains the only whole-scan fail-open: without it the
+    # world residual cannot be formed, so no static state can be established.
+    if not math.isfinite(v_ego):
       return objects
+    # Provider supplies only causal, fresh paths. An unusable path no longer
+    # retains the whole scan; those objects fall back to a straight corridor.
+    path_valid = (len(path) >= 2
+                  and all(math.isfinite(x) and math.isfinite(y) for x, y in path)
+                  and all(path[i][0] < path[i + 1][0] for i in range(len(path) - 1)))
+    # In vehicle coordinates a world-static return moves at -vEgo + yaw*yRel,
+    # so the rotational term must be removed before judging ground speed. A
+    # missing or non-finite yaw degrades to the previous naive residual, which
+    # over-keeps rather than dropping a real object.
+    rotation = yaw_rate if yaw_rate is not None and math.isfinite(yaw_rate) else 0.0
     kept = []
     for obj in objects:
-      speed = abs(obj.v_rel + v_ego)  # Representative velocity, not member votes.
+      # Representative velocity, not member votes.
+      speed = abs(obj.v_rel + v_ego - rotation * obj.y_rel)
       if (obj.oem_selected or obj.vision_supported or not math.isfinite(speed)
-          or speed > 0.6  # Includes uncertain 0.6–1.4 m/s and moving objects.
-          or not path[0][0] <= obj.d_rel <= path[-1][0]):
+          or speed > 0.6):  # Includes uncertain 0.6–1.4 m/s and moving objects.
         kept.append(obj)
         continue
-      offset = obj.y_rel - self._path_y(path, obj.d_rel)
+      offset = (obj.y_rel - self._path_y(path, obj.d_rel)
+                if path_valid and path[0][0] <= obj.d_rel <= path[-1][0] else obj.y_rel)
       if not math.isfinite(offset) or abs(offset) <= 3.0:
         kept.append(obj)
     return objects if len(kept) == len(objects) else tuple(kept)
@@ -1506,7 +1516,8 @@ class BoschRadarProvider:
     self._debug_oem_matches = len(matches)
     self._debug_timeout = False
     qualify_start_ns = time.perf_counter_ns()
-    qualified = self.qualifier.update(objects, availability_ns, v_ego, path) if self.qualifier is not None else objects
+    qualified = (self.qualifier.update(objects, availability_ns, v_ego, path, yaw_rate=yaw_rate_left)
+                 if self.qualifier is not None else objects)
     done_ns = time.perf_counter_ns()
     qualify_ns, total_ns = done_ns - qualify_start_ns, done_ns - start_ns
     raw, physical = self.tracker.raw_manager, self.tracker.group_manager
