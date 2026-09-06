@@ -272,7 +272,9 @@ BOSCH_OUTPUT_INTERVAL_NS = 100_000_000
 BOSCH_SAMPLE_HOLD_NS = 150_000_000  # one 10 Hz observation period plus one SCC publication period
 
 
-def bosch_numpy_linear_sum_assignment(cost_matrix):
+def bosch_numpy_linear_sum_assignment(cost_matrix, *, potentials=False):
+  """Jonker-Volgenant assignment. potentials also returns the dual row/column
+  potentials, which satisfy cost - u - v >= 0 with equality on every match."""
   cost = np.asarray(cost_matrix, dtype=float)
   if cost.ndim != 2:
     raise ValueError('expected a matrix')
@@ -283,30 +285,49 @@ def bosch_numpy_linear_sum_assignment(cost_matrix):
     cost = cost.T
   n, m = cost.shape
   if not n:
-    return np.empty(0, dtype=int), np.empty(0, dtype=int)
+    empty = np.empty(0, dtype=int)
+    return (empty, empty, np.empty(0), np.empty(0)) if potentials else (empty, empty)
   u, v = np.zeros(n + 1), np.zeros(m + 1)
   p, way = np.zeros(m + 1, dtype=int), np.zeros(m + 1, dtype=int)
+  # Scratch reused across rows. The search only ever touches columns 1..m, so
+  # every vector stays full width and is masked in place: the arithmetic per
+  # column is the same as the gather/scatter form, without its temporaries.
+  reduced = np.empty(m)
+  improve = np.empty(m, dtype=bool)
+  minimum = np.empty(m + 1)
+  used = np.empty(m + 1, dtype=bool)
+  unused = np.empty(m + 1, dtype=bool)
+  path_rows = np.empty(m + 1, dtype=int)
+  v_tail, minimum_tail, way_tail = v[1:], minimum[1:], way[1:]
   for row in range(1, n + 1):
     p[0] = row
-    minimum = np.full(m + 1, np.inf)
-    used = np.zeros(m + 1, dtype=bool)
+    minimum.fill(np.inf)
+    used.fill(False)
+    unused.fill(True)
     column = 0
+    depth = 0
     while True:
       used[column] = True
+      unused[column] = False
+      # A used column is never revisited, so parking it at +inf lets the plain
+      # argmin below select exactly the column the masked argmin selected.
+      minimum[column] = np.inf
       current_row = p[column]
-      remaining = np.flatnonzero(~used[1:]) + 1
-      reduced = cost[current_row - 1, remaining - 1] - u[current_row] - v[remaining]
-      improve = reduced < minimum[remaining]
-      improved_columns = remaining[improve]
-      minimum[improved_columns] = reduced[improve]
-      way[improved_columns] = column
-      next_column = remaining[np.argmin(minimum[remaining])]
+      path_rows[depth] = current_row
+      depth += 1
+      np.subtract(cost[current_row - 1], u[current_row], out=reduced)
+      np.subtract(reduced, v_tail, out=reduced)
+      np.less(reduced, minimum_tail, out=improve)
+      np.logical_and(improve, unused[1:], out=improve)
+      np.copyto(minimum_tail, reduced, where=improve)
+      way_tail[improve] = column
+      next_column = int(np.argmin(minimum))
       delta = minimum[next_column]
       if not np.isfinite(delta):
         raise ValueError('cost matrix is infeasible')
-      u[p[used]] += delta
-      v[used] -= delta
-      minimum[~used] -= delta
+      u[path_rows[:depth]] += delta
+      np.subtract(v, delta, out=v, where=used)
+      np.subtract(minimum, delta, out=minimum, where=unused)
       column = next_column
       if p[column] == 0:
         break
@@ -319,6 +340,10 @@ def bosch_numpy_linear_sum_assignment(cost_matrix):
   if transposed:
     rows, columns = columns, rows
   order = np.argsort(rows)
+  if potentials:
+    # Restate the duals in the caller's orientation, dropping the sentinel slot.
+    row_potential, column_potential = (v[1:], u[1:]) if transposed else (u[1:], v[1:])
+    return rows[order], columns[order], row_potential, column_potential
   return rows[order], columns[order]
 
 
@@ -329,13 +354,25 @@ except ImportError:
 
 
 def _bosch_integer(value: object, label: str, minimum: int, maximum: int | None = None) -> None:
-  if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum or (maximum is not None and value > maximum):
-    raise ValueError(f"{label} must be an integer in [{minimum}, {maximum}]")
+  # An exact int type already excludes bool and every non-Integral, so the scan
+  # path never pays for the abstract-base-class lookup. Anything else keeps the
+  # original predicate, including its short-circuit before the comparisons.
+  if type(value) is int:
+    if minimum <= value and (maximum is None or value <= maximum):
+      return
+  elif not (isinstance(value, bool) or not isinstance(value, Integral) or value < minimum
+            or (maximum is not None and value > maximum)):
+    return
+  raise ValueError(f"{label} must be an integer in [{minimum}, {maximum}]")
 
 
 def _bosch_finite(value: object, label: str) -> None:
-  if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
-    raise ValueError(f"{label} must be finite")
+  if type(value) is float:
+    if math.isfinite(value):
+      return
+  elif not (isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value)):
+    return
+  raise ValueError(f"{label} must be finite")
 
 
 @dataclass(frozen=True)
@@ -351,8 +388,9 @@ class BoschRawDetection:
     _bosch_integer(self.timestamp_ns, "timestamp_ns", 0)
     _bosch_integer(self.slot, "slot", 0, 31)
     _bosch_integer(self.raw_word, "raw_word", 0, 2**32 - 1)
-    for name in ("d_rel", "y_rel", "v_rel"):
-      _bosch_finite(getattr(self, name), name)
+    _bosch_finite(self.d_rel, "d_rel")
+    _bosch_finite(self.y_rel, "y_rel")
+    _bosch_finite(self.v_rel, "v_rel")
     if not 0 <= self.d_rel <= 255.75:
       raise ValueError("d_rel outside the supported Bosch decoded range")
     if not -32 <= self.y_rel <= 31.96875:
@@ -491,6 +529,116 @@ def _bosch_advance(x: float, y: float, velocity: float, dt: float, yaw_rate: flo
   return c * x + s * y, -s * x + c * y
 
 
+def _bosch_admissible_cycle(size, adjacency, real):
+  """Iterative Tarjan: True when a nontrivial component contains a real vertex.
+
+  Every vertex of a nontrivial strongly connected component lies on a cycle, so
+  such a component holding a real row or column means an alternating cycle of
+  zero reduced cost re-matches that vertex: a second optimum. Cycles confined to
+  the dummy block only permute which unmatched row pairs with which unmatched
+  column, which no caller can observe.
+  """
+  index = [0] * size
+  low = [0] * size
+  seen = bytearray(size)
+  on_stack = bytearray(size)
+  stack = []
+  counter = 1
+  for root in range(size):
+    if seen[root]:
+      continue
+    work = [(root, 0)]
+    while work:
+      vertex, position = work[-1]
+      if not position:
+        seen[vertex] = 1
+        index[vertex] = low[vertex] = counter
+        counter += 1
+        stack.append(vertex)
+        on_stack[vertex] = 1
+      neighbours = adjacency[vertex]
+      descended = False
+      while position < len(neighbours):
+        other = neighbours[position]
+        position += 1
+        if not seen[other]:
+          work[-1] = (vertex, position)
+          work.append((other, 0))
+          descended = True
+          break
+        if on_stack[other] and index[other] < low[vertex]:
+          low[vertex] = index[other]
+      if descended:
+        continue
+      work.pop()
+      if work:
+        parent = work[-1][0]
+        if low[vertex] < low[parent]:
+          low[parent] = low[vertex]
+      if low[vertex] == index[vertex]:
+        members = []
+        while True:
+          other = stack.pop()
+          on_stack[other] = 0
+          members.append(other)
+          if other == vertex:
+            break
+        if len(members) > 1 and any(real[member] for member in members):
+          return True
+  return False
+
+
+def _bosch_unique_component_matching(rows, columns, row_edges, unmatched_cost, margin):
+  """Solve one component's augmented assignment and certify that it is unique.
+
+  The augmented objective is a sum of independent per-component terms, so a
+  component with a strictly unique optimum carries that same matching inside
+  every global optimum. Certifying it therefore replaces the whole-scan solver
+  without moving a single association, and an ambiguous component returns None
+  so the caller still rebuilds and solves the original global matrix.
+  """
+  a, b = len(rows), len(columns)
+  size = a + b
+  costs = np.full((size, size), np.inf)
+  column_at = {vertex: j for j, vertex in enumerate(columns)}
+  for i, vertex in enumerate(rows):
+    costs[i, b + i] = unmatched_cost
+    for other, cost in row_edges[vertex]:
+      j = column_at.get(other)
+      if j is None:
+        return None  # Not a closed component; leave it to the global solver.
+      costs[i, j] = cost
+  for j in range(b):
+    costs[a + j, j] = unmatched_cost
+  costs[a:, b:] = 0.
+  try:
+    solved_rows, solved_columns, u, v = bosch_numpy_linear_sum_assignment(costs, potentials=True)
+  except ValueError:
+    return None
+  admissible = (costs - u[:, None] - v[None, :]) <= max(margin, 1e-12)
+  partner = dict(zip(solved_rows.tolist(), solved_columns.tolist()))
+  if len(partner) != size:
+    return None
+  adjacency = [[] for _ in range(2 * size)]
+  for i in range(size):
+    matched = partner[i]
+    # Matching edges point column to row, admissible non-matching edges point
+    # row to column, so every directed cycle is an alternating swap.
+    adjacency[size + matched].append(i)
+    outgoing = adjacency[i]
+    for j in np.flatnonzero(admissible[i]).tolist():
+      if j != matched:
+        outgoing.append(size + j)
+  real = bytearray(2 * size)
+  for i in range(a):
+    real[i] = 1
+  for j in range(b):
+    real[size + j] = 1
+  if _bosch_admissible_cycle(2 * size, adjacency, real):
+    return None
+  return {columns[j]: rows[i] for i, j in partner.items() if i < a and j < b}
+
+
 def _bosch_raw_unique_component(rows, columns, row_edges, column_edges, unmatched_cost):
   # Each real match replaces one birth and one miss, so maximizing the sum of
   # (2*unmatched_cost - edge_cost) is exactly the augmented objective minus a
@@ -528,7 +676,9 @@ def _bosch_raw_unique_component(rows, columns, row_edges, column_edges, unmatche
   # optima; ambiguous or numerically indistinguishable results use the original
   # full solver to retain that backend's deterministic tie behavior.
   if min(len(rows), len(columns)) > 6 or max(len(rows), len(columns)) > 12:
-    return None
+    # Too wide for the subset DP. Certify the component's own optimum instead;
+    # only a genuinely tied component still needs the whole-scan solver.
+    return _bosch_unique_component_matching(rows, columns, row_edges, unmatched_cost, margin)
   transposed = len(rows) < len(columns)
   small, large = (rows, columns) if transposed else (columns, rows)
   bits = {vertex: 1 << i for i, vertex in enumerate(small)}
@@ -677,15 +827,24 @@ class BoschRawTrackManager:
     current = tuple(sorted(current, key=lambda point: point.slot))
     config = self.config
     coast_ns = round(config.coast_s * 1e9)
-    retained = [state for _, state in sorted(self._states.items())
-          if timestamp_ns - state.last_seen_scan_ns <= coast_ns]
-    expired_count = len(self._states) - len(retained)
+    states = self._states
+    retained = []
+    for key in sorted(states):
+      state = states[key]
+      if timestamp_ns - state.last_seen_scan_ns <= coast_ns:
+        retained.append(state)
+    expired_count = len(states) - len(retained)
     dt = 0.0 if self.last_timestamp_ns is None else (timestamp_ns - self.last_timestamp_ns) / 1e9
     angle = 0.0 if yaw_rate is None else yaw_rate * dt
     cosine, sine = math.cos(angle), math.sin(angle)
     predicted = []
+    # Retained velocities are read again by the gate loop; keep them off the
+    # RawTrack/RawDetection property chain there.
+    retained_speeds = []
     for state in retained:
-      x = state.x + state.track.v_rel * dt
+      speed = state.track.detection.v_rel
+      retained_speeds.append(speed)
+      x = state.x + speed * dt
       predicted.append((cosine * x + sine * state.y, -sine * x + cosine * state.y))
     observed = []
     rotations = {}
@@ -706,42 +865,64 @@ class BoschRawTrackManager:
     distance_pairs = speed_rejections = bearing_rejections = gated_pairs = 0
     order = sorted(range(m), key=lambda col: observed[col][0])
     lower = upper = 0
-    window_gate = math.nextafter(config.distance_gate_m, math.inf)
+    # Per-scan constants. bearing_gate_rad() is inlined below with exactly the
+    # same thresholds and math.radians() values it would have returned.
+    distance_gate = config.distance_gate_m
+    speed_gate = config.speed_gate_mps
+    same_slot_bonus = config.same_slot_bonus
+    gate_near = math.radians(config.bearing_near_deg)
+    gate_mid = math.radians(config.bearing_mid_deg)
+    gate_far = math.radians(config.bearing_far_deg)
+    gate_distant = math.radians(config.bearing_distant_deg)
+    observed_x = [point[0] for point in observed]
+    observed_speeds = [point.v_rel for point in current]
+    observed_slots = [point.slot for point in current]
+    window_gate = math.nextafter(distance_gate, math.inf)
     for row in sorted(range(n), key=lambda row: predicted[row][0]):
-      state = retained[row]
       pred_x = predicted[row][0]
+      state_speed = retained_speeds[row]
+      state_slot = retained[row].track.detection.slot
+      predicted_bearing = predicted_bearings[row]
+      row_edge = row_edges[row]
       # Cover values whose subtraction rounds onto the gate, including when
       # pred_x - gate cancels to zero. The actual gate below stays unchanged.
       minimum = math.nextafter(pred_x - window_gate, -math.inf)
       maximum = math.nextafter(pred_x + window_gate, math.inf)
-      while lower < m and observed[order[lower]][0] < minimum:
+      while lower < m and observed_x[order[lower]] < minimum:
         lower += 1
       upper = max(upper, lower)
-      while upper < m and observed[order[upper]][0] <= maximum:
+      while upper < m and observed_x[order[upper]] <= maximum:
         upper += 1
       for index in range(lower, upper):
         col = order[index]
-        point = current[col]
-        obs_x = observed[col][0]
+        obs_x = observed_x[col]
         delta_d = abs(obs_x - pred_x)
-        if delta_d > config.distance_gate_m:
+        if delta_d > distance_gate:
           continue
         distance_pairs += 1
-        delta_v = abs(point.v_rel - state.track.v_rel)
-        if delta_v > config.speed_gate_mps:
+        delta_v = abs(observed_speeds[col] - state_speed)
+        if delta_v > speed_gate:
           speed_rejections += 1
           continue
-        angle = observed_bearings[col] - predicted_bearings[row]
+        angle = observed_bearings[col] - predicted_bearing
         delta_bearing = abs(math.atan2(math.sin(angle), math.cos(angle)))
-        gate = config.bearing_gate_rad(max(0.0, min(pred_x, obs_x)))
+        nearest = max(0.0, min(pred_x, obs_x))
+        if nearest < 15:
+          gate = gate_near
+        elif nearest < 30:
+          gate = gate_mid
+        elif nearest < 60:
+          gate = gate_far
+        else:
+          gate = gate_distant
         if delta_bearing > gate:
           bearing_rejections += 1
         else:
           gated_pairs += 1
-          cost = ((delta_d / config.distance_gate_m)**2 + (delta_v / config.speed_gate_mps)**2 + (delta_bearing / gate)**2) / 3
-          if state.track.slot == point.slot:
-            cost = max(0.0, cost - config.same_slot_bonus)
-          row_edges[row].append((col, cost))
+          cost = ((delta_d / distance_gate)**2 + (delta_v / speed_gate)**2 + (delta_bearing / gate)**2) / 3
+          if state_slot == observed_slots[col]:
+            cost = max(0.0, cost - same_slot_bonus)
+          row_edge.append((col, cost))
           column_edges[col].append((row, cost))
     assignment, components, largest, fast_components, fallback = _bosch_raw_assignment(
       n, m, row_edges, column_edges, config.unmatched_cost,
@@ -757,27 +938,39 @@ class BoschRawTrackManager:
     self.last_component_count, self.last_largest_component = components, largest
     self.last_fast_components, self.last_solver_fallback = fast_components, fallback
     self._update_count += 1
-    self._states = {}
-    for state, (x, y) in zip(retained, predicted):
-      self._states[state.track.raw_track_id] = _BoschRawState(state.track, x, y, state.last_seen_scan_ns, state.last_seen_update)
+    update_count = self._update_count
+    # A coasted state only advances its projection, so it is re-seated in place
+    # rather than rebuilt. Rows that a detection claims are overwritten below,
+    # so they are not carried over at all.
+    claimed_rows = set(assignment.values())
+    states = {}
+    self._states = states
+    for row, (state, (x, y)) in enumerate(zip(retained, predicted)):
+      if row in claimed_rows:
+        continue
+      state.x = x
+      state.y = y
+      states[state.track.raw_track_id] = state
     output = []
     decisions = []
+    assignments = cross_slot = recovered_count = created = 0
     for col, (point, (x, y)) in enumerate(zip(current, observed)):
-      if col in assignment:
-        old = retained[assignment[col]]
-        recovered = old.last_seen_update != self._update_count - 1
-        track = BoschRawTrack(old.track.raw_track_id, point, old.track.age_scans + 1, recovered, old.track.slot)
-        self.stats["assignments"] += 1
-        self.stats["cross_slot"] += int(point.slot != old.track.slot)
-        self.stats["recovered"] += int(recovered)
+      row = assignment.get(col)
+      if row is not None:
+        old = retained[row]
+        old_track = old.track
+        recovered = old.last_seen_update != update_count - 1
+        track = BoschRawTrack(old_track.raw_track_id, point, old_track.age_scans + 1, recovered, old_track.slot)
+        assignments += 1
+        cross_slot += point.slot != old_track.slot
+        recovered_count += recovered
       else:
         track = BoschRawTrack(self.next_id, point, 1)
         self.next_id += 1
-        self.stats["created"] += 1
+        created += 1
       output.append(track)
-      self._states[track.raw_track_id] = _BoschRawState(track, x, y, timestamp_ns, self._update_count)
+      states[track.raw_track_id] = _BoschRawState(track, x, y, timestamp_ns, update_count)
       if self.trace_decisions:
-        row = assignment.get(col)
         chosen = next((cost for other, cost in column_edges[col] if other == row), None)
         alternatives = sorted(cost for other, cost in column_edges[col] if other != row)
         bearing = None
@@ -799,14 +992,19 @@ class BoschRawTrackManager:
           candidate_count=len(column_edges[col])))
     self.last_decisions = tuple(decisions)
     self.last_timestamp_ns = int(timestamp_ns)
+    stats = self.stats
     for key, value in pending_stats.items():
-      self.stats[key] += value
-    self.stats["updates"] += 1
-    self.stats["detections"] += m
-    self.stats["deleted"] += expired_count
-    self.stats["coasted_track_scans"] += n - len(assignment)
-    self.stats["max_active"] = max(self.stats["max_active"], len(self._states))
-    self.stats["yaw_compensated_updates" if yaw_rate is not None else "yaw_unavailable_updates"] += 1
+      stats[key] += value
+    stats["assignments"] += assignments
+    stats["cross_slot"] += cross_slot
+    stats["recovered"] += recovered_count
+    stats["created"] += created
+    stats["updates"] += 1
+    stats["detections"] += m
+    stats["deleted"] += expired_count
+    stats["coasted_track_scans"] += n - len(assignment)
+    stats["max_active"] = max(stats["max_active"], len(states))
+    stats["yaw_compensated_updates" if yaw_rate is not None else "yaw_unavailable_updates"] += 1
     return tuple(output)
 
 
@@ -1033,8 +1231,12 @@ class BoschObjectGroupManager:
         del self.states[pid]
         self.stats['deleted'] += 1
       else:
-        state.member_last_seen = {rid: ns for rid, ns in state.member_last_seen.items()
-                     if timestamp_ns - ns <= coast_ns}
+        # Drop in place: rebuilding every surviving member map each scan was
+        # pure churn, since almost no scan expires a member.
+        last_seen = state.member_last_seen
+        expired = [rid for rid, ns in last_seen.items() if timestamp_ns - ns > coast_ns]
+        for rid in expired:
+          del last_seen[rid]
 
     n = len(raw_tracks)
     ids = [r.raw_track_id for r in raw_tracks]
@@ -1166,15 +1368,29 @@ class BoschObjectGroupManager:
       else:
         carry_mode = 'assignment_solver'
         scores = np.zeros((len(clusters), len(previous)+len(clusters)))
+        # Invert membership once instead of intersecting every cluster against
+        # every previous state; only the states a cluster actually touches can
+        # score, and the score itself is unchanged.
+        holders = {}
+        for j, pid in enumerate(previous):
+          for rid in self.states[pid].member_last_seen:
+            entry = holders.get(rid)
+            if entry is None:
+              holders[rid] = [j]
+            else:
+              entry.append(j)
         for i, cluster in enumerate(clusters):
           members = {ids[k] for k in cluster}
-          for j, pid in enumerate(previous):
-            state = self.states[pid]
-            overlap = members.intersection(state.member_last_seen)
-            if overlap:
-              scores[i, j] = (10*len(overlap) +
-                      3*(state.observation.representative_raw_track_id in members) +
-                      min(state.observation.age_scans, 1000)*1e-5 + 1/(pid+1))
+          overlaps = {}
+          for rid in members:
+            for j in holders.get(rid, ()):
+              overlaps[j] = overlaps.get(j, 0) + 1
+          for j, overlap in overlaps.items():
+            pid = previous[j]
+            observation = self.states[pid].observation
+            scores[i, j] = (10*overlap +
+                    3*(observation.representative_raw_track_id in members) +
+                    min(observation.age_scans, 1000)*1e-5 + 1/(pid+1))
         ri, ci = bosch_linear_sum_assignment(-scores)
         assigned = {int(i): previous[int(j)] for i, j in zip(ri, ci) if j < len(previous) and scores[i, j] > 0}
         if self.trace_decisions:
@@ -1184,22 +1400,31 @@ class BoschObjectGroupManager:
     decisions = []
     current_ids = set(ids)
     vision_supported = [self._vision_support(r, vision) for r in raw_tracks] if vision else [False] * n
+    # Nearly nine in ten clusters hold one return. Split that case out and hoist
+    # the loop-invariant lookups; the emitted object is byte-for-byte the same.
+    stats = self.stats
+    states = self.states
+    trace = self.trace_decisions
+    v_ego_known = math.isfinite(v_ego)
+    stationary_speed = c.stationary_speed_mps
+    largest_group = stats['max_group_size']
     for i, cluster in enumerate(clusters):
       pid = assigned.get(i)
-      old = self.states.get(pid)
+      old = states.get(pid)
       prior = old.observation if old else None
       if pid is None:
         if self.next_id >= 2**31:
           raise OverflowError('physical Int32 ID space exhausted; no reuse')
         pid, self.next_id = self.next_id, self.next_id+1
-        self.stats['created'] += 1
-      candidates = [raw_tracks[k] for k in sorted(cluster)]
+        stats['created'] += 1
+      size = len(cluster)
+      candidates = [raw_tracks[cluster[0]]] if size == 1 else [raw_tracks[k] for k in sorted(cluster)]
       member_ids = {m.raw_track_id for m in candidates}
       predicted = None
       # A single-member cluster picks its only member, so production skips the
       # projection there. The trace still needs it: that is exactly the case in
       # which no continuity term reaches the published state at all.
-      if prior and (len(candidates) > 1 or self.trace_decisions):
+      if prior and (size > 1 or trace):
         dt = (timestamp_ns-prior.timestamp_ns)/1e9
         angle = -(yaw_rate or 0.)*dt
         dx = prior.d_rel + prior.v_rel*dt
@@ -1207,58 +1432,84 @@ class BoschObjectGroupManager:
         px = dx*ca-prior.y_rel*sa
         py = dx*sa+prior.y_rel*ca
         predicted = (dt, px, py)
-      elif not prior and len(candidates) > 1:
+      elif not prior and size > 1:
         median = float(np.median([m.d_rel for m in candidates]))
-      def representative_cost(m):
-        if prior:
-          continuity = abs(m.d_rel-px) + .5*abs(m.y_rel-py) + .5*abs(m.v_rel-prior.v_rel)
-          # Observed state wins over OEM changes; these are only ties.
-          return (continuity, m.raw_track_id != prior.representative_raw_track_id,
-              not vision_supported[raw_index[m.raw_track_id]], m.slot != oem_slot, -m.age_scans, m.raw_track_id)
-        # Initially prefer a robust actual member near the group median.
-        return (abs(m.d_rel-median), False, not vision_supported[raw_index[m.raw_track_id]], m.slot != oem_slot, -m.age_scans, m.raw_track_id)
-      rep = candidates[0] if len(candidates) == 1 else min(candidates, key=representative_cost)
+      if size == 1:
+        rep = candidates[0]
+        oem_selected = rep.slot == oem_slot
+        supported = vision_supported[cluster[0]]
+        evidence = 'single_return'
+      else:
+        def representative_cost(m):
+          if prior:
+            continuity = abs(m.d_rel-px) + .5*abs(m.y_rel-py) + .5*abs(m.v_rel-prior.v_rel)
+            # Observed state wins over OEM changes; these are only ties.
+            return (continuity, m.raw_track_id != prior.representative_raw_track_id,
+                not vision_supported[raw_index[m.raw_track_id]], m.slot != oem_slot, -m.age_scans, m.raw_track_id)
+          # Initially prefer a robust actual member near the group median.
+          return (abs(m.d_rel-median), False, not vision_supported[raw_index[m.raw_track_id]], m.slot != oem_slot, -m.age_scans, m.raw_track_id)
+        rep = min(candidates, key=representative_cost)
+        oem_selected = any(m.slot == oem_slot for m in candidates)
+        supported = any(vision_supported[k] for k in cluster)
+        evidence = 'temporal_complete_link'
       obj = BoschPhysicalObject(pid, timestamp_ns, tuple(candidates), rep.raw_track_id,
-                rep.d_rel, rep.y_rel, rep.v_rel, any(m.slot == oem_slot for m in candidates),
-                any(vision_supported[k] for k in cluster),
-                (prior.age_scans+1 if prior else 1),
-                'temporal_complete_link' if len(candidates)>1 else 'single_return')
-      if self.trace_decisions:
+                rep.d_rel, rep.y_rel, rep.v_rel, oem_selected, supported,
+                (prior.age_scans+1 if prior else 1), evidence)
+      if trace:
         decisions.append(self._decision(obj, old, prior, carry_mode, predicted,
                                         solver_scores, i, previous))
-      last_seen = dict(old.member_last_seen) if old else {}
       # A raw member currently assigned elsewhere cannot belong to this ID.
-      for rid in list(last_seen):
-        if rid in current_ids and rid not in member_ids:
-          del last_seen[rid]
-      last_seen.update({m.raw_track_id: timestamp_ns for m in candidates})
-      self.states[pid] = _BoschPhysicalState(obj, last_seen)
+      last_seen = ({rid: ns for rid, ns in old.member_last_seen.items()
+                    if rid not in current_ids or rid in member_ids} if old else {})
+      for m in candidates:
+        last_seen[m.raw_track_id] = timestamp_ns
+      states[pid] = _BoschPhysicalState(obj, last_seen)
       if prior and prior.representative_raw_track_id != rep.raw_track_id:
-        self.stats['representative_changes'] += 1
-      old_owners = {owner[m.raw_track_id] for m in candidates if m.raw_track_id in owner}
-      self.stats['membership_merge_events'] += max(0, len(old_owners)-1)
-      if old is not None and all(m.recovered for m in candidates):
-        self.stats['coasting_recoveries'] += 1
-      self.stats['multi_member_groups'] += int(len(candidates)>1)
-      self.stats['vision_supported_groups'] += int(obj.vision_supported)
-      self.stats['stationary_groups'] += int(math.isfinite(v_ego) and abs(obj.v_rel+v_ego) <= c.stationary_speed_mps)
-      self.stats['max_group_size'] = max(self.stats['max_group_size'], len(candidates))
+        stats['representative_changes'] += 1
+      old_owners = set()
+      recovered_all = old is not None
+      for m in candidates:
+        holder = owner.get(m.raw_track_id)
+        if holder is not None:
+          old_owners.add(holder)
+        if not m.recovered:
+          recovered_all = False
+      if len(old_owners) > 1:
+        stats['membership_merge_events'] += len(old_owners)-1
+      if recovered_all:
+        stats['coasting_recoveries'] += 1
+      if size > 1:
+        stats['multi_member_groups'] += 1
+      if supported:
+        stats['vision_supported_groups'] += 1
+      if v_ego_known and abs(obj.v_rel+v_ego) <= stationary_speed:
+        stats['stationary_groups'] += 1
+      if size > largest_group:
+        largest_group = size
       result.append(obj)
+    if largest_group != stats['max_group_size']:
+      stats['max_group_size'] = largest_group
 
     # Retire absorbed physical IDs immediately, retaining only missing members
     # for genuine coasting. Prevent two IDs from owning the same raw member.
     live_owners = {m.raw_track_id: obj.physical_track_id for obj in result for m in obj.members}
     output_ids = {obj.physical_track_id for obj in result}
-    for pid in list(self.states):
-      state = self.states[pid]
-      state.member_last_seen = {rid: ns for rid, ns in state.member_last_seen.items()
-                   if rid not in live_owners or live_owners[rid] == pid}
-      if not state.member_last_seen and pid not in output_ids:
-        del self.states[pid]
-        self.stats['absorbed'] += 1
-    self.stats['scans'] += 1
-    self.stats['output_objects'] += len(result)
-    self.last_multi_count = sum(len(obj.members) > 1 for obj in result)
+    for pid in list(states):
+      state = states[pid]
+      last_seen = state.member_last_seen
+      stolen = [rid for rid in last_seen if live_owners.get(rid, pid) != pid]
+      for rid in stolen:
+        del last_seen[rid]
+      if not last_seen and pid not in output_ids:
+        del states[pid]
+        stats['absorbed'] += 1
+    stats['scans'] += 1
+    stats['output_objects'] += len(result)
+    multi = 0
+    for obj in result:
+      if len(obj.members) > 1:
+        multi += 1
+    self.last_multi_count = multi
     self.last_decisions = tuple(decisions)
     return tuple(sorted(result, key=lambda obj: obj.physical_track_id))
 
@@ -1330,6 +1581,8 @@ class _BoschStaticOffPathFilter:
   def __init__(self):
     from openpilot.selfdrive.carrot.radar_motion.predictor import model_path_y
     self._path_y = model_path_y
+    self._checked_path = None
+    self._checked_valid = False
 
   def update(self, objects, timestamp_ns, v_ego, path=(), yaw_rate=None):
     # Unknown ego speed remains the only whole-scan fail-open: without it the
@@ -1338,9 +1591,16 @@ class _BoschStaticOffPathFilter:
       return objects
     # Provider supplies only causal, fresh paths. An unusable path no longer
     # retains the whole scan; those objects fall back to a straight corridor.
-    path_valid = (len(path) >= 2
-                  and all(math.isfinite(x) and math.isfinite(y) for x, y in path)
-                  and all(path[i][0] < path[i + 1][0] for i in range(len(path) - 1)))
+    # The same model path is handed to several scans, so validate it once and
+    # keep a reference alongside the verdict rather than rescanning every time.
+    if path is self._checked_path:
+      path_valid = self._checked_valid
+    else:
+      path_valid = (len(path) >= 2
+                    and all(math.isfinite(x) and math.isfinite(y) for x, y in path)
+                    and all(path[i][0] < path[i + 1][0] for i in range(len(path) - 1)))
+      self._checked_path = path
+      self._checked_valid = path_valid
     # In vehicle coordinates a world-static return moves at -vEgo + yaw*yRel,
     # so the rotational term must be removed before judging ground speed. A
     # missing or non-finite yaw degrades to the previous naive residual, which
@@ -1447,7 +1707,12 @@ def bosch_append_points(radar, objects, v_ego, now_ns, alias=None):
   for index, obj in enumerate(objects, offset):
     point = points[index]
     bosch_fill_point(point, obj, v_ego, alias)
-    representative = next(member for member in obj.members if member.raw_track_id == obj.representative_raw_track_id)
+    members = obj.members
+    if len(members) == 1:
+      representative = members[0]
+    else:
+      representative = next(member for member in members
+                            if member.raw_track_id == obj.representative_raw_track_id)
     # Read the native Float32 fields before projection, exactly as the original
     # temporary RadarData path did. This also preserves rounding for test inputs.
     age_s = (now_ns - representative.timestamp_ns) * 1e-9
@@ -1636,14 +1901,25 @@ class BoschRadarProvider:
     self._last_now_ns = now_ns
     if self._start_ns is None:
       self._start_ns = now_ns
+    # Roughly six thousand frames a second reach this loop and about two hundred
+    # are ours, so the reject path stays two indexed comparisons: no unpacking,
+    # no attribute lookups and no payload copy until a frame is actually kept.
+    bus = self.bus
+    frames = self._frames
+    anchors = self._anchors
+    order = self._order
     for timestamp_ns, messages in can_packets:
-      for address, payload, source in messages:
-        if source != self.bus or not 0x601 <= address <= 0x612:
+      future = timestamp_ns > now_ns
+      for message in messages:
+        if message[2] != bus:
           continue
-        if timestamp_ns > now_ns:
+        address = message[0]
+        if address < 0x601 or address > 0x612:
+          continue
+        if future:
           self._pending_error = True
           continue
-        payload = bytes(payload)
+        payload = bytes(message[1])
         if address == 0x612:
           if len(payload) != 8:
             self._pending_error = True
@@ -1652,11 +1928,12 @@ class BoschRadarProvider:
           if tick % 10 == 0:
             if self._last_closed_anchor_ns is not None and timestamp_ns <= self._last_closed_anchor_ns:
               continue
-            if not any(ns == timestamp_ns for ns, _ in self._anchors):
-              self._anchors.append((timestamp_ns, tick))
+            if not any(ns == timestamp_ns for ns, _ in anchors):
+              anchors.append((timestamp_ns, tick))
         else:
-          self._frames.append(_BoschCanFrame(timestamp_ns, address, payload, self._order))
-          self._order += 1
+          frames.append(_BoschCanFrame(timestamp_ns, address, payload, order))
+          order += 1
+    self._order = order
     if len(self._anchors) > 1:
       self._anchors.sort()
     output = None
