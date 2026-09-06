@@ -445,6 +445,35 @@ class BoschRawTrack:
     return self.detection.v_rel
 
 
+@dataclass(frozen=True)
+class BoschRawAssociationDecision:
+  """One raw-return association, recorded for shadow diagnostics only.
+
+  Positions are in the scan-time rotated frame the association actually uses,
+  so residual_d_m and residual_bearing_rad are the quantities the distance and
+  bearing gates were applied to. best_alternative_cost is the cheapest edge
+  this detection did not take, which is what makes a swap visible offline.
+  """
+  timestamp_ns: int
+  raw_track_id: int
+  slot: int
+  previous_slot: int | None
+  created: bool
+  recovered: bool
+  age_scans: int
+  d_rel: float
+  y_rel: float
+  v_rel: float
+  predicted_d_rel: float | None
+  predicted_y_rel: float | None
+  residual_d_m: float | None
+  residual_bearing_rad: float | None
+  bearing_gate_rad: float | None
+  chosen_cost: float | None
+  best_alternative_cost: float | None
+  candidate_count: int
+
+
 @dataclass
 class _BoschRawState:
   track: BoschRawTrack
@@ -615,6 +644,10 @@ class BoschRawTrackManager:
       "gated_pairs", "distance_rejections", "speed_rejections", "bearing_rejections",
       "yaw_compensated_updates", "yaw_unavailable_updates",
     )}
+    # Shadow diagnostic switch, matching the group manager. Off leaves the scan
+    # path unchanged; on only fills last_decisions. Neither setting gates a match.
+    self.trace_decisions = False
+    self.last_decisions: tuple[BoschRawAssociationDecision, ...] = ()
 
   @property
   def active_count(self) -> int:
@@ -728,6 +761,7 @@ class BoschRawTrackManager:
     for state, (x, y) in zip(retained, predicted):
       self._states[state.track.raw_track_id] = _BoschRawState(state.track, x, y, state.last_seen_scan_ns, state.last_seen_update)
     output = []
+    decisions = []
     for col, (point, (x, y)) in enumerate(zip(current, observed)):
       if col in assignment:
         old = retained[assignment[col]]
@@ -742,6 +776,28 @@ class BoschRawTrackManager:
         self.stats["created"] += 1
       output.append(track)
       self._states[track.raw_track_id] = _BoschRawState(track, x, y, timestamp_ns, self._update_count)
+      if self.trace_decisions:
+        row = assignment.get(col)
+        chosen = next((cost for other, cost in column_edges[col] if other == row), None)
+        alternatives = sorted(cost for other, cost in column_edges[col] if other != row)
+        bearing = None
+        if row is not None:
+          angle = observed_bearings[col] - predicted_bearings[row]
+          bearing = math.atan2(math.sin(angle), math.cos(angle))
+        decisions.append(BoschRawAssociationDecision(
+          timestamp_ns=timestamp_ns, raw_track_id=track.raw_track_id, slot=point.slot,
+          previous_slot=track.previous_slot, created=col not in assignment,
+          recovered=track.recovered, age_scans=track.age_scans,
+          d_rel=point.d_rel, y_rel=point.y_rel, v_rel=point.v_rel,
+          predicted_d_rel=predicted[row][0] if row is not None else None,
+          predicted_y_rel=predicted[row][1] if row is not None else None,
+          residual_d_m=x-predicted[row][0] if row is not None else None,
+          residual_bearing_rad=bearing,
+          bearing_gate_rad=(config.bearing_gate_rad(max(0.0, min(predicted[row][0], x)))
+                            if row is not None else None),
+          chosen_cost=chosen, best_alternative_cost=alternatives[0] if alternatives else None,
+          candidate_count=len(column_edges[col])))
+    self.last_decisions = tuple(decisions)
     self.last_timestamp_ns = int(timestamp_ns)
     for key, value in pending_stats.items():
       self.stats[key] += value
@@ -817,6 +873,49 @@ class BoschPhysicalObject:
     return tuple(m.slot for m in self.members)
 
 
+@dataclass(frozen=True)
+class BoschAssociationDecision:
+  """One physical-ID assignment, recorded for shadow diagnostics only.
+
+  The tracker never reads these records back, so enabling the trace cannot
+  change a published object, ID, coordinate or timestamp. It exists to answer
+  one question offline: how far is the state that inherits a physical ID from
+  the state that ID last published, projected forward over the scan gap?
+
+  member_overlap counts the raw members the assignment actually scored, which
+  includes members retained only for coasting. observed_member_overlap counts
+  the members of the previously published object. A carry with
+  observed_member_overlap == 0 kept an ID through a coasted member alone.
+  """
+  timestamp_ns: int
+  physical_track_id: int
+  previous_physical_track_id: int | None
+  assignment_mode: str
+  dt_s: float
+  member_raw_track_ids: tuple[int, ...]
+  member_slots: tuple[int, ...]
+  previous_member_raw_track_ids: tuple[int, ...]
+  member_overlap: int
+  observed_member_overlap: int
+  representative_raw_track_id: int
+  previous_representative_raw_track_id: int | None
+  representative_changed: bool
+  representative_still_a_member: bool
+  d_rel: float
+  y_rel: float
+  v_rel: float
+  predicted_d_rel: float | None
+  predicted_y_rel: float | None
+  predicted_v_rel: float | None
+  residual_d_m: float | None
+  residual_y_m: float | None
+  residual_v_mps: float | None
+  best_score: float | None
+  second_score: float | None
+  age_scans: int
+  grouping_evidence: str
+
+
 @dataclass
 class _BoschPairEvidence:
   samples: deque = field(default_factory=deque)
@@ -846,6 +945,10 @@ class BoschObjectGroupManager:
     self.stats = Counter()
     self.last_pair_possible = self.last_pair_candidates = 0
     self.last_conflicts = self.last_direct_carries = self.last_multi_count = 0
+    # Shadow diagnostic switch. Off leaves the scan path byte-for-byte as it
+    # was; on only fills last_decisions. Neither setting gates an assignment.
+    self.trace_decisions = False
+    self.last_decisions: tuple[BoschAssociationDecision, ...] = ()
 
   @property
   def last_diagnostics(self):
@@ -1033,6 +1136,8 @@ class BoschObjectGroupManager:
       cluster_owners[i] |= cluster_owners.pop(j)
 
     assigned = {}
+    carry_mode = None
+    solver_scores = None
     self.last_conflicts = self.last_direct_carries = 0
     if previous and clusters:
       # In a conflict-free graph every positive overlap edge must be selected;
@@ -1057,7 +1162,9 @@ class BoschObjectGroupManager:
       if not ambiguous:
         assigned = {i: previous[mask.bit_length()-1] for i, mask in enumerate(cluster_owners) if mask}
         self.last_direct_carries = len(assigned)
+        carry_mode = 'direct_carry'
       else:
+        carry_mode = 'assignment_solver'
         scores = np.zeros((len(clusters), len(previous)+len(clusters)))
         for i, cluster in enumerate(clusters):
           members = {ids[k] for k in cluster}
@@ -1070,8 +1177,11 @@ class BoschObjectGroupManager:
                       min(state.observation.age_scans, 1000)*1e-5 + 1/(pid+1))
         ri, ci = bosch_linear_sum_assignment(-scores)
         assigned = {int(i): previous[int(j)] for i, j in zip(ri, ci) if j < len(previous) and scores[i, j] > 0}
+        if self.trace_decisions:
+          solver_scores = scores
 
     result = []
+    decisions = []
     current_ids = set(ids)
     vision_supported = [self._vision_support(r, vision) for r in raw_tracks] if vision else [False] * n
     for i, cluster in enumerate(clusters):
@@ -1085,13 +1195,18 @@ class BoschObjectGroupManager:
         self.stats['created'] += 1
       candidates = [raw_tracks[k] for k in sorted(cluster)]
       member_ids = {m.raw_track_id for m in candidates}
-      if prior and len(candidates) > 1:
+      predicted = None
+      # A single-member cluster picks its only member, so production skips the
+      # projection there. The trace still needs it: that is exactly the case in
+      # which no continuity term reaches the published state at all.
+      if prior and (len(candidates) > 1 or self.trace_decisions):
         dt = (timestamp_ns-prior.timestamp_ns)/1e9
         angle = -(yaw_rate or 0.)*dt
         dx = prior.d_rel + prior.v_rel*dt
         ca, sa = math.cos(angle), math.sin(angle)
         px = dx*ca-prior.y_rel*sa
         py = dx*sa+prior.y_rel*ca
+        predicted = (dt, px, py)
       elif not prior and len(candidates) > 1:
         median = float(np.median([m.d_rel for m in candidates]))
       def representative_cost(m):
@@ -1108,6 +1223,9 @@ class BoschObjectGroupManager:
                 any(vision_supported[k] for k in cluster),
                 (prior.age_scans+1 if prior else 1),
                 'temporal_complete_link' if len(candidates)>1 else 'single_return')
+      if self.trace_decisions:
+        decisions.append(self._decision(obj, old, prior, carry_mode, predicted,
+                                        solver_scores, i, previous))
       last_seen = dict(old.member_last_seen) if old else {}
       # A raw member currently assigned elsewhere cannot belong to this ID.
       for rid in list(last_seen):
@@ -1141,13 +1259,60 @@ class BoschObjectGroupManager:
     self.stats['scans'] += 1
     self.stats['output_objects'] += len(result)
     self.last_multi_count = sum(len(obj.members) > 1 for obj in result)
+    self.last_decisions = tuple(decisions)
     return tuple(sorted(result, key=lambda obj: obj.physical_track_id))
+
+  def _decision(self, obj, old, prior, carry_mode, predicted, solver_scores, cluster_index, previous):
+    """Build one shadow record. Called only while trace_decisions is set."""
+    member_ids = {m.raw_track_id for m in obj.members}
+    best = second = None
+    if solver_scores is not None:
+      ranked = sorted((float(v) for v in solver_scores[cluster_index][:len(previous)] if v > 0), reverse=True)
+      best = ranked[0] if ranked else None
+      second = ranked[1] if len(ranked) > 1 else None
+    dt_s = px = py = residual_d = residual_y = residual_v = None
+    if predicted is not None:
+      dt_s, px, py = predicted
+      residual_d, residual_y = obj.d_rel-px, obj.y_rel-py
+      residual_v = obj.v_rel-prior.v_rel
+    elif prior is not None:
+      dt_s = (obj.timestamp_ns-prior.timestamp_ns)/1e9
+    return BoschAssociationDecision(
+      timestamp_ns=obj.timestamp_ns,
+      physical_track_id=obj.physical_track_id,
+      previous_physical_track_id=prior.physical_track_id if prior else None,
+      assignment_mode='created' if prior is None else carry_mode,
+      dt_s=dt_s if dt_s is not None else 0.,
+      member_raw_track_ids=tuple(m.raw_track_id for m in obj.members),
+      member_slots=obj.member_slots,
+      previous_member_raw_track_ids=tuple(m.raw_track_id for m in prior.members) if prior else (),
+      member_overlap=len(member_ids.intersection(old.member_last_seen)) if old else 0,
+      observed_member_overlap=len(member_ids.intersection(m.raw_track_id for m in prior.members)) if prior else 0,
+      representative_raw_track_id=obj.representative_raw_track_id,
+      previous_representative_raw_track_id=prior.representative_raw_track_id if prior else None,
+      representative_changed=bool(prior and prior.representative_raw_track_id != obj.representative_raw_track_id),
+      representative_still_a_member=bool(prior and prior.representative_raw_track_id in member_ids),
+      d_rel=obj.d_rel, y_rel=obj.y_rel, v_rel=obj.v_rel,
+      predicted_d_rel=px, predicted_y_rel=py,
+      predicted_v_rel=prior.v_rel if prior else None,
+      residual_d_m=residual_d, residual_y_m=residual_y, residual_v_mps=residual_v,
+      best_score=best, second_score=second,
+      age_scans=obj.age_scans, grouping_evidence=obj.grouping_evidence)
 
 
 class BoschPhysicalTracker:
   def __init__(self, raw_config: BoschRawTrackingConfig | None = None, group_config: BoschGroupingConfig | None = None):
     self.raw_manager = BoschRawTrackManager(raw_config)
     self.group_manager = BoschObjectGroupManager(group_config)
+
+  def set_decision_trace(self, enabled: bool) -> None:
+    """Turn the shadow association traces on both layers on or off.
+
+    Diagnostics only: neither layer reads its trace back, so this never changes
+    a raw match, a physical ID, a representative or a published coordinate.
+    """
+    self.raw_manager.trace_decisions = bool(enabled)
+    self.group_manager.trace_decisions = bool(enabled)
 
   def update(self, timestamp_ns, detections, *, yaw_rate=None, v_ego=math.nan, oem_slot=None, vision=()):
     start_ns = time.perf_counter_ns()
@@ -1196,8 +1361,72 @@ class _BoschStaticOffPathFilter:
     return objects if len(kept) == len(objects) else tuple(kept)
 
 
-def bosch_fill_point(point, obj, v_ego):
-  point.trackId = obj.physical_track_id
+BOSCH_PUBLICATION_ALIAS_START = 32
+BOSCH_PUBLICATION_ALIAS_COUNT = 64
+BOSCH_PUBLICATION_ALIAS_GRACE_S = 0.5
+
+
+class BoschPublicationAliasAllocator:
+  """Physical-ID bindings for the existing Hyundai front publication namespace.
+
+  Tracking never reads these aliases. Unused aliases, then released aliases in
+  FIFO order, are assigned independently of raw slots and representatives.
+  """
+  def __init__(self):
+    self.physical_to_alias: dict[int, int] = {}
+    self.alias_to_physical: dict[int, int] = {}
+    self.last_published_ns: dict[int, int] = {}
+    self.free_aliases = deque(range(BOSCH_PUBLICATION_ALIAS_START,
+                                   BOSCH_PUBLICATION_ALIAS_START + BOSCH_PUBLICATION_ALIAS_COUNT))
+    self.peak_usage = 0
+    self.denial_count = 0
+    self.grace_eviction_count = 0
+
+  @property
+  def current_usage(self):
+    return len(self.physical_to_alias)
+
+  def _release(self, physical_id):
+    alias = self.physical_to_alias.pop(physical_id)
+    del self.alias_to_physical[alias]
+    del self.last_published_ns[physical_id]
+    self.free_aliases.append(alias)
+
+  def update(self, timestamp_ns, published_ids, live_ids) -> dict[int, int]:
+    published = set(published_ids)
+    # Bosch has at most 32 raw returns per scan, hence at most 32 physical
+    # objects. Do not silently truncate or alias two objects if that invariant
+    # is ever violated by a future producer using this 64-entry allocator.
+    if len(published) > BOSCH_PUBLICATION_ALIAS_COUNT:
+      self.denial_count += len(published) - BOSCH_PUBLICATION_ALIAS_COUNT
+      raise ValueError('Bosch publication exceeds the front radar alias pool')
+    grace_ns = int(BOSCH_PUBLICATION_ALIAS_GRACE_S * 1e9)
+    for physical_id in list(self.physical_to_alias):
+      if physical_id not in live_ids or timestamp_ns - self.last_published_ns[physical_id] > grace_ns:
+        self._release(physical_id)
+
+    needed = len(published.difference(self.physical_to_alias)) - len(self.free_aliases)
+    if needed > 0:
+      # Under pressure only unpublished grace bindings may be reclaimed;
+      # every currently published object keeps its binding and is emitted.
+      dormant = sorted(physical_id for physical_id in self.physical_to_alias if physical_id not in published)
+      dormant.sort(key=self.last_published_ns.__getitem__)
+      for physical_id in dormant[:needed]:
+        self._release(physical_id)
+        self.grace_eviction_count += 1
+
+    for physical_id in sorted(published):
+      if physical_id not in self.physical_to_alias:
+        alias = self.free_aliases.popleft()
+        self.physical_to_alias[physical_id] = alias
+        self.alias_to_physical[alias] = physical_id
+      self.last_published_ns[physical_id] = timestamp_ns
+    self.peak_usage = max(self.peak_usage, self.current_usage)
+    return {physical_id: self.physical_to_alias[physical_id] for physical_id in published}
+
+
+def bosch_fill_point(point, obj, v_ego, alias=None):
+  point.trackId = obj.physical_track_id if alias is None else alias[obj.physical_track_id]
   point.dRel, point.yRel, point.vRel = obj.d_rel, obj.y_rel, obj.v_rel
   point.aRel = point.yvRel = point.aLead = point.jLead = math.nan
   point.vLead = v_ego + obj.v_rel
@@ -1206,7 +1435,7 @@ def bosch_fill_point(point, obj, v_ego):
   point.measured = True
 
 
-def bosch_append_points(radar, objects, v_ego, now_ns):
+def bosch_append_points(radar, objects, v_ego, now_ns, alias=None):
   """Append directly to the final native list, retaining SCC aliasing safety."""
   if not objects:
     return
@@ -1217,7 +1446,7 @@ def bosch_append_points(radar, objects, v_ego, now_ns):
     points[index] = values
   for index, obj in enumerate(objects, offset):
     point = points[index]
-    bosch_fill_point(point, obj, v_ego)
+    bosch_fill_point(point, obj, v_ego, alias)
     representative = next(member for member in obj.members if member.raw_track_id == obj.representative_raw_track_id)
     # Read the native Float32 fields before projection, exactly as the original
     # temporary RadarData path did. This also preserves rounding for test inputs.
@@ -1288,6 +1517,7 @@ class BoschRadarProvider:
   def __init__(self, bus: int, *, qualification=True):
     self.bus = bus
     self.tracker = BoschPhysicalTracker()
+    self.publication_aliases = BoschPublicationAliasAllocator()
     self.qualifier = _BoschStaticOffPathFilter() if qualification else None
     self.can_error = False
     self.wrong_config = False
@@ -1355,6 +1585,9 @@ class BoschRadarProvider:
       f'native_ms_max={self._perf_native_max * 1e-6:.3f} '
       f'raw_components={self._perf_components} largest_raw_component={self._perf_largest_component} '
       f'raw_fallbacks={self._perf_fallbacks} physical_conflicts={self._perf_conflicts} '
+      f'alias_usage={self.publication_aliases.current_usage}/{BOSCH_PUBLICATION_ALIAS_COUNT} '
+      f'alias_peak={self.publication_aliases.peak_usage} alias_denial={self.publication_aliases.denial_count} '
+      f'alias_grace_evictions={self.publication_aliases.grace_eviction_count} '
       f'can_error={int(self.can_error)}'
     )
     self._reset_perf()
@@ -1709,10 +1942,13 @@ class RadarInterface(RadarInterfaceBase):
     ret = super().update_carrot(v_ego, a_ego, rcv_time, can_packets)
     if ret is not None and self.bosch is not None:
       scan_ns = self.bosch.last_scan_timestamp_ns
-      if scan_ns is not None and 0 <= self._bosch_now_ns - scan_ns <= BOSCH_SAMPLE_HOLD_NS:
-        start_ns = time.perf_counter_ns()
-        bosch_append_points(ret, self._bosch_objects, self.v_ego, self._bosch_now_ns)
-        self.bosch.record_native_time(time.perf_counter_ns() - start_ns)
+      objects = (self._bosch_objects if scan_ns is not None and 0 <= self._bosch_now_ns - scan_ns <= BOSCH_SAMPLE_HOLD_NS
+                 else ())
+      start_ns = time.perf_counter_ns()
+      alias = self.bosch.publication_aliases.update(
+        self._bosch_now_ns, (obj.physical_track_id for obj in objects), self.bosch.tracker.group_manager.states)
+      bosch_append_points(ret, objects, self.v_ego, self._bosch_now_ns, alias)
+      self.bosch.record_native_time(time.perf_counter_ns() - start_ns)
     return ret
 
   def update(self, can_strings):
