@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../ops/ops.cuh"
 #include <iostream>
 
 #define CHECK_CUDA_ERROR(val) check((val), #val, __FILE__, __LINE__)

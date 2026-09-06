@@ -1,5 +1,5 @@
 # much taken from https://github.com/cloneofsimo/minRF
-from tinygrad import Tensor, nn, GlobalCounters, TinyJit, Context
+from tinygrad import Tensor, nn, GlobalCounters, TinyJit
 from tinygrad.helpers import getenv, trange
 from extra.models.llama import Attention, FeedForward, precompute_freqs_cis
 
@@ -135,7 +135,7 @@ if __name__ == "__main__":
   optimizer = nn.optim.Adam(nn.state.get_parameters(model), lr=5e-4)
 
   @TinyJit
-  @Context(TRAINING=1)
+  @Tensor.train()
   def train_step():
     if getenv("OVERFIT"): samples = Tensor.zeros(getenv("BS", 256), dtype='int')
     else: samples = Tensor.randint(getenv("BS", 256), high=X_train.shape[0])

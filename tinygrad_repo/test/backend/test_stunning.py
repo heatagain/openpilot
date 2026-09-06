@@ -41,7 +41,7 @@ class TestStunning(unittest.TestCase):
     X_samp, Y_samp = X_train[samples], Y_train[samples]
     vi = Variable('i', 0, samples.shape[0]-1)
     with Context(SPLIT_REDUCEOP=0):
-      with Context(TRAINING=1):
+      with Tensor.train():
         losses = []
         for i in range(samples.shape[0]):
           vib = vi.bind(i)

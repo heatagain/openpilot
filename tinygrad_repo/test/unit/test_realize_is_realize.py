@@ -30,7 +30,7 @@ class TestRealizeIsRealized(unittest.TestCase):
   def test_multi(self):
     d = Device.DEFAULT
     t = Tensor.ones(8).contiguous().shard((d, d), axis=0).realize()
-    assert t.uop.src[0].is_realized
+    assert all(u.is_realized for u in t.uop.src)
 
   def test_empty(self):
     t = Tensor.empty(4, 4).realize()

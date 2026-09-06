@@ -1,6 +1,6 @@
 import itertools
 from typing import Callable
-from tinygrad import nn, Tensor, dtypes, Device, TinyJit, Context
+from tinygrad import nn, Tensor, dtypes, Device, TinyJit
 from tinygrad.helpers import getenv, trange, partition
 
 class Model:
@@ -59,7 +59,7 @@ if __name__ == "__main__":
   Tensor.realize(*params, *buffers, *adam_params, loss, grads)
 
   @TinyJit
-  @Context(TRAINING=1)
+  @Tensor.train()
   def microbatch():
     samples = Tensor.randint(BS // ACC_STEPS, high=X_train.shape[0])
     for t in params: t.grad = None

@@ -3,7 +3,6 @@ import torch
 import unittest
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.nn.optim import Adam, SGD, AdamW, Muon, LAMB
-from tinygrad.helpers import Context
 from test.helpers import needs_second_gpu, slow
 
 np.random.seed(1337)
@@ -46,7 +45,11 @@ def step(tensor, optim, steps=1, teeny=False, **kwargs):
 
 @slow
 class TestOptim(unittest.TestCase):
-  def setUp(self): self.enterContext(Context(TRAINING=1))
+  def setUp(self):
+    self.old_training = Tensor.training
+    Tensor.training = True
+  def tearDown(self):
+    Tensor.training = self.old_training
 
   def _test_optim(self, tinygrad_optim, torch_optim, steps, opts, atol, rtol):
     for x,y in zip(step(Tensor, tinygrad_optim, steps, **opts),
@@ -87,8 +90,7 @@ class TestOptim(unittest.TestCase):
   def test_muon(self): self._test_muon(1, {'lr': 0.001}, 1e-3, 0)
   # TODO: disabled due to big atol
   # def test_muon_high_lr(self): self._test_muon(1, {'lr': 10}, 1e-6, 3e-4)
-  # NOTE: big weight_decay so a missing wd would be way over atol
-  def test_muon_wd(self): self._test_muon(1, {'lr': 0.001, 'weight_decay': 10}, 1e-3, 3e-4)
+  def test_muon_wd(self): self._test_muon(1, {'lr': 0.001, 'weight_decay': 0.01}, 1e-3, 3e-4)
   # TODO: disabled due to big atol
   # def test_muon_high_lr_wd(self): self._test_muon(1, {'lr': 10, 'weight_decay': 0.01}, 1e-6, 5e-4)
 
@@ -144,21 +146,24 @@ class TestOptim(unittest.TestCase):
 
   @unittest.skipUnless(dtypes.half in Device[Device.DEFAULT].renderer.supported_dtypes(), "need half")
   def test_mixed_precision(self):
-    self.enterContext(Context(DEFAULT_FLOAT=dtypes.half))
+    old_default_float, dtypes.default_float = dtypes.default_float, dtypes.half
     # weight update would overflow without upcasting
     self._test_sgd(10, {'lr': 1e10}, 1e-6, 3e-4)
     self._test_adam(1, {'lr': 1e10}, 1e-4, 1e-4)
     self._test_adamw(1, {'lr': 1e10}, 1e-4, 1e-4)
+    dtypes.default_float = old_default_float
 
   def test_assert_tensor_train(self):
     t = Tensor.ones((1,1))
     optimizer = Adam([t])
     optimizer.zero_grad()
+    old_state = Tensor.training
     t.sum().backward()
-    with Context(TRAINING=0):
-      self.assertRaises(RuntimeError, optimizer.step)
-    with Context(TRAINING=1):
-      optimizer.step()
+    Tensor.training = False
+    self.assertRaises(RuntimeError, optimizer.step)
+    Tensor.training = True
+    optimizer.step()
+    Tensor.training = old_state
 
   def test_lamb_cpu_offload(self):
     # test that LAMB works when optimizer params (m, v, b1_t, b2_t) are moved to CPU

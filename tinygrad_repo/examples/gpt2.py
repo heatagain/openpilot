@@ -22,6 +22,10 @@ class Attention:
     self.head_dim = dim // n_heads
 
   def __call__(self, x:Tensor, start_pos:Variable, mask:Optional[Tensor]) -> Tensor:
+    if mask is not None or start_pos.val == 0:
+      # no symbolic shape qkv when consuming prompts
+      start_pos = start_pos.val
+
     if HALF: x = x.half()
     xqkv = self.c_attn(x).reshape(None, None, 3, self.n_heads, self.head_dim)
     xq, xk, xv = [xqkv[:, :, i, :, :] for i in range(3)]
@@ -34,8 +38,12 @@ class Attention:
     # update the cache
     self.cache_kv[:, :, start_pos:start_pos+seqlen, :, :].assign(Tensor.stack(xk, xv)).realize()
 
-    keys = self.cache_kv[0][:, :start_pos+seqlen, :, :]
-    values = self.cache_kv[1][:, :start_pos+seqlen, :, :]
+    if start_pos > 0:
+      keys = self.cache_kv[0][:, :start_pos+seqlen, :, :]
+      values = self.cache_kv[1][:, :start_pos+seqlen, :, :]
+    else:
+      keys = xk
+      values = xv
 
     xq, keys, values = xq.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
     return self.c_proj(xq.scaled_dot_product_attention(keys, values, mask).transpose(1, 2).reshape(bsz, seqlen, self.dim))
@@ -78,14 +86,15 @@ class Transformer:
       seqlen = tokens.shape[1]
       tok_emb = self.wte(tokens)
 
-    # start_pos is a bound Variable, so everything below it stays symbolic
-    pos_emb = self.wpe(self.allpos.shrink((None, (start_pos, start_pos+seqlen))))
+    # not symbolic when consuming the prompt
+    selected_pos = (0, seqlen) if start_pos.val == 0 else (start_pos, start_pos+1)
+    pos_emb = self.wpe(self.allpos.shrink((None, selected_pos)))
 
     h = tok_emb + pos_emb
 
     if HALF: h = h.half()
 
-    mask = Tensor.full((1, 1, seqlen, start_pos+seqlen), float("-inf"), dtype=h.dtype).triu(start_pos+1) if seqlen > 1 else None
+    mask = Tensor.full((1, 1, seqlen, start_pos.val+seqlen), float("-inf"), dtype=h.dtype).triu(start_pos.val+1) if seqlen > 1 else None
 
     for hi in self.h: h = hi(h, start_pos, mask)
 

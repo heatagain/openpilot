@@ -1,8 +1,7 @@
 ::: tinygrad.dtype.DType
 
-::: tinygrad.dtype.DTypes
+::: tinygrad.dtype.dtypes
     options:
-        heading: dtypes
         members: true
         members_order: source
         show_labels: false

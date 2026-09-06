@@ -1,8 +1,7 @@
 from tinygrad import Tensor, dtypes
+dtypes.default_float = dtypes.float16
 from tinygrad.dtype import to_dtype
-from tinygrad.helpers import getenv, Context
-
-Context(DEFAULT_FLOAT=dtypes.float16).__enter__()
+from tinygrad.helpers import getenv
 
 if __name__ == "__main__":
   # matmuls in bert layers

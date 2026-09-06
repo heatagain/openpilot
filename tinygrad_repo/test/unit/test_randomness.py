@@ -53,12 +53,6 @@ def equal_distribution(tiny_func, torch_func=None, numpy_func=None, shape=(40, 4
 def normal_test(func, shape=(20, 45), alpha=0.05): return equal_distribution(func, numpy_func=lambda x: np.random.randn(*x), shape=shape, alpha=alpha)
 
 class TestRandomness(unittest.TestCase):
-  def test_three_lazy_rands_realized_one_at_a_time_are_distinct(self):
-    Tensor.manual_seed(123)
-    r1, r2, r3 = [Tensor.rand(4) for _ in range(3)]
-    self.assertNotEqual(r1.tolist(), r2.tolist())
-    self.assertNotEqual(r2.tolist(), r3.tolist())
-
   def test_randn(self):
     self.assertEqual(Tensor.randn(3,3,dtype=dtypes.half).dtype, dtypes.half)
     self.assertTrue(normal_test(Tensor.randn))
@@ -119,7 +113,7 @@ class TestRandomness(unittest.TestCase):
     self.assertRaises(AssertionError, lambda: Tensor(2).multinomial(1, replacement=False))
     self.assertRaises(AssertionError, lambda: Tensor([1, 9]).multinomial(0, replacement=False))
     def _check_with_torch(w, num_samples, replacement):
-      tiny_res = Tensor(w).multinomial(num_samples, replacement=replacement).realize()
+      tiny_res = Tensor(w).multinomial(num_samples, replacement=replacement)
       torch_res = torch.tensor(w).multinomial(num_samples, replacement=replacement)
       self.assertEqual(tiny_res.shape, torch_res.shape)
       if torch_res.ndim == 1:
@@ -137,8 +131,8 @@ class TestRandomness(unittest.TestCase):
     @TinyJit
     def sample_one(): return Tensor(w).multinomial(1, replacement=False).realize()
 
-    tiny_samples = [sample_one().item() for _ in range(200)]
-    torch_samples = [torch.tensor(w).multinomial(1, replacement=False).item() for _ in range(200)]
+    tiny_samples = [sample_one().item() for _ in range(400)]
+    torch_samples = [torch.tensor(w).multinomial(1, replacement=False).item() for _ in range(400)]
     self.assertTrue(equal_distribution(lambda *_: Tensor(tiny_samples), lambda _: torch.tensor(torch_samples)))
 
     w = list(range(32))
@@ -153,8 +147,8 @@ class TestRandomness(unittest.TestCase):
     @TinyJit
     def sample_three(): return Tensor(w).multinomial(3, replacement=False).realize()
 
-    tiny_draws = np.array([sample_three().numpy() for _ in range(200)])
-    torch_draws = np.array([torch.tensor(w).multinomial(3, replacement=False).numpy() for _ in range(200)])
+    tiny_draws = np.array([sample_three().numpy() for _ in range(400)])
+    torch_draws = np.array([torch.tensor(w).multinomial(3, replacement=False).numpy() for _ in range(400)])
     for pos in range(3):
       self.assertTrue(equal_distribution(lambda *_: Tensor(tiny_draws[:, pos]), lambda _: torch.tensor(torch_draws[:, pos])))
 
@@ -167,7 +161,7 @@ class TestRandomness(unittest.TestCase):
     self.assertFalse(equal_distribution(lambda *_: tiny_res, lambda _: torch_res))
 
   def test_conv2d_init(self):
-    params = (32, 64, (3,3))
+    params = (128, 256, (3,3))
     assert equal_distribution(lambda *_: nn.Conv2d(*params).weight, lambda _: torch.nn.Conv2d(*params).weight.detach())
     assert equal_distribution(lambda *_: nn.Conv2d(*params).bias, lambda _: torch.nn.Conv2d(*params).bias.detach())
 

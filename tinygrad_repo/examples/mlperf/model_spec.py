@@ -1,6 +1,6 @@
 # load each model here, quick benchmark
 from tinygrad import Tensor, GlobalCounters
-from tinygrad.helpers import getenv, Context
+from tinygrad.helpers import getenv
 import numpy as np
 
 def test_model(model, *inputs):
@@ -59,10 +59,11 @@ def spec_mrcnn():
 
 if __name__ == "__main__":
   # inference only for now
-  with Context(TRAINING=0):
-    for m in getenv("MODEL", "resnet,retinanet,unet3d,rnnt,bert,mrcnn").split(","):
-      nm = f"spec_{m}"
-      if nm in globals():
-        print(f"testing {m}")
-        globals()[nm]()
+  Tensor.training = False
+
+  for m in getenv("MODEL", "resnet,retinanet,unet3d,rnnt,bert,mrcnn").split(","):
+    nm = f"spec_{m}"
+    if nm in globals():
+      print(f"testing {m}")
+      globals()[nm]()
 
