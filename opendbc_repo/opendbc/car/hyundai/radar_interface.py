@@ -588,14 +588,19 @@ def _bosch_admissible_cycle(size, adjacency, real):
   return False
 
 
-def _bosch_unique_component_matching(rows, columns, row_edges, unmatched_cost, margin):
-  """Solve one component's augmented assignment and certify that it is unique.
+def _bosch_component_matching(rows, columns, row_edges, unmatched_cost, margin=None):
+  """Solve one component's augmented assignment, optionally certifying it.
 
   The augmented objective is a sum of independent per-component terms, so a
   component with a strictly unique optimum carries that same matching inside
   every global optimum. Certifying it therefore replaces the whole-scan solver
-  without moving a single association, and an ambiguous component returns None
-  so the caller still rebuilds and solves the original global matrix.
+  without moving a single association.
+
+  Returns (matching, unique), or None when the component is not self-contained
+  or the solve fails. Passing no margin skips the certificate and reports
+  unique False; the matching is still an optimum of this component, and with
+  rows and columns in ascending order it is the one the whole-scan matrix
+  reaches whenever that matrix's own tie choice is a property of the component.
   """
   a, b = len(rows), len(columns)
   size = a + b
@@ -612,13 +617,19 @@ def _bosch_unique_component_matching(rows, columns, row_edges, unmatched_cost, m
     costs[a + j, j] = unmatched_cost
   costs[a:, b:] = 0.
   try:
-    solved_rows, solved_columns, u, v = bosch_numpy_linear_sum_assignment(costs, potentials=True)
+    if margin is None:
+      solved_rows, solved_columns = bosch_numpy_linear_sum_assignment(costs)
+    else:
+      solved_rows, solved_columns, u, v = bosch_numpy_linear_sum_assignment(costs, potentials=True)
   except ValueError:
     return None
-  admissible = (costs - u[:, None] - v[None, :]) <= max(margin, 1e-12)
   partner = dict(zip(solved_rows.tolist(), solved_columns.tolist()))
   if len(partner) != size:
     return None
+  matching = {columns[j]: rows[i] for i, j in partner.items() if i < a and j < b}
+  if margin is None:
+    return matching, False
+  admissible = (costs - u[:, None] - v[None, :]) <= max(margin, 1e-12)
   adjacency = [[] for _ in range(2 * size)]
   for i in range(size):
     matched = partner[i]
@@ -634,9 +645,7 @@ def _bosch_unique_component_matching(rows, columns, row_edges, unmatched_cost, m
     real[i] = 1
   for j in range(b):
     real[size + j] = 1
-  if _bosch_admissible_cycle(2 * size, adjacency, real):
-    return None
-  return {columns[j]: rows[i] for i, j in partner.items() if i < a and j < b}
+  return matching, not _bosch_admissible_cycle(2 * size, adjacency, real)
 
 
 def _bosch_raw_unique_component(rows, columns, row_edges, column_edges, unmatched_cost):
@@ -673,12 +682,13 @@ def _bosch_raw_unique_component(rows, columns, row_edges, column_edges, unmatche
       return matching
 
   # Exact bounded optional matching DP. Keep the runner-up, including equal
-  # optima; ambiguous or numerically indistinguishable results use the original
-  # full solver to retain that backend's deterministic tie behavior.
+  # optima; ambiguous or numerically indistinguishable results are left to the
+  # caller's tie path, which solves the component itself.
   if min(len(rows), len(columns)) > 6 or max(len(rows), len(columns)) > 12:
     # Too wide for the subset DP. Certify the component's own optimum instead;
-    # only a genuinely tied component still needs the whole-scan solver.
-    return _bosch_unique_component_matching(rows, columns, row_edges, unmatched_cost, margin)
+    # only a genuinely tied component reaches the caller's tie path.
+    solved = _bosch_component_matching(rows, columns, row_edges, unmatched_cost, margin)
+    return solved[0] if solved is not None and solved[1] else None
   transposed = len(rows) < len(columns)
   small, large = (rows, columns) if transposed else (columns, rows)
   bits = {vertex: 1 << i for i, vertex in enumerate(small)}
@@ -741,11 +751,21 @@ def _bosch_raw_assignment(n, m, row_edges, column_edges, unmatched_cost):
     components.append((rows, columns))
   largest = max((len(rows) + len(columns) for rows, columns in components), default=0)
   assignment = {}
+  certified = 0
   for rows, columns in components:
     result = _bosch_raw_unique_component(rows, columns, row_edges, column_edges, unmatched_cost)
+    if result is not None:
+      certified += 1
+    else:
+      # A genuinely tied component. Solve it on its own, presenting its rows and
+      # columns in ascending order: the solver breaks ties by index, and inside
+      # one component the whole-scan matrix presents exactly that order.
+      solved = _bosch_component_matching(sorted(rows), sorted(columns), row_edges, unmatched_cost)
+      if solved is not None:
+        result = solved[0]
     if result is None:
-      # Do not solve a tied component in isolation: dummy paths and global row
-      # order can affect SciPy/NumPy's chosen tie. Rebuild the exact old matrix.
+      # Not self-contained, or the component solver refused it. Rebuild the
+      # exact old matrix so this path stays a faithful last resort.
       costs = np.full((n + m, n + m), np.inf)
       for row, edges in enumerate(row_edges):
         costs[row, m + row] = unmatched_cost
@@ -758,7 +778,7 @@ def _bosch_raw_assignment(n, m, row_edges, column_edges, unmatched_cost):
       assignment = {int(column): int(row) for row, column in zip(ri, ci) if row < n and column < m}
       return assignment, len(components), largest, 0, True
     assignment.update(result)
-  return assignment, len(components), largest, len(components), False
+  return assignment, len(components), largest, certified, False
 
 
 class BoschRawTrackManager:
@@ -786,7 +806,7 @@ class BoschRawTrackManager:
     self._states: dict[int, _BoschRawState] = {}
     self.last_pair_possible = self.last_pair_candidates = 0
     self.last_component_count = self.last_largest_component = 0
-    self.last_fast_components = 0
+    self.last_fast_components = self.last_tied_components = 0
     self.last_solver_fallback = False
     self.stats = {name: 0 for name in (
       "updates", "detections", "created", "deleted", "assignments",
@@ -937,6 +957,7 @@ class BoschRawTrackManager:
     self.last_pair_possible, self.last_pair_candidates = n * m, distance_pairs
     self.last_component_count, self.last_largest_component = components, largest
     self.last_fast_components, self.last_solver_fallback = fast_components, fallback
+    self.last_tied_components = 0 if fallback else components - fast_components
     self._update_count += 1
     update_count = self._update_count
     # A coasted state only advances its projection, so it is re-seated in place
@@ -1817,6 +1838,7 @@ class BoschRadarProvider:
     self._perf_raw_pairs = self._perf_raw_possible = 0
     self._perf_physical_pairs = self._perf_physical_possible = 0
     self._perf_components = self._perf_largest_component = self._perf_fallbacks = self._perf_conflicts = 0
+    self._perf_ties = 0
 
   def record_native_time(self, elapsed_ns):
     self._perf_native_count += 1
@@ -1849,7 +1871,8 @@ class BoschRadarProvider:
       f'native_ms_avg={self._perf_native_sum * 1e-6 / max(self._perf_native_count, 1):.3f} '
       f'native_ms_max={self._perf_native_max * 1e-6:.3f} '
       f'raw_components={self._perf_components} largest_raw_component={self._perf_largest_component} '
-      f'raw_fallbacks={self._perf_fallbacks} physical_conflicts={self._perf_conflicts} '
+      f'raw_fallbacks={self._perf_fallbacks} raw_ties={self._perf_ties} '
+      f'physical_conflicts={self._perf_conflicts} '
       f'alias_usage={self.publication_aliases.current_usage}/{BOSCH_PUBLICATION_ALIAS_COUNT} '
       f'alias_peak={self.publication_aliases.peak_usage} alias_denial={self.publication_aliases.denial_count} '
       f'alias_grace_evictions={self.publication_aliases.grace_eviction_count} '
@@ -2048,6 +2071,7 @@ class BoschRadarProvider:
     self._perf_components += raw.last_component_count
     self._perf_largest_component = max(self._perf_largest_component, raw.last_largest_component)
     self._perf_fallbacks += int(raw.last_solver_fallback)
+    self._perf_ties += raw.last_tied_components
     self._perf_conflicts += physical.last_conflicts
     return qualified
 
