@@ -601,6 +601,67 @@ def _bosch_admissible_cycle(size, adjacency, real):
   return False
 
 
+def _bosch_rectangular_unique(rows, columns, row_edges, unmatched_cost, margin):
+  """Certify an optional real matching without solving the square dummy block.
+
+  For k real matches the square cost is sum(edges) + (a+b-2*k)*U.
+  Keeping only real rows and charging 2*U for each private miss gives
+  sum(edges) + (a-k)*2*U: the difference is the constant (b-a)*U.
+  This preserves the optimum, but not the solver's choice among tied optima.
+  Return only a strictly unique matching; every refusal keeps the square path.
+  """
+  a, b = len(rows), len(columns)
+  tolerance = max(margin, 1e-12)
+  # A square admissible cycle has at most a+b non-matching edges. Widen the
+  # rectangular graph conservatively so a near tie refused by that certificate
+  # cannot become a fast success merely because the solver found other duals.
+  threshold = 4 * tolerance * (a + b + 1)
+  if not math.isfinite(threshold):
+    return None
+  costs = np.full((a, a + b), np.inf)
+  column_at = {vertex: j for j, vertex in enumerate(columns)}
+  for i, vertex in enumerate(rows):
+    costs[i, b + i] = 2 * unmatched_cost
+    for other, cost in row_edges[vertex]:
+      j = column_at.get(other)
+      if j is None:
+        return None
+      costs[i, j] = cost
+  try:
+    solved_rows, solved_columns, u, v = bosch_numpy_linear_sum_assignment(costs, potentials=True)
+  except ValueError:
+    return None
+  reduced = costs - u[:, None] - v[None, :]
+  occupied = np.zeros(a + b, dtype=bool)
+  occupied[solved_columns] = True
+  if (len(solved_rows) != a or not np.isfinite(u).all() or not np.isfinite(v).all() or
+      np.any(reduced < -tolerance) or np.any(np.abs(reduced[solved_rows, solved_columns]) > tolerance) or
+      np.any(v > tolerance) or np.any(np.abs(v[~occupied]) > tolerance)):
+    return None
+
+  # Rectangular alternatives are alternating cycles OR alternating paths from
+  # an occupied zero-potential column to a free column. A reservoir closes
+  # exactly these paths into cycles; omitting it would falsely certify ties
+  # that move a birth or miss. Each private dummy column belongs to only one
+  # row, so any cycle containing a row changes an observable real assignment.
+  reservoir = 2 * a + b
+  adjacency = [[] for _ in range(reservoir + 1)]
+  partner = dict(zip(solved_rows.tolist(), solved_columns.tolist()))
+  for i, matched in partner.items():
+    adjacency[a + matched].append(i)
+    adjacency[i].extend(a + j for j in np.flatnonzero(reduced[i] <= threshold).tolist() if j != matched)
+  for j in range(a + b):
+    if not occupied[j]:
+      adjacency[a + j].append(reservoir)
+    elif v[j] >= -threshold:
+      adjacency[reservoir].append(a + j)
+  real = bytearray(reservoir + 1)
+  real[:a] = b'\x01' * a
+  if _bosch_admissible_cycle(reservoir + 1, adjacency, real):
+    return None
+  return {columns[j]: rows[i] for i, j in partner.items() if j < b}
+
+
 def _bosch_component_matching(rows, columns, row_edges, unmatched_cost, margin=None):
   """Solve one component's augmented assignment, optionally certifying it.
 
@@ -615,6 +676,10 @@ def _bosch_component_matching(rows, columns, row_edges, unmatched_cost, margin=N
   rows and columns in ascending order it is the one the whole-scan matrix
   reaches whenever that matrix's own tie choice is a property of the component.
   """
+  if margin is not None:
+    matching = _bosch_rectangular_unique(rows, columns, row_edges, unmatched_cost, margin)
+    if matching is not None:
+      return matching, True
   a, b = len(rows), len(columns)
   size = a + b
   costs = np.full((size, size), np.inf)

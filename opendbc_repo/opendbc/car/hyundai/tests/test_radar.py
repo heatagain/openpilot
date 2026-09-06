@@ -34,6 +34,75 @@ from opendbc.car.hyundai.radar_interface import (
 from opendbc.car.hyundai.values import CAR, HyundaiExtFlags, HyundaiFlags
 
 
+class TestBoschRectangularCertificate:
+  @staticmethod
+  def margin(rows, columns, unmatched=.65):
+    return 1e-12 * max(1., 2 * unmatched) * (rows + columns + 1)
+
+  def test_large_unique_component_skips_square_dummy_rows(self, monkeypatch):
+    # One connected 59-node chain, with a strictly best real matching and one
+    # missed track. No detection or gate is removed by the fast certificate.
+    edges = [[(i, .01)] + ([(i + 1, .2)] if i < 28 else []) for i in range(29)]
+    edges.append([(28, .3)])
+    shapes = []
+    original = radar_interface_module.bosch_numpy_linear_sum_assignment
+
+    def solve(costs, **kwargs):
+      shapes.append(costs.shape)
+      return original(costs, **kwargs)
+
+    monkeypatch.setattr(radar_interface_module, 'bosch_numpy_linear_sum_assignment', solve)
+    result = radar_interface_module._bosch_component_matching(
+      list(range(30)), list(range(29)), edges, .65, self.margin(30, 29))
+    assert result == ({i: i for i in range(29)}, True)
+    assert shapes == [(30, 59)]
+
+  @pytest.mark.parametrize('edges,columns', [
+    ([[(0, .1), (1, .1)]], 2),  # alternating path moves the unmatched detection
+    ([[(0, .1)], [(0, .1)]], 1),  # alternating path moves the missed track
+    ([[(0, 1.3)]], 1),  # an edge ties the birth plus miss cost
+    ([[(0, .1), (1, .1)], [(0, .1), (1, .1)]], 2),  # alternating cycle
+  ])
+  def test_birth_miss_and_cycle_ties_keep_square_choice(self, monkeypatch, edges, columns):
+    rows = list(range(len(edges)))
+    columns = list(range(columns))
+    margin = self.margin(len(rows), len(columns))
+    fast = radar_interface_module._bosch_rectangular_unique
+    assert fast(rows, columns, edges, .65, margin) is None
+    actual = radar_interface_module._bosch_component_matching(rows, columns, edges, .65, margin)
+    monkeypatch.setattr(radar_interface_module, '_bosch_rectangular_unique', lambda *args: None)
+    expected = radar_interface_module._bosch_component_matching(rows, columns, edges, .65, margin)
+    assert actual == expected
+    assert not actual[1]
+
+  def test_uncertified_tie_solve_never_calls_fast_path(self, monkeypatch):
+    def unexpected(*args):
+      raise AssertionError('tie-break must retain the original square solver')
+    monkeypatch.setattr(radar_interface_module, '_bosch_rectangular_unique', unexpected)
+    assert radar_interface_module._bosch_component_matching([0], [0], [[(0, .1)]], .65) == ({0: 0}, False)
+
+  def test_numerically_close_alternative_is_left_to_square(self):
+    margin = self.margin(1, 2)
+    assert radar_interface_module._bosch_rectangular_unique(
+      [0], [0, 1], [[(0, .1), (1, .1 + margin)]], .65, margin) is None
+
+  def test_misses_and_births_are_optional_and_order_is_preserved(self):
+    edges = [[(0, .3)], [(1, .01)], [(2, .4)]]
+    assert radar_interface_module._bosch_component_matching(
+      [2, 1, 0], [2, 0, 1], edges, .05, self.margin(3, 3, .05)) == ({1: 1}, True)
+
+  def test_open_component_and_invalid_cost_keep_refusal(self):
+    margin = self.margin(1, 1)
+    for edges in ([[(2, .1)]], [[(0, math.nan)]], [[(0, -math.inf)]]):
+      assert radar_interface_module._bosch_component_matching([0], [0], edges, .65, margin) is None
+
+  def test_invalid_duals_do_not_certify(self, monkeypatch):
+    import numpy as np
+    monkeypatch.setattr(radar_interface_module, 'bosch_numpy_linear_sum_assignment',
+                        lambda *a, **k: (np.array([0]), np.array([0]), np.array([0.]), np.array([1., 0.])))
+    assert radar_interface_module._bosch_rectangular_unique([0], [0], [[(0, .1)]], .65, self.margin(1, 1)) is None
+
+
 class TestMandoRadar:
   @staticmethod
   def make_interface(monkeypatch):
