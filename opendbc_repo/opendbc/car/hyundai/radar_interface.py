@@ -385,19 +385,32 @@ class BoschRawDetection:
   raw_word: int = 0
 
   def __post_init__(self) -> None:
-    _bosch_integer(self.timestamp_ns, "timestamp_ns", 0)
-    _bosch_integer(self.slot, "slot", 0, 31)
-    _bosch_integer(self.raw_word, "raw_word", 0, 2**32 - 1)
-    _bosch_finite(self.d_rel, "d_rel")
-    _bosch_finite(self.y_rel, "y_rel")
-    _bosch_finite(self.v_rel, "v_rel")
-    if not 0 <= self.d_rel <= 255.75:
+    # Around twenty of these are built per scan and the decoder always presents
+    # exact int/float, so recognise that shape inline and only enter the shared
+    # predicate for anything else. Accepted values and messages are unchanged.
+    timestamp_ns, slot, raw_word = self.timestamp_ns, self.slot, self.raw_word
+    d_rel, y_rel, v_rel = self.d_rel, self.y_rel, self.v_rel
+    if type(timestamp_ns) is not int or timestamp_ns < 0:
+      _bosch_integer(timestamp_ns, "timestamp_ns", 0)
+    if type(slot) is not int or not 0 <= slot <= 31:
+      _bosch_integer(slot, "slot", 0, 31)
+    if type(raw_word) is not int or not 0 <= raw_word <= 2**32 - 1:
+      _bosch_integer(raw_word, "raw_word", 0, 2**32 - 1)
+    # Every coordinate is checked for finiteness before any range is judged:
+    # a value that fails both must still report the finiteness failure.
+    if type(d_rel) is not float or not math.isfinite(d_rel):
+      _bosch_finite(d_rel, "d_rel")
+    if type(y_rel) is not float or not math.isfinite(y_rel):
+      _bosch_finite(y_rel, "y_rel")
+    if type(v_rel) is not float or not math.isfinite(v_rel):
+      _bosch_finite(v_rel, "v_rel")
+    if not 0 <= d_rel <= 255.75:
       raise ValueError("d_rel outside the supported Bosch decoded range")
-    if not -32 <= self.y_rel <= 31.96875:
+    if not -32 <= y_rel <= 31.96875:
       raise ValueError("y_rel outside the supported Bosch decoded range")
-    if not -128 <= self.v_rel <= 127.75:
+    if not -128 <= v_rel <= 127.75:
       raise ValueError("v_rel outside the supported Bosch decoded range")
-    if self.raw_word == BOSCH_INACTIVE_WORD or self.raw_word & (1 << 31):
+    if raw_word == BOSCH_INACTIVE_WORD or raw_word & (1 << 31):
       raise ValueError("empty or unsupported bit31 record is not a RawDetection")
 
   @property
@@ -656,6 +669,14 @@ def _bosch_raw_unique_component(rows, columns, row_edges, column_edges, unmatche
   margin = 1e-12 * max(1.0, abs(reward)) * (len(rows) + len(columns) + 1)
   if not math.isfinite(margin):
     return None
+  if len(rows) == 1 and len(columns) == 1:
+    # The lone pair, which is most of them. It carries exactly one edge, so the
+    # certificate is a single comparison; below that strictness the general
+    # paths refuse as well, and the caller solves the pair itself.
+    saving = reward - row_edges[rows[0]][0][1]
+    if saving > margin:
+      return {columns[0]: rows[0]}
+    return {} if -saving > margin else None
 
   # Distinct strict vertex-best choices attain the sum of independent upper
   # bounds. This certifies the unique optimum, even in a large component.
@@ -730,8 +751,18 @@ def _bosch_raw_assignment(n, m, row_edges, column_edges, unmatched_cost):
   components = []
   visited_rows, visited_columns = set(), set()
   for first in range(n):
-    if not row_edges[first] or first in visited_rows:
+    edges = row_edges[first]
+    if not edges or first in visited_rows:
       continue
+    if len(edges) == 1:
+      column = edges[0][0]
+      if len(column_edges[column]) == 1:
+        # Two thirds of the components are one state and one return that
+        # nothing else can reach; that is the component, so skip the walk.
+        visited_rows.add(first)
+        visited_columns.add(column)
+        components.append(([first], [column]))
+        continue
     rows, columns, pending = [], [], [first]
     while pending:
       vertex = pending.pop()
@@ -858,12 +889,15 @@ class BoschRawTrackManager:
     angle = 0.0 if yaw_rate is None else yaw_rate * dt
     cosine, sine = math.cos(angle), math.sin(angle)
     predicted = []
-    # Retained velocities are read again by the gate loop; keep them off the
-    # RawTrack/RawDetection property chain there.
+    # Retained velocities and slots are read again by the gate loop; keep them
+    # off the RawTrack/RawDetection property chain there.
     retained_speeds = []
+    retained_slots = []
     for state in retained:
-      speed = state.track.detection.v_rel
+      detection = state.track.detection
+      speed = detection.v_rel
       retained_speeds.append(speed)
+      retained_slots.append(detection.slot)
       x = state.x + speed * dt
       predicted.append((cosine * x + sine * state.y, -sine * x + cosine * state.y))
     observed = []
@@ -881,9 +915,12 @@ class BoschRawTrackManager:
     n, m = len(retained), len(current)
     predicted_bearings = [math.atan2(y, x) for x, y in predicted]
     observed_bearings = [math.atan2(y, x) for x, y in observed]
+    predicted_x = [point[0] for point in predicted]
+    observed_x = [point[0] for point in observed]
     row_edges, column_edges = [[] for _ in range(n)], [[] for _ in range(m)]
     distance_pairs = speed_rejections = bearing_rejections = gated_pairs = 0
-    order = sorted(range(m), key=lambda col: observed[col][0])
+    # Same keys the equivalent lambdas produced, read at C speed.
+    order = sorted(range(m), key=observed_x.__getitem__)
     lower = upper = 0
     # Per-scan constants. bearing_gate_rad() is inlined below with exactly the
     # same thresholds and math.radians() values it would have returned.
@@ -894,14 +931,13 @@ class BoschRawTrackManager:
     gate_mid = math.radians(config.bearing_mid_deg)
     gate_far = math.radians(config.bearing_far_deg)
     gate_distant = math.radians(config.bearing_distant_deg)
-    observed_x = [point[0] for point in observed]
     observed_speeds = [point.v_rel for point in current]
     observed_slots = [point.slot for point in current]
     window_gate = math.nextafter(distance_gate, math.inf)
-    for row in sorted(range(n), key=lambda row: predicted[row][0]):
-      pred_x = predicted[row][0]
+    for row in sorted(range(n), key=predicted_x.__getitem__):
+      pred_x = predicted_x[row]
       state_speed = retained_speeds[row]
-      state_slot = retained[row].track.detection.slot
+      state_slot = retained_slots[row]
       predicted_bearing = predicted_bearings[row]
       row_edge = row_edges[row]
       # Cover values whose subtraction rounds onto the gate, including when
@@ -926,7 +962,9 @@ class BoschRawTrackManager:
           continue
         angle = observed_bearings[col] - predicted_bearing
         delta_bearing = abs(math.atan2(math.sin(angle), math.cos(angle)))
-        nearest = max(0.0, min(pred_x, obs_x))
+        nearest = pred_x if pred_x < obs_x else obs_x
+        if nearest < 0.0:
+          nearest = 0.0
         if nearest < 15:
           gate = gate_near
         elif nearest < 30:
@@ -1147,6 +1185,110 @@ class _BoschPhysicalState:
   member_last_seen: dict[int, int]
 
 
+def _bosch_physical_component(rows, columns, row_edges, column_edges, margin):
+  """One component's maximum-weight matching, or None when it is not unique.
+
+  Every score is strictly positive and an unassigned cluster costs nothing, so
+  the augmented square matrix the whole-scan solver builds is minimised exactly
+  by a maximum-weight matching of this graph. A component whose maximum is
+  strictly unique therefore holds the same pairs inside every global optimum,
+  whichever way that solver happened to break its own ties.
+  """
+  if len(rows) == 1:
+    row = rows[0]
+    best = second = 0.
+    partner = None
+    for column, score in row_edges[row]:
+      if score > best:
+        best, second, partner = score, best, column
+      elif score > second:
+        second = score
+    return {row: partner} if best-second > margin else None
+  if len(columns) == 1:
+    column = columns[0]
+    best = second = 0.
+    partner = None
+    for row, score in column_edges[column]:
+      if score > best:
+        best, second, partner = score, best, row
+      elif score > second:
+        second = score
+    return {partner: column} if best-second > margin else None
+  if len(rows) > 8 or len(columns) > 12:
+    return None
+  bits = {column: 1 << i for i, column in enumerate(columns)}
+  options = [[(bits[column], score, (row, column)) for column, score in row_edges[row]] for row in rows]
+  memo = {}
+
+  def solve(index, occupied):
+    # Keep the runner-up as well: equal optima are what the caller must not guess.
+    if index == len(options):
+      return 0., -math.inf, ()
+    key = (index, occupied)
+    cached = memo.get(key)
+    if cached is not None:
+      return cached
+    best, second, matching = solve(index+1, occupied)
+    for bit, score, pair in options[index]:
+      if occupied & bit:
+        continue
+      child_best, child_second, child_matching = solve(index+1, occupied | bit)
+      candidate = score+child_best
+      if candidate > best:
+        best, second, matching = candidate, best, (pair,)+child_matching
+      elif candidate > second:
+        second = candidate
+      runner_up = score+child_second
+      if runner_up > second:
+        second = runner_up
+    result = (best, second, matching)
+    memo[key] = result
+    return result
+
+  best, second, matching = solve(0, 0)
+  return dict(matching) if best-second > margin else None
+
+
+def _bosch_physical_assignment(row_edges, column_edges):
+  """Split the physical score graph into independent parts and solve each one.
+
+  Returns the matching, or None when some part carries more than one optimum:
+  that is the only case in which the whole-scan solver's own tie order is
+  observable, and the caller then rebuilds exactly the matrix it always built.
+  """
+  assignment = {}
+  seen_rows, seen_columns = set(), set()
+  for first, edges in enumerate(row_edges):
+    if not edges or first in seen_rows:
+      continue
+    rows, columns, pending, peak = [], [], [first], 0.
+    while pending:
+      vertex = pending.pop()
+      if vertex >= 0:
+        if vertex in seen_rows:
+          continue
+        seen_rows.add(vertex)
+        rows.append(vertex)
+        for column, score in row_edges[vertex]:
+          if score > peak:
+            peak = score
+          if column not in seen_columns:
+            pending.append(~column)
+      else:
+        column = ~vertex
+        if column in seen_columns:
+          continue
+        seen_columns.add(column)
+        columns.append(column)
+        pending.extend(row for row, _ in column_edges[column] if row not in seen_rows)
+    result = _bosch_physical_component(rows, columns, row_edges, column_edges,
+                                       1e-12*peak*(len(rows)+len(columns)+1))
+    if result is None:
+      return None
+    assignment.update(result)
+  return assignment
+
+
 class BoschObjectGroupManager:
   """Temporal complete-link grouping followed by global physical-ID assignment.
 
@@ -1307,18 +1449,21 @@ class BoschObjectGroupManager:
         samples = evidence.samples
         if samples and timestamp_ns - samples[-1][0] > c.pair_max_gap_s * 1e9:
           samples.clear()
-        samples.append((timestamp_ns, delta_d, delta_y))
+        # Only the magnitudes are ever read back, and abs() is idempotent, so
+        # store them once here instead of re-taking them over the whole window.
+        abs_delta_d, abs_delta_y = abs(delta_d), abs(delta_y)
+        samples.append((timestamp_ns, abs_delta_d, abs_delta_y))
         while timestamp_ns - samples[0][0] > c.evidence_window_s * 1e9:
           samples.popleft()
         # Widening from a recent minimum, not old larger converging separation.
-        stable = (abs(delta_d)-min(abs(s[1]) for s in samples) <= c.max_relative_distance_growth_m and
-                  abs(delta_y)-min(abs(s[2]) for s in samples) <= c.max_relative_lateral_growth_m)
+        stable = (abs_delta_d-min(s[1] for s in samples) <= c.max_relative_distance_growth_m and
+                  abs_delta_y-min(s[2] for s in samples) <= c.max_relative_lateral_growth_m)
         mature = (len(samples) >= c.min_pair_observations and
                   (timestamp_ns-samples[0][0])/1e9 + 1e-6 >= c.min_pair_span_s)
         if stable and mature:
           compatible[i] |= 1 << j
           compatible[j] |= 1 << i
-          cost = abs(delta_d)/c.distance_diameter_m + abs(delta_y)/c.lateral_diameter_m + delta_v/c.velocity_diameter_mps
+          cost = abs_delta_d/c.distance_diameter_m + abs_delta_y/c.lateral_diameter_m + delta_v/c.velocity_diameter_mps
           pair_cost[i*n+j] = pair_cost[j*n+i] = cost
     self.last_pair_possible = n*(n-1)//2
     self.last_pair_candidates = pair_candidates
@@ -1334,14 +1479,30 @@ class BoschObjectGroupManager:
     cluster_masks = [1 << i for i in range(n)]
     cluster_compatible = [compatible[i] | cluster_masks[i] for i in range(n)]
     cluster_owners = [owner_bits.get(owner.get(rid), 0) for rid in ids]
+    member_cluster = list(range(n))
+    max_members = c.max_members
     while True:
       best = None
       for i, a in enumerate(clusters):
-        if not cluster_compatible[i] & ~cluster_masks[i]:
+        reach = cluster_compatible[i] & ~cluster_masks[i]
+        if not reach:
           continue  # No compatible neighbor: singleton/group cannot merge.
-        for j in range(i+1, len(clusters)):
+        # Every cluster that could merge with i has all of its members here, so
+        # walking these bits reaches exactly the candidates the full index scan
+        # did. The minimum below compares whole (owner, cost, i, j) tuples, so
+        # the order they are visited in cannot change which pair wins.
+        limit = max_members-len(a)
+        seen = 0
+        while reach:
+          bit = reach & -reach
+          reach ^= bit
+          j = member_cluster[bit.bit_length()-1]
+          mark = 1 << j
+          if j <= i or seen & mark:
+            continue
+          seen |= mark
           b = clusters[j]
-          if len(a)+len(b) > c.max_members:
+          if len(b) > limit:
             continue
           if cluster_compatible[i] & cluster_masks[j] != cluster_masks[j]:
             continue
@@ -1357,6 +1518,11 @@ class BoschObjectGroupManager:
       cluster_masks[i] |= cluster_masks.pop(j)
       cluster_compatible[i] &= cluster_compatible.pop(j)
       cluster_owners[i] |= cluster_owners.pop(j)
+      for index in range(j, len(clusters)):
+        for member in clusters[index]:
+          member_cluster[member] = index
+      for member in clusters[i]:
+        member_cluster[member] = i
 
     assigned = {}
     carry_mode = None
@@ -1388,7 +1554,6 @@ class BoschObjectGroupManager:
         carry_mode = 'direct_carry'
       else:
         carry_mode = 'assignment_solver'
-        scores = np.zeros((len(clusters), len(previous)+len(clusters)))
         # Invert membership once instead of intersecting every cluster against
         # every previous state; only the states a cluster actually touches can
         # score, and the score itself is unchanged.
@@ -1400,27 +1565,63 @@ class BoschObjectGroupManager:
               holders[rid] = [j]
             else:
               entry.append(j)
+        # Fewer than five in a hundred of the matrix cells the old solver walked
+        # could ever score. Collect the edges instead and let the decomposition
+        # below reach the same matching without materialising the matrix.
+        row_edges, column_edges = [], {}
         for i, cluster in enumerate(clusters):
           members = {ids[k] for k in cluster}
           overlaps = {}
           for rid in members:
             for j in holders.get(rid, ()):
               overlaps[j] = overlaps.get(j, 0) + 1
+          edges = []
           for j, overlap in overlaps.items():
             pid = previous[j]
             observation = self.states[pid].observation
-            scores[i, j] = (10*overlap +
+            score = (10*overlap +
                     3*(observation.representative_raw_track_id in members) +
                     min(observation.age_scans, 1000)*1e-5 + 1/(pid+1))
-        ri, ci = bosch_linear_sum_assignment(-scores)
-        assigned = {int(i): previous[int(j)] for i, j in zip(ri, ci) if j < len(previous) and scores[i, j] > 0}
-        if self.trace_decisions:
-          solver_scores = scores
+            edges.append((j, score))
+            column = column_edges.get(j)
+            if column is None:
+              column_edges[j] = [(i, score)]
+            else:
+              column.append((i, score))
+          row_edges.append(edges)
+        # The shadow trace reports the whole score matrix, so a trace run keeps
+        # the original path; production never needs the matrix at all.
+        matched = None if self.trace_decisions else _bosch_physical_assignment(row_edges, column_edges)
+        if matched is None:
+          scores = np.zeros((len(clusters), len(previous)+len(clusters)))
+          for i, edges in enumerate(row_edges):
+            for j, score in edges:
+              scores[i, j] = score
+          ri, ci = bosch_linear_sum_assignment(-scores)
+          assigned = {int(i): previous[int(j)] for i, j in zip(ri, ci) if j < len(previous) and scores[i, j] > 0}
+          if self.trace_decisions:
+            solver_scores = scores
+        else:
+          assigned = {i: previous[j] for i, j in matched.items()}
 
     result = []
     decisions = []
     current_ids = set(ids)
-    vision_supported = [self._vision_support(r, vision) for r in raw_tracks] if vision else [False] * n
+    # Whether a cue is usable at all depends on the cue alone. Test that once
+    # per scan instead of once per return; the two tolerance comparisons that
+    # actually decide support are untouched, and an unusable cue could never
+    # reach them anyway.
+    cues = [(cue.d_rel, cue.y_rel, cue.distance_tolerance_m, cue.lateral_tolerance_m) for cue in vision
+            if math.isfinite(cue.d_rel) and math.isfinite(cue.y_rel) and cue.probability >= .7]
+    if cues:
+      vision_supported = []
+      for track in raw_tracks:
+        point = track.detection
+        d_rel, y_rel = point.d_rel, point.y_rel
+        vision_supported.append(any(abs(d_rel-cd) <= dt and abs(y_rel-cy) <= lt
+                                    for cd, cy, dt, lt in cues))
+    else:
+      vision_supported = [False] * n
     # Nearly nine in ten clusters hold one return. Split that case out and hoist
     # the loop-invariant lookups; the emitted object is byte-for-byte the same.
     stats = self.stats
@@ -1439,8 +1640,14 @@ class BoschObjectGroupManager:
         pid, self.next_id = self.next_id, self.next_id+1
         stats['created'] += 1
       size = len(cluster)
-      candidates = [raw_tracks[cluster[0]]] if size == 1 else [raw_tracks[k] for k in sorted(cluster)]
-      member_ids = {m.raw_track_id for m in candidates}
+      # Build the member sequence as the tuple the emitted object keeps, so the
+      # object below stores it without a second copy.
+      if size == 1:
+        candidates = (raw_tracks[cluster[0]],)
+        member_ids = {candidates[0].raw_track_id}
+      else:
+        candidates = tuple(raw_tracks[k] for k in sorted(cluster))
+        member_ids = {m.raw_track_id for m in candidates}
       predicted = None
       # A single-member cluster picks its only member, so production skips the
       # projection there. The trace still needs it: that is exactly the case in
@@ -1454,10 +1661,15 @@ class BoschObjectGroupManager:
         py = dx*sa+prior.y_rel*ca
         predicted = (dt, px, py)
       elif not prior and size > 1:
-        median = float(np.median([m.d_rel for m in candidates]))
+        # Same order statistic np.median returns, without entering NumPy for a
+        # handful of floats: the even case averages the two middle values in
+        # float64 exactly as np.mean of that pair does.
+        ordered = sorted(m.d_rel for m in candidates)
+        middle = size//2
+        median = ordered[middle] if size % 2 else (ordered[middle-1]+ordered[middle])/2
       if size == 1:
         rep = candidates[0]
-        oem_selected = rep.slot == oem_slot
+        oem_selected = rep.detection.slot == oem_slot
         supported = vision_supported[cluster[0]]
         evidence = 'single_return'
       else:
@@ -1473,37 +1685,50 @@ class BoschObjectGroupManager:
         oem_selected = any(m.slot == oem_slot for m in candidates)
         supported = any(vision_supported[k] for k in cluster)
         evidence = 'temporal_complete_link'
-      obj = BoschPhysicalObject(pid, timestamp_ns, tuple(candidates), rep.raw_track_id,
-                rep.d_rel, rep.y_rel, rep.v_rel, oem_selected, supported,
+      point = rep.detection
+      v_rel = point.v_rel
+      obj = BoschPhysicalObject(pid, timestamp_ns, candidates, rep.raw_track_id,
+                point.d_rel, point.y_rel, v_rel, oem_selected, supported,
                 (prior.age_scans+1 if prior else 1), evidence)
       if trace:
         decisions.append(self._decision(obj, old, prior, carry_mode, predicted,
                                         solver_scores, i, previous))
       # A raw member currently assigned elsewhere cannot belong to this ID.
-      last_seen = ({rid: ns for rid, ns in old.member_last_seen.items()
-                    if rid not in current_ids or rid in member_ids} if old else {})
+      # Dropping those in place leaves the surviving entries in the order the
+      # rebuilt map had, and this state is the one states[pid] already holds.
+      if old is None:
+        last_seen = {}
+        states[pid] = _BoschPhysicalState(obj, last_seen)
+      else:
+        last_seen = old.member_last_seen
+        for rid in [rid for rid in last_seen if rid in current_ids and rid not in member_ids]:
+          del last_seen[rid]
+        old.observation = obj
       for m in candidates:
         last_seen[m.raw_track_id] = timestamp_ns
-      states[pid] = _BoschPhysicalState(obj, last_seen)
       if prior and prior.representative_raw_track_id != rep.raw_track_id:
         stats['representative_changes'] += 1
-      old_owners = set()
-      recovered_all = old is not None
-      for m in candidates:
-        holder = owner.get(m.raw_track_id)
-        if holder is not None:
-          old_owners.add(holder)
-        if not m.recovered:
-          recovered_all = False
-      if len(old_owners) > 1:
-        stats['membership_merge_events'] += len(old_owners)-1
+      if size == 1:
+        # A lone member has at most one previous owner, so it can never record
+        # a membership merge.
+        recovered_all = old is not None and rep.recovered
+      else:
+        old_owners = set()
+        recovered_all = old is not None
+        for m in candidates:
+          holder = owner.get(m.raw_track_id)
+          if holder is not None:
+            old_owners.add(holder)
+          if not m.recovered:
+            recovered_all = False
+        if len(old_owners) > 1:
+          stats['membership_merge_events'] += len(old_owners)-1
+        stats['multi_member_groups'] += 1
       if recovered_all:
         stats['coasting_recoveries'] += 1
-      if size > 1:
-        stats['multi_member_groups'] += 1
       if supported:
         stats['vision_supported_groups'] += 1
-      if v_ego_known and abs(obj.v_rel+v_ego) <= stationary_speed:
+      if v_ego_known and abs(v_rel+v_ego) <= stationary_speed:
         stats['stationary_groups'] += 1
       if size > largest_group:
         largest_group = size
@@ -1775,16 +2000,20 @@ def bosch_decode_frame(timestamp_ns: int, address: int, payload: bytes):
   """Decode two independent 32-bit records; 0x601 is never a detection."""
   if address not in BOSCH_TRACK_ADDRESSES or len(payload) != 8:
     raise ValueError('expected an eight-byte Bosch raw track frame')
+  # One little-endian read covers both records: in that order the first word is
+  # the low half of the payload, so no slice is copied to reach it.
+  pair = int.from_bytes(payload, 'little')
+  slot = (address - 0x602) * 2
   detections = []
   unsupported = False
   for half in range(2):
-    word = int.from_bytes(payload[half * 4:half * 4 + 4], 'little')
+    word = (pair >> (half * 32)) & 0xFFFFFFFF
     if word == BOSCH_INACTIVE_WORD:
       continue
     if word & (1 << 31):
       unsupported = True
       continue
-    detections.append(BoschRawDetection(timestamp_ns, (address - 0x602) * 2 + half,
+    detections.append(BoschRawDetection(timestamp_ns, slot + half,
                                    (word & 0x3FF) * .25,
                                    ((word >> 10) & 0x7FF) * .03125 - 32,
                                    ((word >> 21) & 0x3FF) * .25 - 128, word))
