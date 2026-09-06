@@ -9,6 +9,7 @@ from tinygrad.runtime.support.system import PCIIfaceBase
 from tinygrad.engine.realize import get_runtime
 from tinygrad.codegen import to_program
 from tinygrad.codegen.opt import Opt, OptOps
+from tinygrad.uop.ops import AxisType
 from tinygrad import Variable
 
 MOCKGPU = DEV.interface.startswith("MOCK")
@@ -31,8 +32,8 @@ class TestHCQ(unittest.TestCase):
 
   def setUp(self):
     TestHCQ.d0.synchronize()
-    TestHCQ.a.uop.buffer.copyin(memoryview(bytearray(struct.pack("ff", 0, 1))))
-    TestHCQ.b.uop.buffer.copyin(memoryview(bytearray(struct.pack("ff", 0, 0))))
+    TestHCQ.a.uop.buffer.copy_from(Buffer("PYTHON", 2, dtypes.float, opaque=memoryview(bytearray(struct.pack("ff", 0, 1)))))
+    TestHCQ.b.uop.buffer.copy_from(Buffer("PYTHON", 2, dtypes.float, opaque=memoryview(bytearray(struct.pack("ff", 0, 0)))))
     TestHCQ.d0.synchronize() # wait for copyins to complete
 
   # Test signals
@@ -167,7 +168,7 @@ class TestHCQ(unittest.TestCase):
     b = a + 1
     si = b.schedule_linear().src[-1]
 
-    prg = to_program(replace_opts(si.src[0], [Opt(op=OptOps.LOCAL, axis=0, arg=3) for _ in range(3)]), TestHCQ.d0.renderer)
+    prg = to_program(replace_opts(si.src[0], [Opt(op=OptOps.SPLIT, axis=0, arg=(3, AxisType.LOCAL)) for _ in range(3)]), TestHCQ.d0.renderer)
     runtime = get_runtime(Device.DEFAULT, prg)
 
     zb = Buffer(Device.DEFAULT, 3 * 3 * 3, dtypes.int, options=BufferSpec(cpu_access=True, nolru=True)).ensure_allocated()
@@ -330,6 +331,7 @@ class TestHCQ(unittest.TestCase):
   # Test profile api
   def test_speed_exec_time(self):
     sig_st, sig_en = TestHCQ.d0.new_signal(), TestHCQ.d0.new_signal()
+    st = time.perf_counter()
     TestHCQ.d0.hw_compute_queue_t().timestamp(sig_st) \
                                    .exec(TestHCQ.runtime, TestHCQ.kernargs_ba_ptr, TestHCQ.prg.arg.global_size, TestHCQ.prg.arg.local_size) \
                                    .timestamp(sig_en) \
@@ -337,11 +339,13 @@ class TestHCQ(unittest.TestCase):
 
     TestHCQ.d0.timeline_signal.wait(TestHCQ.d0.timeline_value)
     TestHCQ.d0.timeline_value += 1
+    host_us = (time.perf_counter() - st) * 1e6
 
     et = float(sig_en.timestamp - sig_st.timestamp)
 
     print(f"exec kernel time: {et:.2f} us")
-    assert 0.1 <= et <= (3000000 if MOCKGPU or Device.DEFAULT in {"CPU"} else 100)
+    # emulated devices are only bounded by the host window around submit+wait
+    assert 0.1 <= et <= (host_us if MOCKGPU or Device.DEFAULT in {"CPU"} else 100)
 
   def test_speed_copy_bandwidth(self):
     if TestHCQ.d0.hw_copy_queue_t is None: self.skipTest("device does not support copy queue")
@@ -352,6 +356,7 @@ class TestHCQ(unittest.TestCase):
     b = Buffer(Device.DEFAULT, SZ, dtypes.uint8, options=BufferSpec(nolru=True)).allocate()
 
     sig_st, sig_en = TestHCQ.d0.new_signal(), TestHCQ.d0.new_signal()
+    st = time.perf_counter()
     TestHCQ.d0.hw_copy_queue_t().timestamp(sig_st) \
                                 .copy(a._buf, b._buf, SZ) \
                                 .timestamp(sig_en) \
@@ -359,13 +364,14 @@ class TestHCQ(unittest.TestCase):
 
     TestHCQ.d0.timeline_signal.wait(TestHCQ.d0.timeline_value)
     TestHCQ.d0.timeline_value += 1
+    host_ms = (time.perf_counter() - st) * 1e3
 
-    et = float(sig_en.timestamp - sig_st.timestamp)
-    et_ms = et / 1e3
+    et_ms = float(sig_en.timestamp - sig_st.timestamp) / 1e3
+    assert 0 < et_ms <= host_ms # timestamps are in us and cover only the copy
 
     gb_s = ((SZ / 1e9) / et_ms) * 1e3
     print(f"same device copy:  {et_ms:.2f} ms, {gb_s:.2f} GB/s")
-    assert (0.2 if MOCKGPU else 10) <= gb_s <= 1000
+    assert (0 if MOCKGPU else 10) <= gb_s <= 1000
 
   def test_speed_cross_device_copy_bandwidth(self):
     if TestHCQ.d0.hw_copy_queue_t is None: self.skipTest("device does not support copy queue")
@@ -376,9 +382,10 @@ class TestHCQ(unittest.TestCase):
     SZ = 200_000_000
     b = Buffer(f"{Device.DEFAULT}:1", SZ, dtypes.uint8, options=BufferSpec(nolru=True)).allocate()
     a = Buffer(Device.DEFAULT, SZ, dtypes.uint8, options=BufferSpec(nolru=True)).allocate()
-    TestHCQ.d0.allocator.map(b._buf)
+    TestHCQ.d0.allocator._map(b._buf)
 
     sig_st, sig_en = TestHCQ.d0.new_signal(), TestHCQ.d0.new_signal()
+    st = time.perf_counter()
     TestHCQ.d0.hw_copy_queue_t().timestamp(sig_st) \
                                 .copy(a._buf, b._buf, SZ) \
                                 .timestamp(sig_en) \
@@ -386,13 +393,14 @@ class TestHCQ(unittest.TestCase):
 
     TestHCQ.d0.timeline_signal.wait(TestHCQ.d0.timeline_value)
     TestHCQ.d0.timeline_value += 1
+    host_ms = (time.perf_counter() - st) * 1e3
 
-    et = float(sig_en.timestamp - sig_st.timestamp)
-    et_ms = et / 1e3
+    et_ms = float(sig_en.timestamp - sig_st.timestamp) / 1e3
+    assert 0 < et_ms <= host_ms # timestamps are in us and cover only the copy
 
     gb_s = ((SZ / 1e9) / et_ms) * 1e3
     print(f"cross device copy: {et_ms:.2f} ms, {gb_s:.2f} GB/s")
-    assert (0.2 if MOCKGPU else 2) <= gb_s <= 100
+    assert (0 if MOCKGPU else 2) <= gb_s <= 100
 
   def test_timeline_signal_rollover(self):
     for queue_type in [TestHCQ.d0.hw_compute_queue_t, TestHCQ.d0.hw_copy_queue_t]:
@@ -454,7 +462,7 @@ class TestHCQ(unittest.TestCase):
     buf1 = Buffer(Device.DEFAULT, 1, dtypes.int8, options=BufferSpec(nolru=True)).ensure_allocated()
     buf2 = Buffer(f"{Device.DEFAULT}:1", 1, dtypes.int8, options=BufferSpec(nolru=True)).ensure_allocated()
     buf3 = Buffer(Device.DEFAULT, 1, dtypes.int8, options=BufferSpec(host=True, nolru=True)).ensure_allocated()
-    TestHCQ.d0.allocator.map(buf2._buf)
+    TestHCQ.d0.allocator._map(buf2._buf)
 
     for i in range(256):
       ctypes.memset(buf3._buf.va_addr, i, 1)
@@ -569,7 +577,7 @@ class TestHCQ(unittest.TestCase):
 
       local_buf = Buffer(f"{Device.DEFAULT}:{devid}", sz, dtypes.uint8, options=BufferSpec(cpu_access=True)).ensure_allocated()
 
-      d.allocator.map(cpu_buffer._buf)
+      d.allocator._map(cpu_buffer._buf)
 
       d.hw_copy_queue_t().wait(d.timeline_signal, d.timeline_value - 1) \
                          .copy(local_buf._buf, cpu_buffer._buf, sz) \

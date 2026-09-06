@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler
 from typing import Any, TypedDict, TypeVar, Generator, Callable
-from tinygrad.helpers import colored, getenv, tqdm, unwrap, word_wrap, TRACEMETA, ProfileEvent, ProfileRangeEvent, TracingKey, ProfilePointEvent, temp
+from tinygrad.helpers import colored, getenv, unwrap, word_wrap, TRACEMETA, ProfileEvent, ProfileRangeEvent, TracingKey, ProfilePointEvent, temp
 from tinygrad.helpers import printable, Context, START_TIME, NO_COLOR, ansistrip
 from tinygrad.renderer.amd.dsl import Inst
 from tinygrad.renderer.amd import detect_format
@@ -37,7 +37,7 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
       self.wfile.write("data: [DONE]\n\n".encode("utf-8"))
     # pass if client closed connection
-    except (BrokenPipeError, ConnectionResetError): return
+    except (BrokenPipeError, ConnectionResetError): source.close()
 
 from tinygrad.uop.ops import TrackedGraphRewrite, RewriteTrace, UOp, Ops, GroupOp, srender, sint, sym_infer, range_str, range_start, multirange_str
 from tinygrad.uop.ops import KernelInfo
@@ -46,16 +46,15 @@ from tinygrad.device import ProfileDeviceEvent, ProfileGraphEvent, ProfileGraphE
 from tinygrad.dtype import dtypes, AddrSpace
 
 uops_colors = {Ops.LOAD: "#ffc0c0", Ops.STORE: "#87CEEB", Ops.CONST: "#e0e0e0", Ops.REDUCE: "#FF5B5B",
-               Ops.SHAPED_WMMA: "#FF5B5B",
                Ops.RANGE: "#c8a0e0", Ops.BARRIER: "#ff8080", Ops.IF: "#c8b0c0", Ops.SPECIAL: "#c0c0ff",
-               Ops.INDEX: "#D8F9E4", Ops.STACK: "#D8F9E4",
-               Ops.WMMA: "#efefc0", Ops.MULTI: "#f6ccff", Ops.INS: "#eec4ff",
+               Ops.INDEX: "#CEF9B7", Ops.STACK: "#D8F9E4",
+               Ops.WMMA: "#efefc0", Ops.UNSHARD: "#f6ccff", Ops.INS: "#eec4ff",
                **{x:"#D8F9E4" for x in GroupOp.Movement}, **{x:"#ffffc0" for x in GroupOp.ALU}, Ops.THREEFRY:"#ffff80",
-               Ops.SLICE: "#E5EAFF", Ops.BUFFER: "#B0BDFF", Ops.GETADDR: "#9DB1F0", Ops.COPY: "#a040a0", Ops.CUSTOM_FUNCTION: "#bf71b6",
-               Ops.CALL: "#00B7C8", Ops.FUNCTION: "#C07788", Ops.PARAM: "#14686F", Ops.SOURCE: "#c0c0c0", Ops.BINARY: "#404040",
+               Ops.BUFFER: "#B0BDFF", Ops.GETADDR: "#9DB1F0", Ops.COPY: "#a040a0", Ops.CUSTOM_FUNCTION: "#bf71b6",
+               Ops.CALL: "#00B7C8", Ops.PARAM: "#14686F", Ops.RETURNED: "#C07788", Ops.SOURCE: "#c0c0c0", Ops.BINARY: "#404040",
                Ops.LINEAR: "#7DF4FF",
                Ops.ALLREDUCE: "#ff40a0", Ops.MSELECT: "#d040a0", Ops.MSTACK: "#d040a0", Ops.CONTIGUOUS: "#FFC14D",
-               Ops.STAGE: "#AC640D", Ops.REWRITE_ERROR: "#ff2e2e", Ops.AFTER: "#8A7866", Ops.END: "#524C46"}
+               Ops.STAGE: "#AC640D", Ops.REWRITE_ERROR: "#1a1b26", Ops.AFTER: "#8A7866", Ops.END: "#524C46"}
 
 addrspace_colors = {AddrSpace.ALU: "#AAAAAA", AddrSpace.REG:"#e68181", AddrSpace.LOCAL:"#e7c86a", AddrSpace.GLOBAL:"#75bd7b"}
 
@@ -119,8 +118,8 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
   graph: dict[int, dict] = {}
   excluded: set[UOp] = set()
   for u in (toposort:=x.toposort()):
-    # always exclude DEVICE/CONST/UNIQUE
-    if u.op in {Ops.DEVICE, Ops.CONST, Ops.UNIQUE, Ops.LUNIQUE} and u is not x: excluded.add(u)
+    # always exclude CONST
+    if u.op is Ops.CONST and u is not x: excluded.add(u)
     if u.op is Ops.STACK and len(u.src) == 0: excluded.add(u)
     # exclude RESHAPE/EXPAND that only serve to broadcast a CONST
     if u.op in {Ops.RESHAPE, Ops.EXPAND} and len(u.src) >= 1 and u.src[0] in excluded and u is not x: excluded.add(u)
@@ -130,7 +129,7 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
     with soft_err():
       if u.op in GroupOp.Movement and u.marg: argst = (mask_to_str if u.op in {Ops.SHRINK, Ops.PAD} else shape_to_str)(u.marg)
     if u.op is Ops.BINARY: argst = f"<{len(u.arg)} bytes>"
-    if u.op is Ops.CONST and dtypes.is_float(u.dtype): argst = f"{u.arg:g}"
+    if u.op is Ops.CONST and dtypes.is_float(u.dtype): argst = f"{u.val:g}"
     wrap_len = 200 if u.op is Ops.SOURCE else 80
     label = f"{str(u.op).split('.')[1]}{(chr(10)+word_wrap(argst.replace(':', ''), wrap=wrap_len)) if u.arg is not None else ''}"
     if u.dtype != dtypes.void: label += f"\n{u.dtype}"
@@ -139,17 +138,17 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
         # walk through excluded movement ops to find the underlying CONST
         cx = x
         while cx.op in GroupOp.Movement and len(cx.src) >= 1 and cx.src[0] in excluded: cx = cx.src[0]
-        arg = f"{cx.arg:g}" if cx.op is Ops.CONST and dtypes.is_float(cx.dtype) else cx.render() if cx.op is Ops.STACK else f"{cx.arg}"
+        arg = f"{cx.val:g}" if cx.op is Ops.CONST and dtypes.is_float(cx.dtype) else cx.render() if cx.op is Ops.STACK else f"{cx.arg}"
         label += f"\n{cx.op.name}{idx} {arg}" + (f" {cx.src[0].op}" if len(cx.src) else "")
     try:
       if len(rngs:=u.ranges):
         label += f"\n({multirange_str(rngs, color=True)})"
       if u._shape is not None:
         label += f"\n{shape_to_str(u.shape)}"
-      if u.op in {Ops.CALL, Ops.FUNCTION}:
-        label += f"\n{u.src[0].key.hex()[:8]}"
+      if u.op is Ops.CALL:
+        label += f"\n{u.src[0].key.hex()[:8]}\n{u.src[0].op}"
       if u.op in {Ops.INDEX, Ops.STAGE}:
-        if len(u.toposort()) < 30: label += f"\n{u.render()}"
+        label += f"\n{u.render()}" if sum(len(s.toposort()) for s in u.src[1:]) < 30 else "\nINDEX TOO LARGE"
         ranges: list[UOp] = []
         for us in u.src[1:]: ranges += [s for s in us.toposort() if s.op in {Ops.RANGE, Ops.SPECIAL}]
         if ranges: label += "\n"+' '.join([f"{s.render()}={s.vmax+1}" for s in ranges])
@@ -157,10 +156,10 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
         label += "\n"+' '.join([f"{range_str(s, color=True)}({s.vmax+1})" for s in trngs])
     except Exception:
       label += "\n<ISSUE GETTING LABEL>"
-    ref = data.ref_map.get(canonicalize_ast(u.src[0])) if u.op in {Ops.CALL, Ops.FUNCTION} else None
+    ref = data.ref_map.get(canonicalize_ast(u.src[0])) if u.op is Ops.CALL else None
     if ref is not None: label += f"\ncodegen@{fmt_colored(data.ctxs[ref]['name'])}"
     # NOTE: kernel already has metadata in arg
-    if TRACEMETA >= 2 and u.metadata is not None and u.op not in {Ops.CALL, Ops.FUNCTION}: label += "\n"+str(u.metadata)
+    if TRACEMETA >= 2 and u.metadata is not None and u.op is not Ops.CALL: label += "\n"+str(u.metadata)
     # limit SOURCE labels line count
     if u.op is Ops.SOURCE and len(lines:=label.split("\n")) > 40:
       label = "\n".join(lines[:30]) + "\n..."
@@ -172,28 +171,29 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
 
 def _reconstruct(data:VizData, a:int, depth:int|None=None):
   if depth is None and a in data.all_uops: return data.all_uops[a]
-  op, dtype, src, arg, *rest = data.trace.uop_fields[a]
-  if depth is not None and depth <= 0: return UOp(op, dtype, (), arg, *rest)
-  ret = UOp(op, dtype, tuple(_reconstruct(data, s, None if depth is None else depth-1) for s in src), arg, *rest)
+  op, src, arg, *rest = data.trace.uop_fields[a]
+  if depth is not None and depth <= 0: return UOp(op, (), arg, *rest)
+  ret = UOp(op, tuple(_reconstruct(data, s, None if depth is None else depth-1) for s in src), arg, *rest)
   if depth is None: data.all_uops[a] = ret
   return ret
 
-def get_full_rewrite(data:VizData, ctx:TrackedGraphRewrite, depth:int|None=None) -> Generator[GraphRewriteDetails, None, None]:
-  next_sink = _reconstruct(data, ctx.sink, depth=depth)
+def get_full_rewrite(data:VizData, ctx:TrackedGraphRewrite, depth:int|None=None, update_sink=True) -> Generator[GraphRewriteDetails, None, None]:
+  next_sink, err = _reconstruct(data, ctx.sink, depth=depth), False
   yield {"graph":uop_to_json(data, next_sink), "uop":pystr(next_sink), "change":None, "diff":None, "upat":None, "_sink":next_sink}
   replaces: dict[UOp, UOp] = {}
-  for u0_num,u1_num,upat_loc,dur in tqdm(ctx.matches, disable=not ctx.matches):
+  for u0_num,u1_num,upat_loc,dur in ctx.matches:
+    if err: break
     replaces[u0:=_reconstruct(data, u0_num, depth=depth)] = u1 = _reconstruct(data, u1_num, depth=depth)
-    try: new_sink = next_sink.substitute(replaces)
-    except RuntimeError as e: new_sink = UOp(Ops.NOOP, arg=str(e))
+    try: new_sink = next_sink.substitute(replaces, walk=ctx.walk, enter_calls=ctx.enter_calls) if update_sink else next_sink
+    except RuntimeError: new_sink, err = UOp(Ops.REWRITE_ERROR, arg=traceback.format_exc()), True
     match_repr = f"# {dur*1e6:.2f} us\n"+printable(upat_loc)
     yield {"graph":(sink_json:=uop_to_json(data, new_sink)), "uop":pystr(new_sink), "change":[id(x) for x in u1.toposort() if id(x) in sink_json],
            "diff":list(difflib.unified_diff(pystr(u0).splitlines(), pystr(u1).splitlines())), "upat":(upat_loc, match_repr), "_sink":new_sink}
     if not ctx.bottom_up: next_sink = new_sink
 
-def get_sink_at(upats:tuple[str, ...], viz_data:VizData, ctx:TrackedGraphRewrite, depth:int|None=None) -> UOp|None:
-  for s in get_full_rewrite(viz_data, ctx, depth=depth):
-    if s["upat"] is not None and any(n in s["upat"][1] for n in upats): return s["_sink"]
+def get_sink_at(upats:tuple[str, ...], viz_data:VizData, kernel_idx:int, lin_idx:int, depth:int|None=None) -> UOp|None:
+  for s in get_full_rewrite(viz_data, ctx:=viz_data.trace.rewrites[kernel_idx][lin_idx], depth=depth):
+    if (s["upat"] is not None and any(n in s["upat"][1] for n in upats)) or len(ctx.matches) == 0: return s["_sink"]
   return None
 
 # encoder helpers
@@ -231,15 +231,15 @@ def timeline_layout(data:VizData, dev_events:list[tuple[int, int, float, DevEven
   ei:ProfilePointEvent|None = None
   for st,et,dur,e in dev_events:
     if isinstance(e, ProfilePointEvent) and e.name == "exec": ei = e
-    if dur == 0: continue
+    # only visualize range events with an end timestamp
+    if dur == 0 or isinstance(e, ProfilePointEvent): continue
     name, key = e.name, None
     fmt:dict = {}
-    if (ref:=data.ref_map.get(name)) is not None and ref < len(data.ctxs):
+    if (ref:=data.ref_map.get(e.profile_key)) is not None and ref < len(data.ctxs):
       name = data.ctxs[ref]["name"]
       if (ki:=data.ctxs[ref].get("ki")) is not None and ki.estimates is not None and ei is not None:
-        fmt["FLOPS"] = int(sym_infer(ki.estimates.ops, var_vals:=ei.arg['var_vals'])/(t:=dur*1e-6))
-        fmt["B/s mem"], fmt["B/s lds"] = int(sym_infer(ki.estimates.mem, var_vals)/t), int(sym_infer(ki.estimates.lds, var_vals)/t)
-        if ei.arg["metadata"]: fmt["metadata"] = ",".join([str(m) for m in ei.arg['metadata']+["batched" if isinstance(e,ProfileGraphEntry) else ""]])
+        for est_key,est_val in (("FLOPS", ki.estimates.ops), ("B/s mem", ki.estimates.mem), ("B/s lds", ki.estimates.lds)):
+          with soft_err(lambda _: fmt.update({est_key:"ERR"})): fmt[est_key] = int(sym_infer(est_val, ei.arg['var_vals'])/(dur*1e-6))
         key = ei.key
     elif isinstance(e.name, TracingKey):
       name = e.name.display_name
@@ -334,36 +334,31 @@ def unpack_pmc(e) -> dict:
 
 def load_amd_counters(data:VizData, profile:list) -> None:
   counter_events:dict[tuple[int, int], dict] = {}
-  durations:dict[str, list[float]] = {}
+  durations:dict[bytes|str, list[float]] = {}
   prg_events:dict[int, ProfileProgramEvent] = {}
   arch = ""
   for e in profile:
     if type(e).__name__ in {"ProfilePMCEvent", "ProfileSQTTEvent"}:
       counter_events.setdefault((e.kern, e.exec_tag), {}).setdefault(type(e).__name__, []).append(e)
-    if isinstance(e, ProfileRangeEvent) and e.device.startswith("AMD") and e.en is not None:
-      durations.setdefault(str(e.name), []).append(float(e.en-e.st))
-    if isinstance(e, ProfileProgramEvent) and e.tag is not None: prg_events[e.tag] = e
+    if isinstance(e, ProfileRangeEvent) and e.device.startswith("AMD") and e.en is not None and e.profile_key is not None:
+      durations.setdefault(e.profile_key, []).append(float(e.en-e.st))
+    if isinstance(e, ProfileProgramEvent) and e.device.startswith("AMD") and e.tag is not None: prg_events[e.tag] = e
     if isinstance(e, ProfileDeviceEvent) and e.device.startswith("AMD"): arch = f"gfx{unwrap(e.props)['gfx_target_version']//1000}"
   if len(counter_events) == 0: return None
   data.ctxs.append({"name":"All Counters", "steps":[create_step("PMC", ("/all-pmc", len(data.ctxs), 0), (durations, all_counters:={}))]})
   run_number = {n:0 for n,_ in counter_events}
   for (k, tag),v in counter_events.items():
     # use the colored name if it exists
-    name = data.ctxs[r]["ki"].name if (r:=data.ref_map.get(pname:=prg_events[k].name)) is not None else pname
+    name = data.ctxs[r]["ki"].name if (r:=data.ref_map.get(unwrap(prg_events[k].profile_key))) is not None else prg_events[k].name
     run_number[k] += 1
     steps:list[dict] = []
     if (pmc:=v.get("ProfilePMCEvent")):
       steps.append(create_step("PMC", ("/prg-pmc", len(data.ctxs), len(steps)), pmc[0]))
-      all_counters[(name, run_number[k], pname)] = pmc[0]
+      all_counters[(name, run_number[k], unwrap(prg_events[k].profile_key))] = pmc[0]
     # to decode a SQTT trace, we need the raw stream, program binary and device properties
     if (sqtt:=v.get("ProfileSQTTEvent")):
       for e in sqtt:
         if e.itrace: steps.append(create_step(f"SE:{e.se} PKTS", (f"/sqtt-{e.se}",len(data.ctxs),len(steps)), data=(e.blob,prg_events[k].lib,arch)))
-      try:
-        with Context(DEBUG=0): from extra.sqtt.roc import unpack_occ
-        steps.append(create_step("OCC", ("/amd-sqtt-occ", len(data.ctxs), len(steps)),
-                                 data={"fxn":unpack_occ, "args":((k, tag), sqtt, prg_events[k], arch)}))
-      except Exception: pass
     data.ctxs.append({"name":f"SQTT {name}"+(f" n{run_number[k]}" if run_number[k] > 1 else ""), "steps":steps})
 
 wave_colors = {"WMMA": "#1F7857", **{x:"#ffffc0" for x in ["VALU", "VINTERP"]}, "SALU": "#cef263", "SMEM": "#ffc0c0", "STORE": "#4fa3cc",
@@ -470,11 +465,12 @@ def get_profile(data:VizData, profile:list[ProfileEvent], sort_fn:Callable[[str]
   start_ts:int|None = None
   end_ts:int|None = None
   for ts,en,e in flatten_events(profile, device_ts_diffs):
-    dev_events.setdefault(e.device,[]).append((st:=int(ts), et:=int(en), float(en-ts), e))
-    if start_ts is None or st < start_ts: start_ts = st
-    if end_ts is None or et > end_ts: end_ts = et
-    if isinstance(e, ProfilePointEvent) and e.name == "marker": markers.append(e)
     if isinstance(e, ProfilePointEvent) and e.name == "JSON": ext_data[e.key] = e.arg
+    else:
+      dev_events.setdefault(e.device,[]).append((st:=int(ts), et:=int(en), float(en-ts), e))
+      if start_ts is None or st < start_ts: start_ts = st
+      if end_ts is None or et > end_ts: end_ts = et
+      if isinstance(e, ProfilePointEvent) and e.name == "marker": markers.append(e)
   if start_ts is None: return None
   # return layout of per device events
   layout:dict[str, bytes|None] = {}
@@ -497,10 +493,10 @@ def get_profile(data:VizData, profile:list[ProfileEvent], sort_fn:Callable[[str]
 def load_nv_counters(data:VizData, profile:list) -> None:
   steps:list[dict] = []
   sm_version = {e.device:e.props.get("sm_version", 0x800) for e in profile if isinstance(e, ProfileDeviceEvent) and e.props is not None}
-  run_number:dict[str, int] = {}
+  run_number:dict[bytes, int] = {}
   for e in profile:
     if type(e).__name__ == "ProfilePMAEvent":
-      run_number[e.kern] = run_num = run_number.get(e.kern, 0)+1
+      run_number[profile_key] = run_num = run_number.get(profile_key:=unwrap(e.profile_key), 0)+1
       steps.append(create_step(f"PMA {e.kern}"+(f"n{run_num}" if run_num>1 else ""), ("/prg-pma-pkts", len(data.ctxs), len(steps)),
                                data=(e.blob, sm_version[e.device])))
   if steps: data.ctxs.append({"name":"All Counters", "steps":steps})
@@ -612,23 +608,23 @@ def amdgpu_cfg(lib:bytes, target:str) -> dict:
 
 # ** Main render function to get the complete details about a trace event
 
-def get_render(viz_data:VizData, query:str) -> dict:
+def get_render(viz_data:VizData, query:str, **kwargs) -> dict:
   url = urlparse(query)
   i, j, fmt = get_int(qs:=parse_qs(url.query), "ctx"), get_int(qs, "step"), url.path.lstrip("/")
   data = viz_data.ctxs[i]["steps"][j]["_data"]
-  if fmt == "graph-rewrites": return {"value":get_full_rewrite(viz_data, viz_data.trace.rewrites[i][j]), "content_type":"text/event-stream"}
+  if fmt == "graph-rewrites": return {"value":get_full_rewrite(viz_data, viz_data.trace.rewrites[i][j], **kwargs), "content_type":"text/event-stream"}
   if fmt == "uops":
-    if (sink:=get_sink_at(("do_linearize",), viz_data, viz_data.trace.rewrites[i][data])) is None: return {"src":"No linear found"}
-    return {"src":sink.arg} if sink.op is Ops.REWRITE_ERROR else {"src":get_stdout(lambda: print_uops(list(unwrap(sink).src[2].src)))}
+    if (sink:=get_sink_at(("do_linearize",), viz_data, i, data)) is None: return {"src":"No linear found"}
+    return {"src":sink.arg} if sink.op is Ops.REWRITE_ERROR else {"src":get_stdout(lambda: print_uops(list(unwrap(sink).src[1].src)))}
   if fmt == "code":
-    if (sink:=get_sink_at(("do_render",), viz_data, viz_data.trace.rewrites[i][data], depth=1)) is None: return {"src":"No source found"}
-    return {"src":sink.arg} if sink.op is Ops.REWRITE_ERROR else {"src":sink.src[3].arg, "lang":"cpp"}
+    if (sink:=get_sink_at(("do_render",), viz_data, i, data, depth=1)) is None: return {"src":"No source found"}
+    return {"src":sink.arg} if sink.op is Ops.REWRITE_ERROR else {"src":sink.src[2].arg, "lang":"cpp"}
   if fmt == "asm":
     ret:dict = {}
     renderer, idx = data
-    if (sink:=get_sink_at(("do_compile","do_assemble"), viz_data, viz_data.trace.rewrites[i][idx], depth=1)) is None: return {"src":"No binary found"}
+    if (sink:=get_sink_at(("do_compile","do_assemble"), viz_data, i, idx, depth=1)) is None: return {"src":"No binary found"}
     if sink.op is Ops.REWRITE_ERROR: return {"src":sink.arg}
-    lib:bytes = sink.src[4].arg
+    lib:bytes = sink.src[3].arg
     if renderer.target.arch.startswith("gfx"):
       with soft_err(lambda err: ret.update(err)): ret.update(amdgpu_cfg(lib, renderer.target.arch))
     else: ret["src"] = get_stdout(lambda: renderer.compiler.disassemble(lib))
@@ -650,9 +646,6 @@ def get_render(viz_data:VizData, query:str) -> dict:
         ret = {"value":events, "content_type":"application/octet-stream"}
       else: ret = {"src":"No SQTT trace on this SE."}
     return ret
-  # viewers for the amd decoder in extra
-  if fmt.startswith("amd-sqtt"): return data["fxn"](viz_data, i, j, *data["args"])
-  if fmt == "cu-sqtt": return {"value":get_profile(viz_data, data, sort_fn=row_tuple), "content_type":"application/octet-stream"}
   if fmt == "prg-pma-pkts":
     ret = {}
     with soft_err(lambda err:ret.update(err)):
