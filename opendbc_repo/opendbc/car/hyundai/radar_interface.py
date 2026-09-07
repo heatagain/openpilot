@@ -267,6 +267,15 @@ BOSCH_INACTIVE_WORD = 0x40100000
 BOSCH_MAX_RAW_TRACK_ID = 2**31 - 1
 BOSCH_TRACK_ADDRESSES = frozenset(range(0x602, 0x612))
 BOSCH_WINDOW_NS = 20_000_000
+# A model path is only a corridor where it still reaches well past the object.
+# modelV2.position is 33 samples on the fixed grid T_IDXS[i] = 10*(i/32)**2
+# seconds, so its reach in metres collapses with speed: about 10*vEgo. Near the
+# end of that reach the samples are a forecast rather than observed road, and
+# they stop being usable to drop a return. Measured over 306,896 consecutive
+# static observations on five routes, the scan-to-scan disagreement of the
+# corridor residual is 0.72 m at p95 with no rule and 0.40 m once this much
+# path is required beyond the query point.
+BOSCH_PATH_TRUST_MARGIN_M = 40.0
 BOSCH_STALE_NS = 300_000_000
 BOSCH_OUTPUT_INTERVAL_NS = 100_000_000
 BOSCH_SAMPLE_HOLD_NS = 150_000_000  # one 10 Hz observation period plus one SCC publication period
@@ -1925,8 +1934,18 @@ class _BoschStaticOffPathFilter:
           or speed > 0.6):  # Includes uncertain 0.6–1.4 m/s and moving objects.
         kept.append(obj)
         continue
-      offset = (obj.y_rel - self._path_y(path, obj.d_rel)
-                if path_valid and path[0][0] <= obj.d_rel <= path[-1][0] else obj.y_rel)
+      offset = obj.y_rel
+      if path_valid and path[0][0] <= obj.d_rel <= path[-1][0]:
+        # Only the part of the path that still has road behind it may overrule
+        # the straight corridor. Past that the path is read only when the
+        # corridor would already have dropped the object, so a terminal
+        # prediction can argue to keep a return but never to remove one.
+        if obj.d_rel <= path[-1][0] - BOSCH_PATH_TRUST_MARGIN_M:
+          offset = obj.y_rel - self._path_y(path, obj.d_rel)
+        elif abs(offset) > 3.0:
+          path_offset = obj.y_rel - self._path_y(path, obj.d_rel)
+          if abs(path_offset) < abs(offset):
+            offset = path_offset
       if not math.isfinite(offset) or abs(offset) <= 3.0:
         kept.append(obj)
     return objects if len(kept) == len(objects) else tuple(kept)
@@ -2205,7 +2224,7 @@ class BoschRadarProvider:
                    'oem_selected': obj.oem_selected} for obj in self._debug_objects],
     }
 
-  def update(self, can_packets, now_ns: int, v_ego: float, yaw_rate_left=None, vision=(), *, path=(), path_ns=None):
+  def update(self, can_packets, now_ns: int, v_ego: float, yaw_rate_left=None, vision=(), *, path=(), path_ns=None, path_source_ns=None):
     """Consume (receive_ns, [(address, payload, src), ...]) CAN packets.
 
     Return None when no window has closed, otherwise only freshly observed
@@ -2269,8 +2288,18 @@ class BoschRadarProvider:
       self._last_closed_anchor_ns = phase_ns
       # Context must be fresh at receipt and close to this particular scan, also
       # when a batch closes several old windows. No path extrapolation in time.
-      scan_path = path if (path_ns is not None and 0 <= now_ns - path_ns <= 200_000_000
-                           and phase_ns - 200_000_000 <= path_ns <= phase_ns + BOSCH_WINDOW_NS) else ()
+      # modelV2.logMonoTime is a publication time: the scene the path describes
+      # was captured a model-pipeline latency earlier, 43.6 ms at the median on
+      # route259. Judge freshness on that capture time when the caller supplies
+      # it, so a path is used exactly when its scene precedes this scan and it
+      # had already been received. Without the source time the previous
+      # publication-time gate stands unchanged.
+      if path_ns is None or not (0 <= now_ns - path_ns <= 200_000_000):
+        scan_path = ()
+      elif path_source_ns:
+        scan_path = path if phase_ns - 200_000_000 <= path_source_ns <= phase_ns else ()
+      else:
+        scan_path = path if phase_ns - 200_000_000 <= path_ns <= phase_ns + BOSCH_WINDOW_NS else ()
       output = self._finish_scan(phase_ns, tick, assigned, v_ego, yaw_rate_left, vision, scan_path)
       self._last_output_ns = now_ns
 
@@ -2408,6 +2437,7 @@ class RadarInterface(RadarInterfaceBase):
     self._bosch_debug_ns = 0
     self._bosch_context = None
     self._bosch_path_ns = None
+    self._bosch_path_source_ns = 0
     self._bosch_path = ()
     if self.radar_tracks and CP.extFlags & HyundaiExtFlags.BOSCH_RADAR:
       CAN = CanBus(CP)
@@ -2517,6 +2547,7 @@ class RadarInterface(RadarInterfaceBase):
       yaw = -float(angular.z)
     cues = ()
     path = ()
+    source_ns = 0
     if model is not None and 0 <= now_ns - model_ns <= 200_000_000:
       if model.leadsV3:
         lead = model.leadsV3[0]
@@ -2526,9 +2557,12 @@ class RadarInterface(RadarInterfaceBase):
       if self._bosch_path_ns != model_ns:
         position = getattr(model, 'position', None)
         self._bosch_path = tuple(zip(position.x, position.y)) if position is not None else ()
+        # The camera frame the model consumed, not the time it finished.
+        self._bosch_path_source_ns = int(getattr(model, 'timestampEof', 0) or 0)
         self._bosch_path_ns = model_ns
       path = self._bosch_path
-    self._bosch_context = (int(now_ns), yaw, cues, path, model_ns)
+      source_ns = self._bosch_path_source_ns
+    self._bosch_context = (int(now_ns), yaw, cues, path, model_ns, source_ns)
 
   def update_carrot(self, v_ego, a_ego, rcv_time, can_packets):
     # Keep the legacy SCC/corner MyTrack processing intact. Bosch objects are
@@ -2557,11 +2591,13 @@ class RadarInterface(RadarInterfaceBase):
 
     track_ready = False
     if self.bosch is not None:
-      now_ns, yaw, cues, path, path_ns = self._bosch_context or (time.monotonic_ns(), None, (), (), None)
+      now_ns, yaw, cues, path, path_ns, path_source_ns = (
+        self._bosch_context or (time.monotonic_ns(), None, (), (), None, 0))
       self._bosch_now_ns = now_ns
       self._bosch_context = None
       objects = self.bosch.update(can_strings, now_ns=now_ns, v_ego=self.v_ego,
-                                  yaw_rate_left=yaw, vision=cues, path=path, path_ns=path_ns)
+                                  yaw_rate_left=yaw, vision=cues, path=path, path_ns=path_ns,
+                                  path_source_ns=path_source_ns)
       if objects is not None:
         self._bosch_objects = objects
         track_ready = True
