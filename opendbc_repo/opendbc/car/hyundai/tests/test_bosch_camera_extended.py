@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -8,6 +9,7 @@ from opendbc.car.hyundai.radar_interface import (
   BOSCH_CAMERA_ASSOC_UNRESOLVED,
   BOSCH_CAMERA_E2_HOLD_NS,
   BOSCH_CAMERA_EXTENDED_ACTIVE,
+  BOSCH_CAMERA_EXTENDED_ACTIVE_TEST,
   BOSCH_CAMERA_EXTENDED_OFF,
   BOSCH_CAMERA_EXTENDED_SHADOW,
   BOSCH_CAMERA_HEADER,
@@ -17,6 +19,9 @@ from opendbc.car.hyundai.radar_interface import (
   BoschPhysicalObject,
   BoschRawDetection,
   BoschRawTrack,
+  BoschRadarProvider,
+  RadarInterface,
+  bosch_append_points,
 )
 
 
@@ -149,7 +154,7 @@ class TestBoschCameraE2Overlay:
     assert grouping.camera is None
     assert grouping.update(1_000_000_000, objects, 10.) is objects
 
-  def test_shadow_is_output_identical_and_active_suppresses_only_nonrepresentative(self):
+  def test_shadow_and_active_preserve_observations_while_grouping(self):
     objects = (physical(1_000_001, 15.), physical(1_000_002, 19.))
     mapping = {pid: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1) for pid in (1_000_001, 1_000_002)}
     shadow = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_SHADOW)
@@ -159,7 +164,8 @@ class TestBoschCameraE2Overlay:
     active = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
     self.statuses(active, mapping)
     output = active.update(1_000_000_000, objects, 10.)
-    assert len(output) == 1 and output[0] in objects
+    assert output is objects
+    assert active.last_groups == shadow.last_groups
     self.statuses(active, {})
     split = active.update(1_100_000_000, objects, 10.)
     assert len(split) == 2
@@ -178,7 +184,8 @@ class TestBoschCameraE2Overlay:
       grouping.update(now, objects, 10.)
     self.statuses(grouping, {1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1)})
     output = grouping.update(1_000_000_000 + elapsed, objects, 10.)
-    assert (len(output) == 1) is held
+    assert output is objects
+    assert bool(grouping.last_groups) is held
 
   @pytest.mark.parametrize(('gap', 'held'), ((159_000_000, True), (160_000_000, True), (160_000_001, False)))
   def test_observation_gap_boundary(self, gap, held):
@@ -187,7 +194,8 @@ class TestBoschCameraE2Overlay:
     self.statuses(grouping, {pid: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1) for pid in (1_000_001, 1_000_002)})
     grouping.update(1_000_000_000, objects, 10.)
     self.statuses(grouping, {1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1)})
-    assert (len(grouping.update(1_000_000_000 + gap, objects, 10.)) == 1) is held
+    assert grouping.update(1_000_000_000 + gap, objects, 10.) is objects
+    assert bool(grouping.last_groups) is held
 
   @pytest.mark.parametrize('veto', ['different', 'ambiguous', 'class', 'geometry', 'no_anchor'])
   def test_e2_current_hard_vetoes(self, veto):
@@ -208,7 +216,8 @@ class TestBoschCameraE2Overlay:
     elif veto == 'no_anchor':
       mapping = {}
     self.statuses(grouping, mapping)
-    assert len(grouping.update(1_100_000_000, current, 10.)) == 2
+    assert grouping.update(1_100_000_000, current, 10.) is current
+    assert grouping.last_groups == ()
 
   def test_coast_never_recruits_a_new_member(self):
     grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
@@ -224,4 +233,313 @@ class TestBoschCameraE2Overlay:
     })
     output = grouping.update(1_100_000_000, objects, 10.)
     assert grouping.last_groups == ((1_000_001, 1_000_002),)
-    assert len(output) == 2
+    assert output is objects
+
+
+class TestBoschCameraPublicationSafety:
+  @staticmethod
+  def group(overlay, objects, ns):
+    TestBoschCameraE2Overlay.statuses(overlay, {
+      obj.physical_track_id: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1) for obj in objects
+    })
+    return overlay.update(ns, objects, 10.)
+
+  def test_original_representative_preserves_s12_oem_tie_policy(self):
+    ns = 1_000_000_000
+    near = replace(physical(1_000_002, 13., .5, 2., ns, 1), vision_supported=True)
+    far = replace(physical(1_000_001, 16.25, .46875, 2., ns, 43), vision_supported=True, oem_selected=True)
+    overlay = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    output = self.group(overlay, (far, near), ns)
+    assert output == (far, near)
+    assert overlay.representatives[0].representative_pid == far.physical_track_id
+    from opendbc.car import structs
+    data = structs.RadarData.new_message()
+    bosch_append_points(data, output, 10., ns + 10_000_000)
+    assert data.points[1].dRel == pytest.approx(13.02, abs=1e-6)
+    assert (data.points[1].yRel, data.points[1].vRel) == (near.y_rel, near.v_rel)
+    assert data.points[0].dRel == pytest.approx(16.27, abs=1e-6)
+
+  def test_original_continuity_can_keep_farther_previous_representative(self):
+    overlay = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    first = (physical(1_000_001, 16.25), physical(1_000_003, 20.))
+    assert self.group(overlay, first, 1_000_000_000) is first
+    assert overlay.representatives[0].representative_pid == first[0].physical_track_id
+    current = (physical(1_000_001, 16.25, ns=1_100_000_000), physical(1_000_002, 13., ns=1_100_000_000))
+    assert self.group(overlay, current, 1_100_000_000) is current
+    assert overlay.representatives[0].representative_pid == current[0].physical_track_id
+    assert overlay.representative_switches == 0
+
+  def test_reordered_members_do_not_chatter(self):
+    overlay = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(20):
+      ns = 1_000_000_000 + i * 100_000_000
+      members = (physical(1_000_001, 13. + i * .25, ns=ns), physical(1_000_002, 16.25 + i * .25, ns=ns))
+      ordered = members if i % 2 else members[::-1]
+      assert self.group(overlay, ordered, ns) is ordered
+      assert overlay.representatives[0].representative_pid == members[0].physical_track_id
+    assert overlay.representative_switches == 0
+
+  @pytest.mark.parametrize('mode', (BOSCH_CAMERA_EXTENDED_OFF, BOSCH_CAMERA_EXTENDED_SHADOW, BOSCH_CAMERA_EXTENDED_ACTIVE))
+  def test_provider_qualifier_receives_complete_baseline_tuple(self, monkeypatch, mode):
+    provider = BoschRadarProvider(1, camera_extended_mode=mode)
+    objects = (physical(1_000_001, 13.), physical(1_000_002, 16.25))
+    provider.tracker.update(900_000_000, (), v_ego=10.)
+    monkeypatch.setattr(provider.tracker, 'update', lambda *a, **kw: objects)
+    if mode != BOSCH_CAMERA_EXTENDED_OFF:
+      TestBoschCameraE2Overlay.statuses(provider.camera_extended, {
+        obj.physical_track_id: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1) for obj in objects})
+    seen = []
+    original = provider.qualifier.update
+    def qualify(got, *a, **kw):
+      seen.append(got)
+      return original(got, *a, **kw)
+    monkeypatch.setattr(provider.qualifier, 'update', qualify)
+    output = provider._finish_scan(1_000_000_000, 0, (), 10., 0., ())
+    assert seen == [objects] and seen[0] is objects
+    assert output is objects
+    view = provider.publication_view(output)
+    assert view is output
+
+  def test_missing_qualified_representative_preserves_other_points(self):
+    provider = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE)
+    objects = (physical(1_000_001, 13.), physical(1_000_002, 16.25))
+    self.group(provider.camera_extended, objects, 1_000_000_000)
+    qualified = (objects[1],)
+    assert provider.publication_view(qualified) is qualified
+
+  @pytest.mark.parametrize('disappear_reappear', (False, True))
+  def test_native_boundary_preserves_fifo_and_every_member_history_identity(self, monkeypatch, disappear_reappear):
+    from opendbc.car import structs
+    import opendbc.car.hyundai.radar_interface as module
+    def base_update(*args):
+      data = structs.RadarData.new_message()
+      data.points = [dict(trackId=0, dRel=80., vRel=0., radarSource='scc', measured=True)]
+      return data
+    monkeypatch.setattr(module.RadarInterfaceBase, 'update_carrot', base_update)
+    interfaces = []
+    for mode in (BOSCH_CAMERA_EXTENDED_OFF, BOSCH_CAMERA_EXTENDED_ACTIVE):
+      interface = RadarInterface.__new__(RadarInterface)
+      interface.bosch = BoschRadarProvider(1, qualification=False, camera_extended_mode=mode)
+      interface.v_ego = 10.
+      interfaces.append(interface)
+    unrelated_alias = None
+    preserved_samples = 0
+    for i in range(24):
+      ns = 1_000_000_000 + i * 100_000_000
+      objects = [physical(1_000_001, 13., ns=ns), physical(1_010_690, 30., 3., ns=ns)]
+      if not disappear_reappear or i not in (8, 9, 10):
+        objects.append(physical(1_000_002, 16.25, ns=ns))
+      if i >= 5:
+        objects.append(physical(1_001_000 + i // 3, 60., -4., ns=ns))
+      objects = tuple(objects)
+      outputs = []
+      for interface in interfaces:
+        p = interface.bosch
+        p.tracker.group_manager.states = {o.physical_track_id: None for o in objects}
+        p.last_scan_timestamp_ns = interface._bosch_now_ns = ns
+        interface._bosch_objects = objects
+        if p.camera_extended.mode == BOSCH_CAMERA_EXTENDED_ACTIVE:
+          self.group(p.camera_extended, objects, ns)
+        outputs.append(interface.update_carrot(10., 0., ns * 1e-9, []))
+      a, b = (x.bosch.publication_aliases for x in interfaces)
+      assert a.physical_to_alias == b.physical_to_alias
+      assert a.last_published_ns == b.last_published_ns
+      assert list(a.free_aliases) == list(b.free_aliases)
+      alias = a.physical_to_alias[1_010_690]
+      unrelated_alias = alias if unrelated_alias is None else unrelated_alias
+      assert alias == unrelated_alias
+      for output in outputs:
+        assert output.points[0].to_dict() == base_update().points[0].to_dict()
+        assert any(p.trackId == alias and p.dRel == 30. for p in output.points)
+      if 1_000_002 in a.physical_to_alias:
+        duplicate_alias = a.physical_to_alias[1_000_002]
+        assert any(p.trackId == duplicate_alias for p in outputs[1].points)
+        preserved_samples += 1
+      assert len(a.physical_to_alias) <= 64
+    assert preserved_samples > 10
+
+
+class TestBoschCameraConservativePublication:
+  @pytest.mark.parametrize('scans', (1, 2, 3, 4, 5, 6, 50))
+  def test_group_age_never_authorizes_history_loss(self, scans):
+    provider = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(scans):
+      ns = 1_000_000_000 + i * 99_123_456
+      objects = (physical(1_000_001, 15., ns=ns, age=i+1), physical(1_000_002, 19., ns=ns, age=i+1))
+      assert TestBoschCameraPublicationSafety.group(provider.camera_extended, objects, ns) is objects
+      assert provider.publication_view(objects) is objects
+      assert provider.camera_extended.last_groups == ((1_000_001, 1_000_002),)
+    assert provider.camera_extended.representatives[0].age == scans
+
+  @pytest.mark.parametrize('split_after', (1, 2, 5, 50))
+  def test_split_reappearance_has_no_camera_induced_observation_gap(self, split_after):
+    provider = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE)
+    seen = {1_000_001: [], 1_000_002: []}
+    for i in range(split_after+3):
+      ns = 1_000_000_000 + i * 100_000_000
+      objects = (physical(1_000_001, 15., ns=ns), physical(1_000_002, 19., ns=ns, age=i+1))
+      mapping = {o.physical_track_id: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1) for o in objects} if i < split_after else {}
+      TestBoschCameraE2Overlay.statuses(provider.camera_extended, mapping)
+      assert provider.camera_extended.update(ns, objects, 10.) is objects
+      for obj in provider.publication_view(objects):
+        seen[obj.physical_track_id].append(ns)
+    assert seen[1_000_001] == seen[1_000_002]
+    assert len(seen[1_000_002]) == split_after+3
+    assert provider.camera_extended.histories == {}
+
+  @pytest.mark.parametrize(('near_y', 'far_y', 'near_v', 'far_v'), (
+    (-2.5625, -1.96875, -6., -5.75), (1.09375, -.09375, 2., 2.), (0., 0., 0., 0.)))
+  def test_geometry_and_identical_lateral_values_do_not_authorize_pid_collapse(self, near_y, far_y, near_v, far_v):
+    provider = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE)
+    objects = (physical(1_000_001, 19.5, near_y, near_v), physical(1_000_002, 24., far_y, far_v))
+    TestBoschCameraPublicationSafety.group(provider.camera_extended, objects, 1_000_000_000)
+    assert provider.camera_extended.last_groups
+    assert provider.publication_view(objects) is objects
+
+  def test_new_member_replaces_group_without_hiding_its_first_observation(self):
+    provider = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(8):
+      ns = 1_000_000_000 + i * 100_000_000
+      other = 1_000_002 if i < 6 else 1_000_003
+      objects = (physical(1_000_001, 15., ns=ns), physical(other, 19., ns=ns, age=1 if i==6 else 4))
+      TestBoschCameraPublicationSafety.group(provider.camera_extended, objects, ns)
+      assert provider.publication_view(objects) is objects
+      assert tuple(provider.camera_extended.histories) == ((1_000_001, other),)
+    assert provider.camera_extended.max_state_count == 1
+
+
+class TestBoschActiveTestPublication:
+  @staticmethod
+  def scan(provider, ns, objects=None, mapping=None):
+    objects = objects or (physical(1_000_001, 15., ns=ns), physical(1_000_002, 19., ns=ns))
+    ext = provider.camera_extended
+    if ext.camera is not None:
+      TestBoschCameraE2Overlay.statuses(ext, mapping if mapping is not None else {
+        o.physical_track_id: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1) for o in objects})
+    assert ext.update(ns, objects, 10.) is objects
+    return objects, provider.publication_view(objects)
+
+  @pytest.mark.parametrize('mode', (BOSCH_CAMERA_EXTENDED_OFF, BOSCH_CAMERA_EXTENDED_SHADOW,
+                                   BOSCH_CAMERA_EXTENDED_ACTIVE, BOSCH_CAMERA_EXTENDED_ACTIVE_TEST))
+  def test_two_completed_intervals_only_test_mode_suppresses(self, mode):
+    p = BoschRadarProvider(1, camera_extended_mode=mode)
+    for i, ns in enumerate((1_000_000_000, 1_099_123_456, 1_198_765_432, 1_299_000_000)):
+      objects, view = self.scan(p, ns)
+      assert len(view) == (1 if mode == BOSCH_CAMERA_EXTENDED_ACTIVE_TEST and i >= 2 else 2)
+      if i < 2 or mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
+        assert view is objects
+    if mode == BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
+      assert p.camera_extended.histories[(1_000_001, 1_000_002)].stable_intervals == 2
+
+  @pytest.mark.parametrize('failure', ('tuple', 'missing', 'p2', 'ambiguous', 'class', 'episode',
+                                      'g0', 'conflict', 'stale_member', 'stale_camera', 'future_camera',
+                                      'motion_jump', 'gap', 'duplicate_ns'))
+  def test_current_failure_resets_maturity_and_immediately_opens_publication(self, failure):
+    p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)
+    for i in range(3):
+      _, view = self.scan(p, 1_000_000_000 + i * 100_000_000)
+    assert len(view) == 1
+    ns = 1_300_000_000
+    if failure == 'gap':
+      ns = 1_360_000_001
+    elif failure == 'duplicate_ns':
+      ns = 1_200_000_000
+    objects = (physical(1_000_001, 15., ns=ns), physical(1_000_002, 19., ns=ns))
+    mapping = {o.physical_track_id: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1) for o in objects}
+    if failure == 'tuple':
+      objects = (objects[0], physical(1_000_003, 19., ns=ns))
+      mapping[1_000_003] = (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1)
+    elif failure == 'missing':
+      objects = (objects[0],)
+    elif failure == 'p2':
+      del mapping[1_000_002]
+    elif failure == 'ambiguous':
+      mapping[1_000_002] = (BOSCH_CAMERA_ASSOC_AMBIGUOUS, -1, -1)
+    elif failure == 'class':
+      mapping[1_000_002] = (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 2)
+    elif failure == 'episode':
+      mapping = {p: (BOSCH_CAMERA_ASSOC_ASSIGNED, 8, 1) for p in mapping}
+    elif failure == 'g0':
+      objects = (objects[0], physical(1_000_002, 19., 2., ns=ns))
+    elif failure == 'conflict':
+      objects = (replace(objects[0], v_rel=-10.), replace(objects[1], v_rel=-8.5))
+    elif failure == 'stale_member':
+      objects = (objects[0], replace(objects[1], timestamp_ns=ns - 1))
+    elif failure == 'motion_jump':
+      objects = tuple(replace(o, d_rel=o.d_rel + 1.) for o in objects)
+    ext = p.camera_extended
+    TestBoschCameraE2Overlay.statuses(ext, mapping)
+    if failure in ('stale_camera', 'future_camera'):
+      cam_ns = ns - 160_000_001 if failure == 'stale_camera' else ns + 1
+      ext.camera.snapshot = lambda _: ([BoschCameraObject()], 1, 0, cam_ns)
+    ext.update(ns, objects, 10.)
+    assert p.publication_view(objects) is objects
+    assert not ext.mature_groups
+    assert ext.last_maturity_resets == 1
+    assert all(s.stable_intervals == 0 for s in ext.histories.values())
+
+  def test_missing_qualified_representative_or_member_is_fail_open(self):
+    p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)
+    for i in range(3):
+      objects, _ = self.scan(p, 1_000_000_000 + i * 100_000_000)
+    for qualified in ((objects[0],), (objects[1],)):
+      assert p.publication_view(qualified) is qualified
+    stale = tuple(replace(o, timestamp_ns=1_100_000_000) for o in objects)
+    assert p.publication_view(stale) is stale
+
+  def test_real_decoder_m2_and_native_boundary_keep_scc_and_alias_reservation(self, monkeypatch):
+    import opendbc.car.hyundai.radar_interface as module
+    from opendbc.car import structs
+    def baseline(*args):
+      result = structs.RadarData.new_message()
+      result.points = [dict(trackId=0, dRel=80., vRel=0., radarSource='scc', measured=True)]
+      return result
+    monkeypatch.setattr(module.RadarInterfaceBase, 'update_carrot', baseline)
+    messages = []
+    monkeypatch.setattr(module.carlog, 'info', messages.append)
+    interfaces = []
+    for mode in (BOSCH_CAMERA_EXTENDED_OFF, BOSCH_CAMERA_EXTENDED_ACTIVE_TEST):
+      ri = RadarInterface.__new__(RadarInterface)
+      ri.bosch = BoschRadarProvider(1, qualification=False, camera_extended_mode=mode)
+      ri.v_ego = 10.
+      interfaces.append(ri)
+    visible = []
+    for i in range(9):
+      ns = 1_000_000_000 + i * 100_000_000
+      objects = (physical(1_000_001, 15., ns=ns, age=i+1), physical(1_010_690, 19., ns=ns, age=i+1))
+      outputs = []
+      for ri in interfaces:
+        p = ri.bosch
+        if p.camera_extended.camera is not None:
+          # camera 공백으로 split/reappearance를 유발한 뒤 maturity를 다시 시작한다.
+          feed(p.camera_extended.camera, ns, i, [(7, 20., 0., 0., 1.7, 1, 0, -.1, .1)] if i != 5 else [])
+        p.camera_extended.update(ns, objects, 10.)
+        p.tracker.group_manager.states = {o.physical_track_id: None for o in objects}
+        p.last_scan_timestamp_ns = ri._bosch_now_ns = ns
+        ri._bosch_objects = objects
+        outputs.append(ri.update_carrot(10., 0., ns * 1e-9, []))
+      a, b = (ri.bosch.publication_aliases for ri in interfaces)
+      assert a.physical_to_alias == b.physical_to_alias
+      assert a.last_published_ns == b.last_published_ns
+      assert list(a.free_aliases) == list(b.free_aliases)
+      target = a.physical_to_alias[1_010_690]
+      visible.append(any(point.trackId == target for point in outputs[1].points))
+      for result in outputs:
+        assert result.points[0].to_dict() == baseline().points[0].to_dict()
+      assert target not in b.free_aliases
+    assert visible == [True, True, False, False, False, True, True, True, False]
+    assert messages and all('mode=ACTIVE_TEST' in line and 'rep_pid=' in line for line in messages)
+    assert sum('suppressed_pids=1010690' in line for line in messages) == 4
+    perf = interfaces[1].bosch.perf_message()
+    assert 'camera_ext_test_scans=9' in perf and 'camera_ext_suppressed_points=4' in perf
+    assert 'camera_ext_maturity_resets=1' in perf
+
+  def test_route254_original_policy_keeps_24m_lateral_member(self):
+    p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)
+    for i in range(3):
+      ns = 1_000_000_000 + i * 100_000_000
+      far = replace(physical(1_001_303, 24. - .575 * i, -1.96875, -5.75, ns), oem_selected=True)
+      near = physical(1_001_321, 19.5 - .6 * i, -2.5625, -6., ns)
+      _, view = self.scan(p, ns, (far, near))
+    assert view == (far,)
+    assert p.camera_extended.representatives[0].representative_pid == far.physical_track_id

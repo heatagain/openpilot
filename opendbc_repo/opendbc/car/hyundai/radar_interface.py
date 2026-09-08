@@ -286,7 +286,12 @@ BOSCH_SAMPLE_HOLD_NS = 150_000_000  # one 10 Hz observation period plus one SCC 
 BOSCH_CAMERA_EXTENDED_OFF = 0
 BOSCH_CAMERA_EXTENDED_SHADOW = 1
 BOSCH_CAMERA_EXTENDED_ACTIVE = 2
-BOSCH_CAMERA_EXTENDED_MODE = BOSCH_CAMERA_EXTENDED_OFF
+BOSCH_CAMERA_EXTENDED_ACTIVE_TEST = 3
+# EXPERIMENTAL / TEST 전용: 실제 RadarData를 변경한다. UI 전용 overlay가 아니다.
+# 감독하 테스트카 로그 수집에만 사용하며 longitudinal control engagement는 승인되지 않았다.
+# 원복은 아래 MODE 한 줄을 OFF 또는 SHADOW로 변경하고 card를 재시작한다.
+BOSCH_CAMERA_EXTENDED_TEST_INTERVALS = 2
+BOSCH_CAMERA_EXTENDED_MODE = BOSCH_CAMERA_EXTENDED_ACTIVE_TEST
 BOSCH_CAMERA_HEADER = 0x738
 BOSCH_CAMERA_FIRST_OBJECT = 0x739
 BOSCH_CAMERA_LAST_OBJECT = 0x756
@@ -507,6 +512,10 @@ class _BoschExtendedHistory:
   cam_key: int
   class_code: int
   last_confirm_ns: int
+  # 현재 exact tuple의 직전 관측만 보관한다(최대 8 member). 과거 이력 원장이 아니다.
+  stable_intervals: int = 0
+  sample_ns: int = 0
+  observations: tuple[tuple[float, float, float], ...] = ()
 
 
 @dataclass(slots=True)
@@ -521,9 +530,15 @@ class _BoschExtendedRepresentative:
 
 
 class BoschCameraExtendedGrouping:
-  """Frozen A0 + P2 + G0_ATOMIC + group-level E2 output overlay."""
+  """A0/P2/G0/E2 그룹과 테스트 전용 M2 eligibility를 계산한다.
+
+  OFF/SHADOW/안전용 ACTIVE는 baseline 관측을 보존한다. ACTIVE_TEST만
+  allocator 이후 실제 publication을 축소한다. 별도 PID의 소실된 운동 이력을
+  대표점이 이전하지 못하므로 longitudinal control 사용은 NO-GO다.
+  """
   def __init__(self, mode=BOSCH_CAMERA_EXTENDED_MODE):
-    if mode not in (BOSCH_CAMERA_EXTENDED_OFF, BOSCH_CAMERA_EXTENDED_SHADOW, BOSCH_CAMERA_EXTENDED_ACTIVE):
+    if mode not in (BOSCH_CAMERA_EXTENDED_OFF, BOSCH_CAMERA_EXTENDED_SHADOW,
+                    BOSCH_CAMERA_EXTENDED_ACTIVE, BOSCH_CAMERA_EXTENDED_ACTIVE_TEST):
       raise ValueError('invalid Bosch camera extended-grouping mode')
     self.mode = mode
     self.camera = BoschCameraCycleCache() if mode != BOSCH_CAMERA_EXTENDED_OFF else None
@@ -541,6 +556,13 @@ class BoschCameraExtendedGrouping:
     self.perf_sum = Counter()
     self.perf_max = Counter()
     self.perf_scans = 0
+    self.mature_groups = ()
+    self.maturity_resets = 0
+    self.last_maturity_resets = 0
+    self.test_scans = self.test_group_scans = self.test_mature_scans = 0
+    self.test_maturity_reached = 0
+    self.test_full_groups = self.test_coast_groups = 0
+    self.last_camera_ns = None
 
   @staticmethod
   def _geometry(a, b, v_ego, yaw_rate):
@@ -662,6 +684,28 @@ class BoschCameraExtendedGrouping:
     self.representatives = new_states
     return representatives
 
+  def _maturity(self, members, episode, timestamp_ns, by_pid, yaw_rate):
+    # 연구 M2 정의 그대로: 첫 confirmed scan은 0, 두 이전 안정 간격 후 2.
+    # camera ID/episode만으로 연속성을 인정하지 않고 모든 member의 d/y/v를 확인한다.
+    prior = self.histories.get(members)
+    age = 0
+    if prior is not None and prior.cam_key == episode and prior.observations:
+      dt = (timestamp_ns - prior.sample_ns) * 1e-9
+      if 0 < dt <= .160:
+        angle = -(yaw_rate if yaw_rate is not None and math.isfinite(yaw_rate) else 0.) * dt
+        co, si = math.cos(angle), math.sin(angle)
+        for pid, (d, y, v) in zip(members, prior.observations):
+          obj = by_pid[pid]
+          x = d + v * dt
+          if not (abs(obj.d_rel - (x * co - y * si)) <= .5 + 2.5 * dt * dt and
+                  abs(obj.y_rel - (x * si + y * co)) <= .0625 + 2 * dt and
+                  abs(obj.v_rel - v) <= .25 + 5 * dt):
+            break
+        else:
+          age = min(prior.stable_intervals + 1, BOSCH_CAMERA_EXTENDED_TEST_INTERVALS)
+    return _BoschExtendedHistory(members, episode, 1, timestamp_ns, age, timestamp_ns,
+                                 tuple((by_pid[p].d_rel, by_pid[p].y_rel, by_pid[p].v_rel) for p in members))
+
   def _record_perf(self, name, elapsed):
     self.perf_sum[name] += elapsed
     self.perf_max[name] = max(self.perf_max[name], elapsed)
@@ -670,8 +714,10 @@ class BoschCameraExtendedGrouping:
     if self.mode == BOSCH_CAMERA_EXTENDED_OFF:
       return objects
     start = time.perf_counter_ns()
+    prior_maturity = self.histories
+    self.mature_groups = ()
     if self.last_ns is not None and timestamp_ns - self.last_ns > BOSCH_CAMERA_OBSERVATION_GAP_NS:
-      self.histories.clear()
+      self.histories = {}
       self.representatives.clear()
     self.last_ns = timestamp_ns
     by_pid = {obj.physical_track_id: obj for obj in objects}
@@ -696,6 +742,7 @@ class BoschCameraExtendedGrouping:
     self._record_perf('candidate', now - start)
 
     snapshot = self.camera.snapshot(timestamp_ns)
+    self.last_camera_ns = snapshot[3] if snapshot is not None else None
     associations = {}
     assoc_start = now
     if snapshot is not None and candidate_nodes:
@@ -752,7 +799,8 @@ class BoschCameraExtendedGrouping:
     self._record_perf('group', now - group_start)
 
     output_start = now
-    representatives = self._choose_representatives(groups, by_pid, timestamp_ns, yaw_rate)
+    self._choose_representatives(groups, by_pid, timestamp_ns, yaw_rate)
+    mature = []
     for group in groups:
       if len(group) < 2:
         continue
@@ -760,17 +808,41 @@ class BoschCameraExtendedGrouping:
       pairs = [tuple(sorted((members[i], members[j]))) for i in range(len(members)) for j in range(i + 1, len(members))]
       if all(pair in strict for pair in pairs):
         episode = associations[members[0]][1]
-        next_history[members] = _BoschExtendedHistory(members, episode, 1, timestamp_ns)
+        fresh = (self.last_camera_ns is not None and
+                 0 <= timestamp_ns - self.last_camera_ns <= BOSCH_CAMERA_OBSERVATION_GAP_NS and
+                 all(by_pid[p].timestamp_ns == timestamp_ns for p in members))
+        if self.mode == BOSCH_CAMERA_EXTENDED_ACTIVE_TEST and fresh:
+          state = self._maturity(members, episode, timestamp_ns, by_pid, yaw_rate)
+          next_history[members] = state
+          if state.stable_intervals >= BOSCH_CAMERA_EXTENDED_TEST_INTERVALS:
+            mature.append(members)
+            prior = self.histories.get(members)
+            if prior is None or prior.stable_intervals < BOSCH_CAMERA_EXTENDED_TEST_INTERVALS:
+              self.test_maturity_reached += 1
+        else:
+          next_history[members] = _BoschExtendedHistory(members, episode, 1, timestamp_ns)
       elif members not in next_history:
         raise AssertionError('E2 coast created an unconfirmed extended member set')
+      else:
+        # E2 association은 유지해도 strict P2 없는 coast의 maturity는 즉시 폐기한다.
+        state = next_history[members]
+        next_history[members] = _BoschExtendedHistory(members, state.cam_key, state.class_code, state.last_confirm_ns)
+    self.last_maturity_resets = sum(bool(old.observations) and
+      (key not in next_history or not next_history[key].observations or next_history[key].stable_intervals == 0)
+      for key, old in prior_maturity.items())
+    self.maturity_resets += self.last_maturity_resets
+    self.mature_groups = tuple(mature)
     self.histories = next_history
     self.max_state_count = max(self.max_state_count, len(self.histories))
     self.last_groups = tuple(sorted(tuple(sorted(group)) for group in groups if len(group) > 1))
-    if self.mode == BOSCH_CAMERA_EXTENDED_ACTIVE:
-      suppressed = {pid for members, rep in representatives.items() for pid in members if pid != rep.physical_track_id}
-      result = tuple(obj for obj in objects if obj.physical_track_id not in suppressed)
-    else:
-      result = objects
+    if self.mode == BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
+      self.test_scans += 1
+      self.test_group_scans += len(self.last_groups)
+      self.test_mature_scans += len(self.mature_groups)
+      self.test_full_groups += len(self.last_groups) - self.last_coast_count
+      self.test_coast_groups += self.last_coast_count
+    # qualifier와 allocator 입력은 모든 모드에서 baseline 그대로 보존한다.
+    result = objects
     done = time.perf_counter_ns()
     self._record_perf('output', done - output_start)
     self._record_perf('total', done - start)
@@ -785,7 +857,15 @@ class BoschCameraExtendedGrouping:
       for name in ('candidate', 'association', 'group', 'e2', 'output', 'total'))
     fields += (f' camera_ext_candidates={self.last_candidate_count} camera_ext_nodes={self.last_association_count}'
                f' camera_ext_coasts={self.last_coast_count} camera_ext_state_peak={self.max_state_count}'
-               f' camera_ext_rep_switches={self.representative_switches}')
+               f' camera_ext_rep_switches={self.representative_switches}'
+               f' camera_ext_test_scans={self.test_scans}'
+               f' camera_ext_group_scans={self.test_group_scans} camera_ext_mature_group_scans={self.test_mature_scans}'
+               f' camera_ext_maturity_reached={self.test_maturity_reached}'
+               f' camera_ext_full_group_scans={self.test_full_groups} camera_ext_coast_group_scans={self.test_coast_groups}'
+               f' camera_ext_groups={len(self.last_groups)} camera_ext_mature_groups={len(self.mature_groups)}'
+               f' camera_ext_maturity_resets={self.maturity_resets}'
+               f' camera_ext_camera_age_ms={(self.last_ns - self.last_camera_ns) * 1e-6 if self.last_camera_ns is not None else -1:.3f}'
+               f' camera_ext_camera_reject={self.camera.rejected_cycles}')
     self.perf_sum.clear()
     self.perf_max.clear()
     self.perf_scans = 0
@@ -2653,7 +2733,57 @@ class BoschRadarProvider:
     self._last_output_ns = None
     self._pending_error = False
     self._perf_raw = self._perf_qualified = 0
+    self.test_publications = self.test_suppressed_points = self.test_active_groups = 0
+    self.test_last_suppressed = ()
+    self.test_last_active_groups = 0
     self._reset_perf()
+
+  def publication_view(self, objects, timestamp_ns=None):
+    """EXPERIMENTAL: OFF-equivalent alias 할당 이후 실제 RadarData를 축소한다.
+
+    감독하 테스트카 로그 수집 전용이며 longitudinal engagement는 NO-GO다.
+    이 provider 입력에는 신뢰 가능한 engagement 상태가 없다.
+    """
+    ext = self.camera_extended
+    if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
+      return objects
+    if timestamp_ns is not None:
+      self.test_publications += 1
+    if not ext.mature_groups or not objects:
+      self.test_last_suppressed = ()
+      self.test_last_active_groups = 0
+      return objects
+    # 다른 scan의 tuple 또는 qualification에서 대표가 빠진 그룹은 baseline으로 연다.
+    by_pid = {obj.physical_track_id: obj for obj in objects}
+    suppressed = set()
+    active = []
+    for rep in ext.representatives:
+      members = tuple(sorted(rep.members))
+      if members not in ext.mature_groups or not all(
+          p in by_pid and by_pid[p].timestamp_ns == ext.last_ns for p in members):
+        continue
+      suppressed.update(p for p in members if p != rep.representative_pid)
+      active.append(rep)
+    self.test_last_suppressed = tuple(sorted(suppressed))
+    self.test_last_active_groups = len(active)
+    if timestamp_ns is not None:
+      self.test_suppressed_points += len(suppressed)
+      self.test_active_groups += len(active)
+      # 기존 carlog/logMessage 경로. 활성 publication만 기록하며 payload는 현재 그룹으로 제한한다.
+      # 각 PID/alias/좌표와 ns를 CAN, liveTracks, radarState와 결합해 재등장 이력을 offline 복원한다.
+      for rep in active:
+        members = tuple(sorted(rep.members))
+        state = ext.histories[members]
+        snapshot = ext.camera.snapshot(ext.last_ns)
+        camera_id = next((c.obj_id for c in snapshot[0][:snapshot[1]] if c.episode == state.cam_key), -1) if snapshot else -1
+        detail = ';'.join(f'{p}:{self.publication_aliases.physical_to_alias.get(p, -1)}:'
+                          f'{by_pid[p].d_rel}:{by_pid[p].y_rel}:{by_pid[p].v_rel}' for p in members)
+        carlog.info(f'BoschActiveTest mode=ACTIVE_TEST ns={timestamp_ns} scan_ns={ext.last_ns} '
+                    f'maturity={state.stable_intervals} rep_pid={rep.representative_pid} '
+                    f'suppressed_pids={",".join(str(p) for p in members if p != rep.representative_pid)} '
+                    f'suppressed_count={len(members) - 1} camera_id={camera_id} episode={state.cam_key} '
+                    f'camera_ns={ext.last_camera_ns} members_pid_alias_d_y_v={detail}')
+    return tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects
 
   def _reset_perf(self):
     self._perf_scans = 0
@@ -2708,6 +2838,9 @@ class BoschRadarProvider:
       f'can_error={int(self.can_error)} '
       f'camera_decode_ms_avg={self._perf_camera_decode_sum * 1e-6 / max(self._perf_camera_decode_count, 1):.3f} '
       f'camera_decode_ms_max={self._perf_camera_decode_max * 1e-6:.3f} {extended_fields}'
+      f' camera_ext_mode={self.camera_extended.mode} camera_ext_test_publications={self.test_publications}'
+      f' camera_ext_suppressed_points={self.test_suppressed_points} camera_ext_active_group_publications={self.test_active_groups}'
+      f' camera_ext_active_groups={self.test_last_active_groups} camera_ext_suppressed_pid_count={len(self.test_last_suppressed)}'
     )
     self._reset_perf()
     return message
@@ -2906,10 +3039,12 @@ class BoschRadarProvider:
     self._debug_oem_slot = oem_slot
     self._debug_oem_matches = len(matches)
     self._debug_timeout = False
-    output_view = self.camera_extended.update(availability_ns, objects, v_ego, yaw_rate_left)
+    self.camera_extended.update(availability_ns, objects, v_ego, yaw_rate_left)
     qualify_start_ns = time.perf_counter_ns()
-    qualified = (self.qualifier.update(output_view, availability_ns, v_ego, path, yaw_rate=yaw_rate_left)
-                 if self.qualifier is not None else output_view)
+    # 모든 모드에서 qualifier 이력과 alias 할당에는 동일한 physical 집합을 전달한다.
+    # ACTIVE_TEST 필터는 allocator 이후 최종 publication에만 적용한다.
+    qualified = (self.qualifier.update(objects, availability_ns, v_ego, path, yaw_rate=yaw_rate_left)
+                 if self.qualifier is not None else objects)
     done_ns = time.perf_counter_ns()
     qualify_ns, total_ns = done_ns - qualify_start_ns, done_ns - start_ns
     raw, physical = self.tracker.raw_manager, self.tracker.group_manager
@@ -3113,6 +3248,7 @@ class RadarInterface(RadarInterfaceBase):
       start_ns = time.perf_counter_ns()
       alias = self.bosch.publication_aliases.update(
         self._bosch_now_ns, (obj.physical_track_id for obj in objects), self.bosch.tracker.group_manager.states)
+      objects = self.bosch.publication_view(objects, self._bosch_now_ns)
       bosch_append_points(ret, objects, self.v_ego, self._bosch_now_ns, alias)
       self.bosch.record_native_time(time.perf_counter_ns() - start_ns)
     return ret
