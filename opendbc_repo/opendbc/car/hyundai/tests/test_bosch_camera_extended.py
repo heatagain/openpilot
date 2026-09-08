@@ -543,3 +543,206 @@ class TestBoschActiveTestPublication:
       _, view = self.scan(p, ns, (far, near))
     assert view == (far,)
     assert p.camera_extended.representatives[0].representative_pid == far.physical_track_id
+
+
+class TestBoschTruckAwareP2:
+  IDS = (1_004_581, 1_004_624)
+
+  @staticmethod
+  def statuses(grouping, ns, mapping, *, camera_id=203, episode=186, width=2.45,
+               camera_d=24., camera_y=0., camera_v=0., camera_ns=None):
+    grouping._associate = lambda obj, *_: mapping.get(obj.physical_track_id, (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
+    camera = BoschCameraObject(camera_id, episode, camera_d, camera_y, camera_v, width, 6, .2, -.2)
+    grouping.camera.snapshot = lambda _: ([camera], 1, 0, ns if camera_ns is None else camera_ns)
+
+  @classmethod
+  def objects(cls, ns, *, far_d=28., far_y=0., far_v=0., far_pid=None):
+    return (physical(cls.IDS[0], 20., 0., 0., ns),
+            physical(cls.IDS[1] if far_pid is None else far_pid, far_d, far_y, far_v, ns))
+
+  @classmethod
+  def assigned(cls, episode=186, class_code=6, far_pid=None):
+    return {cls.IDS[0]: (BOSCH_CAMERA_ASSOC_ASSIGNED, episode, class_code),
+            cls.IDS[1] if far_pid is None else far_pid: (BOSCH_CAMERA_ASSOC_ASSIGNED, episode, class_code)}
+
+  def test_class1_baseline_p2_is_still_immediate(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = 1_000_000_000
+    objects = self.objects(ns)
+    self.statuses(grouping, ns, self.assigned(class_code=1))
+    assert grouping.update(ns, objects, 10.) is objects
+    assert grouping.last_groups == (self.IDS,)
+    assert grouping.truck_pair_histories == {}
+
+  def test_class6_does_not_open_p2_immediately(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = 1_000_000_000
+    self.statuses(grouping, ns, self.assigned())
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.last_groups == ()
+    assert grouping.truck_pair_histories[self.IDS].confirmations == 1
+
+  def test_same_episode_class6_and_current_g0_still_require_history(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(9):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.statuses(grouping, ns, self.assigned())
+      grouping.update(ns, self.objects(ns), 10.)
+      assert grouping.last_groups == ()
+
+  def test_stable_large_vehicle_opens_only_on_tenth_confirmation(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(10):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.statuses(grouping, ns, self.assigned())
+      grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.last_groups == (self.IDS,)
+    assert grouping.truck_pair_histories[self.IDS].confirmations == 10
+
+  @pytest.mark.parametrize(('reset', 'kwargs'), (
+    ('episode', {'episode': 187}),
+    ('camera_id', {'camera_id': 204}),
+    ('camera_d', {'camera_d': 25.}),
+    ('camera_y', {'camera_y': .25}),
+    ('camera_v', {'camera_v': 1.}),
+    ('camera_width', {'width': 2.60}),
+  ))
+  def test_camera_identity_or_motion_discontinuity_resets(self, reset, kwargs):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(9):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.statuses(grouping, ns, self.assigned())
+      grouping.update(ns, self.objects(ns), 10.)
+    ns += 100_000_000
+    mapping = self.assigned(episode=kwargs.get('episode', 186))
+    self.statuses(grouping, ns, mapping, **kwargs)
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.last_groups == (), reset
+    assert grouping.truck_pair_histories[self.IDS].confirmations == 1
+
+  @pytest.mark.parametrize(('name', 'objects'), (
+    ('dd', lambda self, ns: self.objects(ns, far_d=29.)),
+    ('dy', lambda self, ns: self.objects(ns, far_y=.75)),
+    ('dv', lambda self, ns: self.objects(ns, far_v=.5)),
+  ))
+  def test_radar_geometry_discontinuity_resets(self, name, objects):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(9):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.statuses(grouping, ns, self.assigned())
+      grouping.update(ns, self.objects(ns, far_d=28.), 10.)
+    ns += 100_000_000
+    self.statuses(grouping, ns, self.assigned())
+    grouping.update(ns, objects(self, ns), 10.)
+    assert grouping.last_groups == (), name
+    assert grouping.truck_pair_histories[self.IDS].confirmations == 1
+
+  def test_member_pid_change_starts_a_new_pair_at_one(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(9):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.statuses(grouping, ns, self.assigned())
+      grouping.update(ns, self.objects(ns), 10.)
+    ns += 100_000_000
+    new_pid = 1_004_625
+    self.statuses(grouping, ns, self.assigned(far_pid=new_pid))
+    grouping.update(ns, self.objects(ns, far_pid=new_pid), 10.)
+    assert tuple(grouping.truck_pair_histories) == ((self.IDS[0], new_pid),)
+    assert next(iter(grouping.truck_pair_histories.values())).confirmations == 1
+
+  @pytest.mark.parametrize('failure', ('stale', 'ambiguous', 'class_change'))
+  def test_stale_ambiguity_or_class_change_clears_pair_state(self, failure):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(9):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.statuses(grouping, ns, self.assigned())
+      grouping.update(ns, self.objects(ns), 10.)
+    ns += 100_000_000
+    mapping = self.assigned()
+    camera_ns = None
+    if failure == 'stale':
+      camera_ns = ns - 160_000_001
+    elif failure == 'ambiguous':
+      mapping[self.IDS[1]] = (BOSCH_CAMERA_ASSOC_AMBIGUOUS, -1, -1)
+    else:
+      mapping[self.IDS[1]] = (BOSCH_CAMERA_ASSOC_ASSIGNED, 186, 2)
+    self.statuses(grouping, ns, mapping, camera_ns=camera_ns)
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.last_groups == ()
+    assert grouping.truck_pair_histories == {}
+
+  def test_two_distinct_convoy_members_with_different_episodes_never_group(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    mapping = {self.IDS[0]: (BOSCH_CAMERA_ASSOC_ASSIGNED, 186, 6),
+               self.IDS[1]: (BOSCH_CAMERA_ASSOC_ASSIGNED, 187, 6)}
+    for i in range(20):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.statuses(grouping, ns, mapping)
+      grouping.update(ns, self.objects(ns), 10.)
+      assert grouping.last_groups == ()
+
+  def test_adjacent_vehicle_pair_fails_absolute_lateral_gate(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(20):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.statuses(grouping, ns, self.assigned())
+      grouping.update(ns, self.objects(ns, far_y=1.), 10.)
+    assert grouping.last_groups == ()
+
+  def test_cut_in_motion_change_resets_before_authorization(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(20):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.statuses(grouping, ns, self.assigned())
+      grouping.update(ns, self.objects(ns, far_y=.75 if i % 2 else 0.), 10.)
+      assert grouping.last_groups == ()
+
+  def test_narrow_class6_phantom_never_enters_pair_state(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(20):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.statuses(grouping, ns, self.assigned(), width=2.35)
+      grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.last_groups == ()
+    assert grouping.truck_pair_histories == {}
+
+  def test_class1_box_truck_m2_publication_sequence_is_exact(self):
+    provider = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)
+    visible = []
+    for i in range(6):
+      ns = 1_000_000_000 + i * 100_000_000
+      objects = self.objects(ns)
+      self.statuses(provider.camera_extended, ns, self.assigned(class_code=1))
+      provider.camera_extended.update(ns, objects, 10.)
+      visible.append(len(provider.publication_view(objects)))
+    assert visible == [2, 2, 1, 1, 1, 1]
+
+  @pytest.mark.parametrize(('field', 'value', 'accepted'), (
+    ('width', 2.40, True), ('width', 2.35, False),
+    ('dd', 5.50, True), ('dd', 5.49, False), ('dd', 9.00, True), ('dd', 9.01, False),
+    ('dy', .875, True), ('dy', .876, False), ('dv', .50, True), ('dv', .501, False),
+  ))
+  def test_absolute_truck_gate_boundaries(self, field, value, accepted):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(10):
+      ns = 1_000_000_000 + i * 100_000_000
+      width = value if field == 'width' else 2.45
+      far_d = 20. + value if field == 'dd' else 28.
+      far_y = value if field == 'dy' else 0.
+      far_v = value if field == 'dv' else 0.
+      self.statuses(grouping, ns, self.assigned(), width=width)
+      grouping.update(ns, self.objects(ns, far_d=far_d, far_y=far_y, far_v=far_v), 10.)
+    assert bool(grouping.last_groups) is accepted
+
+  def test_pair_state_is_bounded_and_retires_on_next_scan(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = 1_000_000_000
+    objects = tuple(physical(1_000_000 + i, 10. + i, ns=ns) for i in range(24))
+    mapping = {obj.physical_track_id: (BOSCH_CAMERA_ASSOC_ASSIGNED, 186, 6) for obj in objects}
+    self.statuses(grouping, ns, mapping)
+    grouping.update(ns, objects, 10.)
+    assert len(grouping.truck_pair_histories) == 16
+    ns += 100_000_000
+    self.statuses(grouping, ns, {})
+    grouping.update(ns, (), 10.)
+    assert grouping.truck_pair_histories == {}

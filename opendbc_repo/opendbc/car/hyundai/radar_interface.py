@@ -307,6 +307,17 @@ BOSCH_CAMERA_ANGLE_LSB = 1.0 / 4496.3
 BOSCH_CAMERA_ASSOC_UNRESOLVED = 0
 BOSCH_CAMERA_ASSOC_ASSIGNED = 1
 BOSCH_CAMERA_ASSOC_AMBIGUOUS = 2
+# camera class 6은 경험적으로 car-family 상태이지 truck enum이 아니다.
+# 아래의 독립적인 폭/rigid-pair 증거를 모두 만족할 때만 대형차 P2를 보조하며,
+# 기존 class-1 경로는 별도 분기로 그대로 유지한다.
+BOSCH_TRUCK_P2_CLASS = 6
+BOSCH_TRUCK_P2_CONFIRMATIONS = 10
+BOSCH_TRUCK_P2_STATE_MAX = 16
+BOSCH_TRUCK_P2_WIDTH_MIN_M = 2.40
+BOSCH_TRUCK_P2_DD_MIN_M = 5.50
+BOSCH_TRUCK_P2_DD_MAX_M = 9.00
+BOSCH_TRUCK_P2_DY_MAX_M = 0.875
+BOSCH_TRUCK_P2_DV_MAX_MPS = 0.50
 
 
 def _bosch_camera_signed(value, bits):
@@ -519,6 +530,22 @@ class _BoschExtendedHistory:
 
 
 @dataclass(slots=True)
+class _BoschTruckPairHistory:
+  members: tuple[int, int]
+  camera_id: int
+  episode: int
+  last_ns: int
+  confirmations: int
+  dd: float
+  dy: float
+  dv: float
+  camera_d: float
+  camera_y: float
+  camera_v: float
+  camera_width: float
+
+
+@dataclass(slots=True)
 class _BoschExtendedRepresentative:
   members: frozenset[int]
   representative_pid: int
@@ -543,6 +570,7 @@ class BoschCameraExtendedGrouping:
     self.mode = mode
     self.camera = BoschCameraCycleCache() if mode != BOSCH_CAMERA_EXTENDED_OFF else None
     self.histories: dict[tuple[int, ...], _BoschExtendedHistory] = {}
+    self.truck_pair_histories: dict[tuple[int, int], _BoschTruckPairHistory] = {}
     self.representatives: list[_BoschExtendedRepresentative] = []
     self.last_ns = None
     self.last_groups: tuple[tuple[int, ...], ...] = ()
@@ -563,6 +591,8 @@ class BoschCameraExtendedGrouping:
     self.test_maturity_reached = 0
     self.test_full_groups = self.test_coast_groups = 0
     self.last_camera_ns = None
+    self.last_truck_edge_count = 0
+    self.max_truck_pair_state = 0
 
   @staticmethod
   def _geometry(a, b, v_ego, yaw_rate):
@@ -684,7 +714,7 @@ class BoschCameraExtendedGrouping:
     self.representatives = new_states
     return representatives
 
-  def _maturity(self, members, episode, timestamp_ns, by_pid, yaw_rate):
+  def _maturity(self, members, episode, class_code, timestamp_ns, by_pid, yaw_rate):
     # 연구 M2 정의 그대로: 첫 confirmed scan은 0, 두 이전 안정 간격 후 2.
     # camera ID/episode만으로 연속성을 인정하지 않고 모든 member의 d/y/v를 확인한다.
     prior = self.histories.get(members)
@@ -703,8 +733,57 @@ class BoschCameraExtendedGrouping:
             break
         else:
           age = min(prior.stable_intervals + 1, BOSCH_CAMERA_EXTENDED_TEST_INTERVALS)
-    return _BoschExtendedHistory(members, episode, 1, timestamp_ns, age, timestamp_ns,
+    return _BoschExtendedHistory(members, episode, class_code, timestamp_ns, age, timestamp_ns,
                                  tuple((by_pid[p].d_rel, by_pid[p].y_rel, by_pid[p].v_rel) for p in members))
+
+  @staticmethod
+  def _truck_pair_continuous(prior, timestamp_ns, dd, dy, dv, camera):
+    dt = (timestamp_ns - prior.last_ns) * 1e-9
+    return (
+      0 < dt <= BOSCH_CAMERA_OBSERVATION_GAP_NS * 1e-9 and
+      prior.episode == camera.episode and prior.camera_id == camera.obj_id and
+      abs(dd - prior.dd) <= .50 and abs(dy - prior.dy) <= .375 and abs(dv - prior.dv) <= .25 and
+      abs(camera.long_m - (prior.camera_d + prior.camera_v * dt)) <= .75 and
+      abs(camera.lat_m - prior.camera_y) <= .125 and
+      abs(camera.vrel_mps - prior.camera_v) <= .50 and
+      abs(camera.width_m - prior.camera_width) <= .10)
+
+  def _truck_strict(self, timestamp_ns, geometry, associations, by_pid, camera_by_episode):
+    candidates = []
+    for key, (dd, dy, dv) in geometry.items():
+      aa = associations.get(key[0], (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
+      ab = associations.get(key[1], (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
+      if not (aa[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and ab[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and
+              aa[1] == ab[1] and aa[1] >= 0 and aa[2] == ab[2] == BOSCH_TRUCK_P2_CLASS):
+        continue
+      camera = camera_by_episode.get(aa[1])
+      fresh = (camera is not None and self.last_camera_ns is not None and
+               0 <= timestamp_ns - self.last_camera_ns <= BOSCH_CAMERA_OBSERVATION_GAP_NS and
+               by_pid[key[0]].timestamp_ns == by_pid[key[1]].timestamp_ns == timestamp_ns)
+      if not (fresh and camera.width_m >= BOSCH_TRUCK_P2_WIDTH_MIN_M and
+              BOSCH_TRUCK_P2_DD_MIN_M <= dd <= BOSCH_TRUCK_P2_DD_MAX_M and
+              dy <= BOSCH_TRUCK_P2_DY_MAX_M and dv <= BOSCH_TRUCK_P2_DV_MAX_MPS):
+        continue
+      score = dd / 12.0 + dy / 1.5 + dv / 1.5
+      candidates.append((score, key, dd, dy, dv, camera))
+
+    # 비정상적으로 조밀한 return에서도 fail-open으로 state 상한을 지킨다.
+    candidates.sort(key=lambda row: (row[0], row[1]))
+    next_history = {}
+    strict = {}
+    for score, key, dd, dy, dv, camera in candidates[:BOSCH_TRUCK_P2_STATE_MAX]:
+      prior = self.truck_pair_histories.get(key)
+      confirmations = prior.confirmations + 1 if prior is not None and self._truck_pair_continuous(
+        prior, timestamp_ns, dd, dy, dv, camera) else 1
+      state = _BoschTruckPairHistory(key, camera.obj_id, camera.episode, timestamp_ns, confirmations,
+                                     dd, dy, dv, camera.long_m, camera.lat_m, camera.vrel_mps, camera.width_m)
+      next_history[key] = state
+      if confirmations >= BOSCH_TRUCK_P2_CONFIRMATIONS:
+        strict[key] = score
+    self.truck_pair_histories = next_history
+    self.max_truck_pair_state = max(self.max_truck_pair_state, len(next_history))
+    self.last_truck_edge_count = len(strict)
+    return strict
 
   def _record_perf(self, name, elapsed):
     self.perf_sum[name] += elapsed
@@ -718,6 +797,7 @@ class BoschCameraExtendedGrouping:
     self.mature_groups = ()
     if self.last_ns is not None and timestamp_ns - self.last_ns > BOSCH_CAMERA_OBSERVATION_GAP_NS:
       self.histories = {}
+      self.truck_pair_histories = {}
       self.representatives.clear()
     self.last_ns = timestamp_ns
     by_pid = {obj.physical_track_id: obj for obj in objects}
@@ -744,9 +824,11 @@ class BoschCameraExtendedGrouping:
     snapshot = self.camera.snapshot(timestamp_ns)
     self.last_camera_ns = snapshot[3] if snapshot is not None else None
     associations = {}
+    camera_by_episode = {}
     assoc_start = now
     if snapshot is not None and candidate_nodes:
       camera_objects, count, _, _ = snapshot
+      camera_by_episode = {camera_objects[index].episode: camera_objects[index] for index in range(count)}
       for pid in candidate_nodes:
         associations[pid] = self._associate(by_pid[pid], camera_objects, count)
     self.last_association_count = len(associations)
@@ -755,12 +837,17 @@ class BoschCameraExtendedGrouping:
     self._record_perf('association', now - assoc_start)
 
     strict = {}
+    strict_classes = {}
     for key, (dd, dy, dv) in geometry.items():
       aa = associations.get(key[0], (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
       ab = associations.get(key[1], (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
       if (aa[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and ab[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and
           aa[1] == ab[1] and aa[1] >= 0 and aa[2] == 1 and ab[2] == 1):
         strict[key] = dd / 12.0 + dy / 1.5 + dv / 1.5
+        strict_classes[key] = 1
+    truck_strict = self._truck_strict(timestamp_ns, geometry, associations, by_pid, camera_by_episode)
+    strict.update(truck_strict)
+    strict_classes.update((key, BOSCH_TRUCK_P2_CLASS) for key in truck_strict)
 
     e2_start = time.perf_counter_ns()
     edges = dict(strict)
@@ -773,7 +860,7 @@ class BoschCameraExtendedGrouping:
       okay = (all(pid in by_pid for pid in members) and all(pair in geometry for pair in pairs) and
               timestamp_ns - history.last_confirm_ns <= BOSCH_CAMERA_E2_HOLD_NS and
               not any(value[0] == BOSCH_CAMERA_ASSOC_AMBIGUOUS for value in verdicts) and
-              not any(value[1] != history.cam_key or value[2] != 1 for value in assigned) and
+              not any(value[1] != history.cam_key or value[2] != history.class_code for value in assigned) and
               any(value[1] == history.cam_key for value in assigned))
       if not okay:
         continue
@@ -808,11 +895,12 @@ class BoschCameraExtendedGrouping:
       pairs = [tuple(sorted((members[i], members[j]))) for i in range(len(members)) for j in range(i + 1, len(members))]
       if all(pair in strict for pair in pairs):
         episode = associations[members[0]][1]
+        class_code = strict_classes[pairs[0]]
         fresh = (self.last_camera_ns is not None and
                  0 <= timestamp_ns - self.last_camera_ns <= BOSCH_CAMERA_OBSERVATION_GAP_NS and
                  all(by_pid[p].timestamp_ns == timestamp_ns for p in members))
         if self.mode == BOSCH_CAMERA_EXTENDED_ACTIVE_TEST and fresh:
-          state = self._maturity(members, episode, timestamp_ns, by_pid, yaw_rate)
+          state = self._maturity(members, episode, class_code, timestamp_ns, by_pid, yaw_rate)
           next_history[members] = state
           if state.stable_intervals >= BOSCH_CAMERA_EXTENDED_TEST_INTERVALS:
             mature.append(members)
@@ -820,7 +908,7 @@ class BoschCameraExtendedGrouping:
             if prior is None or prior.stable_intervals < BOSCH_CAMERA_EXTENDED_TEST_INTERVALS:
               self.test_maturity_reached += 1
         else:
-          next_history[members] = _BoschExtendedHistory(members, episode, 1, timestamp_ns)
+          next_history[members] = _BoschExtendedHistory(members, episode, class_code, timestamp_ns)
       elif members not in next_history:
         raise AssertionError('E2 coast created an unconfirmed extended member set')
       else:
@@ -857,6 +945,8 @@ class BoschCameraExtendedGrouping:
       for name in ('candidate', 'association', 'group', 'e2', 'output', 'total'))
     fields += (f' camera_ext_candidates={self.last_candidate_count} camera_ext_nodes={self.last_association_count}'
                f' camera_ext_coasts={self.last_coast_count} camera_ext_state_peak={self.max_state_count}'
+               f' camera_ext_truck_edges={self.last_truck_edge_count}'
+               f' camera_ext_truck_state_peak={self.max_truck_pair_state}'
                f' camera_ext_rep_switches={self.representative_switches}'
                f' camera_ext_test_scans={self.test_scans}'
                f' camera_ext_group_scans={self.test_group_scans} camera_ext_mature_group_scans={self.test_mature_scans}'
