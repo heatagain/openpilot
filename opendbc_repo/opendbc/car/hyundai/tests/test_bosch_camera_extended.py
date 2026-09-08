@@ -1,0 +1,227 @@
+import math
+
+import pytest
+
+from opendbc.car.hyundai.radar_interface import (
+  BOSCH_CAMERA_ASSOC_AMBIGUOUS,
+  BOSCH_CAMERA_ASSOC_ASSIGNED,
+  BOSCH_CAMERA_ASSOC_UNRESOLVED,
+  BOSCH_CAMERA_E2_HOLD_NS,
+  BOSCH_CAMERA_EXTENDED_ACTIVE,
+  BOSCH_CAMERA_EXTENDED_OFF,
+  BOSCH_CAMERA_EXTENDED_SHADOW,
+  BOSCH_CAMERA_HEADER,
+  BoschCameraCycleCache,
+  BoschCameraExtendedGrouping,
+  BoschCameraObject,
+  BoschPhysicalObject,
+  BoschRawDetection,
+  BoschRawTrack,
+)
+
+
+def signed(value, bits):
+  return value & ((1 << bits) - 1)
+
+
+def camera_frames(counter, objects):
+  frames = [(BOSCH_CAMERA_HEADER, len(objects) | (counter << 52))]
+  for slot, obj in enumerate(objects):
+    obj_id, long_m, lat_m, vrel_mps, width_m, cls, ext, right, left = obj
+    a = (obj_id | (round(long_m / .0625) << 8) |
+         (signed(round(lat_m / .0625), 12) << 20) |
+         (signed(round(vrel_mps / .0625), 12) << 40) | (counter << 52))
+    b = round(width_m / .05) | (cls << 48) | (ext << 50) | (counter << 52)
+    c = (signed(round(right * 4496.3), 13) << 18) | (signed(round(left * 4496.3), 13) << 31) | (counter << 52)
+    frames.extend(((0x739 + 3 * slot, a), (0x73a + 3 * slot, b), (0x73b + 3 * slot, c)))
+  return frames
+
+
+def feed(cache, ns, counter, objects, omit=(), counter_override=None):
+  for address, word in camera_frames(counter, objects):
+    if address in omit:
+      continue
+    if counter_override and address in counter_override:
+      word &= ~(0xf << 52)
+      word |= counter_override[address] << 52
+    cache.ingest(ns, address, word.to_bytes(8, 'little'))
+
+
+def physical(pid, d_rel, y_rel=0., v_rel=0., ns=1_000_000_000, age=4):
+  raw = pid - 999_000
+  detection = BoschRawDetection(ns, raw % 32, float(d_rel), float(y_rel), float(v_rel), 1)
+  member = BoschRawTrack(raw, detection, age, False)
+  return BoschPhysicalObject(pid, ns, (member,), raw, float(d_rel), float(y_rel), float(v_rel),
+                             False, False, age, 'single_return')
+
+
+class TestBoschCameraCycleCache:
+  OBJ = (7, 20., -1.25, -2.5, 2.65, 1, 0, -.08, .06)
+
+  def test_scalar_decode_matches_frozen_bit_layout(self):
+    cache = BoschCameraCycleCache()
+    feed(cache, 1_000_000_000, 3, [self.OBJ])
+    snapshot = cache.snapshot(1_001_000_000)
+    assert snapshot is not None
+    objects, count, cycle, complete_ns = snapshot
+    obj = objects[0]
+    assert (count, cycle, complete_ns) == (1, 0, 1_000_000_000)
+    assert (obj.obj_id, obj.episode, obj.class_code) == (7, 1, 1)
+    assert (obj.long_m, obj.lat_m, obj.vrel_mps) == (20., -1.25, -2.5)
+    assert obj.width_m == pytest.approx(2.65)
+    assert obj.angle_right == pytest.approx(round(-.08 * 4496.3) / 4496.3)
+    assert obj.angle_left == pytest.approx(round(.06 * 4496.3) / 4496.3)
+
+  def test_counter_mixing_and_incomplete_cycles_are_unavailable(self):
+    for omit, override in [((0x73a,), None), ((), {0x73b: 4})]:
+      cache = BoschCameraCycleCache()
+      feed(cache, 1_000_000_000, 3, [self.OBJ], omit=omit, counter_override=override)
+      assert cache.snapshot(1_010_000_000) is None
+
+  def test_dense_count_and_occupied_slot_must_agree(self):
+    cache = BoschCameraCycleCache()
+    bad = list(self.OBJ)
+    bad[0] = bad[1] = bad[2] = bad[3] = 0
+    feed(cache, 1_000_000_000, 0, [tuple(bad)])
+    assert cache.snapshot(1_010_000_000) is None
+
+  def test_id_episode_survives_slot_handoff_but_not_two_missing_cycles(self):
+    cache = BoschCameraCycleCache()
+    feed(cache, 1_000_000_000, 0, [self.OBJ])
+    first = cache.snapshot(1_001_000_000)[0][0].episode
+    other = (9, 18., 0., 0., 1.7, 2, 0, -.1, .1)
+    feed(cache, 1_040_000_000, 1, [other, self.OBJ])
+    moved = cache.snapshot(1_041_000_000)
+    assert moved[0][1].episode == first
+    feed(cache, 1_080_000_000, 2, [other])
+    feed(cache, 1_120_000_000, 3, [other])
+    feed(cache, 1_160_000_000, 4, [self.OBJ])
+    assert cache.snapshot(1_161_000_000)[0][0].episode != first
+
+  def test_future_and_stale_snapshots_are_never_selected(self):
+    cache = BoschCameraCycleCache()
+    feed(cache, 1_000_000_000, 0, [self.OBJ])
+    assert cache.snapshot(999_999_999) is None
+    assert cache.snapshot(1_160_000_000) is not None
+    assert cache.snapshot(1_160_000_001) is None
+
+
+class TestBoschCameraAssociationAndGeometry:
+  def test_frozen_a0_many_to_one_and_ambiguous(self):
+    a, b = physical(1_000_001, 15.), physical(1_000_002, 19.)
+    cam = BoschCameraObject(7, 11, 20., 0., 0., 1.7, 1, .1, -.1)
+    assert BoschCameraExtendedGrouping._associate(a, [cam], 1) == (BOSCH_CAMERA_ASSOC_ASSIGNED, 11, 1)
+    assert BoschCameraExtendedGrouping._associate(b, [cam], 1) == (BOSCH_CAMERA_ASSOC_ASSIGNED, 11, 1)
+    twin = BoschCameraObject(8, 12, 20., 0., 0., 1.7, 1, .1, -.1)
+    assert BoschCameraExtendedGrouping._associate(a, [cam, twin], 2)[0] == BOSCH_CAMERA_ASSOC_AMBIGUOUS
+    far = physical(1_000_003, 25.1)
+    assert BoschCameraExtendedGrouping._associate(far, [cam], 1)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  @pytest.mark.parametrize(('dd', 'expected'), ((3.0, False), (3.25, True), (12.0, True), (12.01, False)))
+  def test_distance_boundaries(self, dd, expected):
+    assert BoschCameraExtendedGrouping._geometry(physical(1_000_001, 20.), physical(1_000_002, 20. + dd), 10., 0.)[3] is expected
+
+  @pytest.mark.parametrize(('dy', 'dv', 'expected'), ((1.5, 1.5, True), (1.5001, 0., False), (0., 1.5001, False)))
+  def test_lateral_velocity_boundaries(self, dy, dv, expected):
+    assert BoschCameraExtendedGrouping._geometry(physical(1_000_001, 20., 0., 0.), physical(1_000_002, 24., dy, dv), 10., 0.)[3] is expected
+
+  def test_stationary_moving_conflict(self):
+    a = physical(1_000_001, 20., v_rel=-10.)
+    b = physical(1_000_002, 24., v_rel=-8.5)
+    assert not BoschCameraExtendedGrouping._geometry(a, b, 10., 0.)[3]
+
+  def test_complete_link_rejects_single_link_chain(self):
+    objects = (physical(1_000_001, 10.), physical(1_000_002, 14.), physical(1_000_003, 18.))
+    edges = {(1_000_001, 1_000_002): 1., (1_000_002, 1_000_003): 1.}
+    groups = BoschCameraExtendedGrouping._complete_link(objects, edges, ())
+    assert max(map(len, groups)) == 2
+
+
+class TestBoschCameraE2Overlay:
+  @staticmethod
+  def statuses(grouping, mapping):
+    grouping._associate = lambda obj, *_: mapping.get(obj.physical_track_id, (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
+    grouping.camera.snapshot = lambda ns: ([BoschCameraObject()], 1, 0, ns)
+
+  def test_off_is_exact_identity_and_has_no_camera_state(self):
+    objects = (physical(1_000_001, 15.), physical(1_000_002, 19.))
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_OFF)
+    assert grouping.camera is None
+    assert grouping.update(1_000_000_000, objects, 10.) is objects
+
+  def test_shadow_is_output_identical_and_active_suppresses_only_nonrepresentative(self):
+    objects = (physical(1_000_001, 15.), physical(1_000_002, 19.))
+    mapping = {pid: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1) for pid in (1_000_001, 1_000_002)}
+    shadow = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_SHADOW)
+    self.statuses(shadow, mapping)
+    assert shadow.update(1_000_000_000, objects, 10.) is objects
+    assert shadow.last_groups == ((1_000_001, 1_000_002),)
+    active = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    self.statuses(active, mapping)
+    output = active.update(1_000_000_000, objects, 10.)
+    assert len(output) == 1 and output[0] in objects
+    self.statuses(active, {})
+    split = active.update(1_100_000_000, objects, 10.)
+    assert len(split) == 2
+
+  @pytest.mark.parametrize(('elapsed', 'held'), ((249_000_000, True), (250_000_000, True), (250_000_001, False)))
+  def test_e2_timeout_is_exact_nanoseconds(self, elapsed, held):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    objects = (physical(1_000_001, 15.), physical(1_000_002, 19.))
+    confirmed = {pid: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1) for pid in (1_000_001, 1_000_002)}
+    self.statuses(grouping, confirmed)
+    grouping.update(1_000_000_000, objects, 10.)
+    now = 1_000_000_000
+    while now + 100_000_000 < 1_000_000_000 + elapsed:
+      now += 100_000_000
+      self.statuses(grouping, {1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1)})
+      grouping.update(now, objects, 10.)
+    self.statuses(grouping, {1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1)})
+    output = grouping.update(1_000_000_000 + elapsed, objects, 10.)
+    assert (len(output) == 1) is held
+
+  @pytest.mark.parametrize(('gap', 'held'), ((159_000_000, True), (160_000_000, True), (160_000_001, False)))
+  def test_observation_gap_boundary(self, gap, held):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    objects = (physical(1_000_001, 15.), physical(1_000_002, 19.))
+    self.statuses(grouping, {pid: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1) for pid in (1_000_001, 1_000_002)})
+    grouping.update(1_000_000_000, objects, 10.)
+    self.statuses(grouping, {1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1)})
+    assert (len(grouping.update(1_000_000_000 + gap, objects, 10.)) == 1) is held
+
+  @pytest.mark.parametrize('veto', ['different', 'ambiguous', 'class', 'geometry', 'no_anchor'])
+  def test_e2_current_hard_vetoes(self, veto):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    objects = (physical(1_000_001, 15.), physical(1_000_002, 19.))
+    self.statuses(grouping, {pid: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1) for pid in (1_000_001, 1_000_002)})
+    grouping.update(1_000_000_000, objects, 10.)
+    mapping = {1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1)}
+    current = objects
+    if veto == 'different':
+      mapping[1_000_002] = (BOSCH_CAMERA_ASSOC_ASSIGNED, 8, 1)
+    elif veto == 'ambiguous':
+      mapping[1_000_002] = (BOSCH_CAMERA_ASSOC_AMBIGUOUS, -1, -1)
+    elif veto == 'class':
+      mapping[1_000_001] = (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 2)
+    elif veto == 'geometry':
+      current = (objects[0], physical(1_000_002, 27.1))
+    elif veto == 'no_anchor':
+      mapping = {}
+    self.statuses(grouping, mapping)
+    assert len(grouping.update(1_100_000_000, current, 10.)) == 2
+
+  def test_coast_never_recruits_a_new_member(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    objects = (physical(1_000_001, 15.), physical(1_000_002, 19.), physical(1_000_003, 23.))
+    self.statuses(grouping, {
+      1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1),
+      1_000_002: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1),
+    })
+    grouping.update(1_000_000_000, objects, 10.)
+    self.statuses(grouping, {
+      1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1),
+      1_000_003: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1),
+    })
+    output = grouping.update(1_100_000_000, objects, 10.)
+    assert grouping.last_groups == ((1_000_001, 1_000_002),)
+    assert len(output) == 2

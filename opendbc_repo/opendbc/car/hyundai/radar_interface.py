@@ -280,6 +280,517 @@ BOSCH_STALE_NS = 300_000_000
 BOSCH_OUTPUT_INTERVAL_NS = 100_000_000
 BOSCH_SAMPLE_HOLD_NS = 150_000_000  # one 10 Hz observation period plus one SCC publication period
 
+# Frozen Bosch <-> OEM-camera extended grouping candidate.  Keep production
+# disabled until the on-device SHADOW timing pass is complete; tests and replay
+# may opt into SHADOW/ACTIVE explicitly when constructing BoschRadarProvider.
+BOSCH_CAMERA_EXTENDED_OFF = 0
+BOSCH_CAMERA_EXTENDED_SHADOW = 1
+BOSCH_CAMERA_EXTENDED_ACTIVE = 2
+BOSCH_CAMERA_EXTENDED_MODE = BOSCH_CAMERA_EXTENDED_OFF
+BOSCH_CAMERA_HEADER = 0x738
+BOSCH_CAMERA_FIRST_OBJECT = 0x739
+BOSCH_CAMERA_LAST_OBJECT = 0x756
+BOSCH_CAMERA_LAST_FAMILY = 0x760
+BOSCH_CAMERA_SLOTS = 10
+BOSCH_CAMERA_PERIOD_NS = 40_000_000
+BOSCH_CAMERA_FRAME_TOLERANCE_NS = 25_000_000
+BOSCH_CAMERA_OBSERVATION_GAP_NS = 160_000_000
+BOSCH_CAMERA_E2_HOLD_NS = 250_000_000
+BOSCH_CAMERA_SNAPSHOT_COUNT = 4
+BOSCH_CAMERA_WIDTH_REF_M = 1.70
+BOSCH_CAMERA_ANGLE_LSB = 1.0 / 4496.3
+BOSCH_CAMERA_ASSOC_UNRESOLVED = 0
+BOSCH_CAMERA_ASSOC_ASSIGNED = 1
+BOSCH_CAMERA_ASSOC_AMBIGUOUS = 2
+
+
+def _bosch_camera_signed(value, bits):
+  sign = 1 << (bits - 1)
+  return value - (1 << bits) if value & sign else value
+
+
+@dataclass(slots=True)
+class BoschCameraObject:
+  obj_id: int = 0
+  episode: int = 0
+  long_m: float = 0.0
+  lat_m: float = 0.0
+  vrel_mps: float = 0.0
+  width_m: float = 0.0
+  class_code: int = -1
+  angle_left: float = 0.0
+  angle_right: float = 0.0
+
+
+class BoschCameraCycleCache:
+  """Bounded, allocation-free-per-frame cache for the 25 Hz camera family.
+
+  A/B/C are accepted only with the current header counter.  A tiny fixed
+  pre-header bank handles arbitrary ordering inside one CAN receive batch.
+  Four preallocated snapshots retain the latest causal cycle when a newer
+  camera cycle is already later than the Bosch scan being closed.
+  """
+  def __init__(self):
+    self._counter = -1
+    self._cycle_index = -1
+    self._header_ns = -1
+    self._n_objects = 0
+    self._a = [0] * BOSCH_CAMERA_SLOTS
+    self._b = [0] * BOSCH_CAMERA_SLOTS
+    self._c = [0] * BOSCH_CAMERA_SLOTS
+    self._a_ns = [-1] * BOSCH_CAMERA_SLOTS
+    self._b_ns = [-1] * BOSCH_CAMERA_SLOTS
+    self._c_ns = [-1] * BOSCH_CAMERA_SLOTS
+    self._masks = [0, 0, 0]
+    pending_size = 16 * BOSCH_CAMERA_SLOTS
+    self._pending = [[0] * pending_size for _ in range(3)]
+    self._pending_ns = [[-1] * pending_size for _ in range(3)]
+    self._buffers = [[BoschCameraObject() for _ in range(BOSCH_CAMERA_SLOTS)]
+                     for _ in range(BOSCH_CAMERA_SNAPSHOT_COUNT)]
+    self._snapshot_cycle = [-1] * BOSCH_CAMERA_SNAPSHOT_COUNT
+    self._snapshot_header_ns = [-1] * BOSCH_CAMERA_SNAPSHOT_COUNT
+    self._snapshot_complete_ns = [-1] * BOSCH_CAMERA_SNAPSHOT_COUNT
+    self._snapshot_count = [0] * BOSCH_CAMERA_SNAPSHOT_COUNT
+    self._snapshot_next = 0
+    self._last_seen_cycle = [-1000] * 256
+    self._episode = [0] * 256
+    self._next_episode = 0
+    self.fault_ns = -1
+    self.completed_cycles = 0
+    self.rejected_cycles = 0
+
+  @staticmethod
+  def _counter_of(word):
+    return (word >> 52) & 0xf
+
+  def _unwrap(self, counter, timestamp_ns):
+    if self._counter < 0:
+      return 0
+    elapsed = max(0, round((timestamp_ns - self._header_ns) / BOSCH_CAMERA_PERIOD_NS))
+    wanted = (counter - self._counter) & 0xf
+    step = elapsed + ((wanted - elapsed) & 0xf)
+    if step - elapsed > 8:
+      step -= 16
+    return self._cycle_index + max(step, wanted)
+
+  def _store(self, kind, slot, word, timestamp_ns):
+    arrays = (self._a, self._b, self._c)
+    times = (self._a_ns, self._b_ns, self._c_ns)
+    arrays[kind][slot] = word
+    times[kind][slot] = timestamp_ns
+    self._masks[kind] |= 1 << slot
+
+  def _pending_store(self, counter, kind, slot, word, timestamp_ns):
+    index = counter * BOSCH_CAMERA_SLOTS + slot
+    if timestamp_ns >= self._pending_ns[kind][index]:
+      self._pending[kind][index] = word
+      self._pending_ns[kind][index] = timestamp_ns
+
+  def _start_cycle(self, counter, n_objects, timestamp_ns):
+    if self._header_ns >= 0 and timestamp_ns <= self._header_ns:
+      return False
+    if self._counter >= 0 and self._n_objects and not self._is_complete():
+      self.fault_ns = timestamp_ns
+      self.rejected_cycles += 1
+    cycle_index = self._unwrap(counter, timestamp_ns)
+    self._counter = counter
+    self._cycle_index = cycle_index
+    self._header_ns = timestamp_ns
+    self._n_objects = n_objects
+    self._masks[:] = (0, 0, 0)
+    self._a_ns[:] = [-1] * BOSCH_CAMERA_SLOTS
+    self._b_ns[:] = [-1] * BOSCH_CAMERA_SLOTS
+    self._c_ns[:] = [-1] * BOSCH_CAMERA_SLOTS
+    for kind in range(3):
+      for slot in range(BOSCH_CAMERA_SLOTS):
+        index = counter * BOSCH_CAMERA_SLOTS + slot
+        pending_ns = self._pending_ns[kind][index]
+        if pending_ns >= 0 and abs(pending_ns - timestamp_ns) <= BOSCH_CAMERA_FRAME_TOLERANCE_NS:
+          self._store(kind, slot, self._pending[kind][index], pending_ns)
+        self._pending_ns[kind][index] = -1
+    self._try_complete()
+    return True
+
+  def _is_complete(self):
+    required = (1 << self._n_objects) - 1
+    return all(mask & required == required for mask in self._masks)
+
+  def _try_complete(self):
+    if self._counter < 0 or not self._is_complete():
+      return
+    if any(cycle == self._cycle_index for cycle in self._snapshot_cycle):
+      return
+    seen_ids = 0
+    for slot in range(self._n_objects):
+      a = self._a[slot]
+      if not (a & ((1 << 48) - 1)):
+        self.fault_ns = max(self._header_ns, self._a_ns[slot])
+        self.rejected_cycles += 1
+        return
+      obj_id = a & 0xff
+      bit = 1 << obj_id
+      if seen_ids & bit:
+        self.fault_ns = max(self._header_ns, self._a_ns[slot])
+        self.rejected_cycles += 1
+        return
+      seen_ids |= bit
+    target = self._snapshot_next
+    objects = self._buffers[target]
+    complete_ns = self._header_ns
+    for slot in range(self._n_objects):
+      a, b, c = self._a[slot], self._b[slot], self._c[slot]
+      complete_ns = max(complete_ns, self._a_ns[slot], self._b_ns[slot], self._c_ns[slot])
+      obj_id = a & 0xff
+      if self._cycle_index - self._last_seen_cycle[obj_id] > 2:
+        self._next_episode += 1
+        self._episode[obj_id] = self._next_episode
+      self._last_seen_cycle[obj_id] = self._cycle_index
+      obj = objects[slot]
+      obj.obj_id = obj_id
+      obj.episode = self._episode[obj_id]
+      obj.long_m = ((a >> 8) & 0xfff) * 0.0625
+      obj.lat_m = _bosch_camera_signed((a >> 20) & 0xfff, 12) * 0.0625
+      obj.vrel_mps = _bosch_camera_signed((a >> 40) & 0xfff, 12) * 0.0625
+      obj.width_m = (b & 0x3f) * 0.05
+      obj.class_code = int((b >> 48) & 0x3) + 4 * int((b >> 50) & 0x1)
+      obj.angle_right = _bosch_camera_signed((c >> 18) & 0x1fff, 13) * BOSCH_CAMERA_ANGLE_LSB
+      obj.angle_left = _bosch_camera_signed((c >> 31) & 0x1fff, 13) * BOSCH_CAMERA_ANGLE_LSB
+    self._snapshot_cycle[target] = self._cycle_index
+    self._snapshot_header_ns[target] = self._header_ns
+    self._snapshot_complete_ns[target] = complete_ns
+    self._snapshot_count[target] = self._n_objects
+    self._snapshot_next = (target + 1) % BOSCH_CAMERA_SNAPSHOT_COUNT
+    self.completed_cycles += 1
+
+  def ingest(self, timestamp_ns, address, payload):
+    if len(payload) != 8:
+      self.fault_ns = timestamp_ns
+      return False
+    word = int.from_bytes(payload, 'little')
+    if address == BOSCH_CAMERA_HEADER:
+      n_objects = word & 0xf
+      if n_objects > BOSCH_CAMERA_SLOTS:
+        self.fault_ns = timestamp_ns
+        self.rejected_cycles += 1
+        return False
+      return self._start_cycle(self._counter_of(word), n_objects, timestamp_ns)
+    if not BOSCH_CAMERA_FIRST_OBJECT <= address <= BOSCH_CAMERA_LAST_OBJECT:
+      return False
+    offset = address - BOSCH_CAMERA_FIRST_OBJECT
+    slot, kind = divmod(offset, 3)
+    counter = self._counter_of(word)
+    if (counter == self._counter and self._header_ns >= 0 and
+        abs(timestamp_ns - self._header_ns) <= BOSCH_CAMERA_FRAME_TOLERANCE_NS):
+      self._store(kind, slot, word, timestamp_ns)
+      self._try_complete()
+    else:
+      self._pending_store(counter, kind, slot, word, timestamp_ns)
+    return True
+
+  def snapshot(self, timestamp_ns):
+    best = -1
+    best_cycle = -1
+    for index in range(BOSCH_CAMERA_SNAPSHOT_COUNT):
+      complete_ns = self._snapshot_complete_ns[index]
+      if (complete_ns <= timestamp_ns and complete_ns > self.fault_ns and
+          timestamp_ns - complete_ns <= BOSCH_CAMERA_OBSERVATION_GAP_NS and
+          self._snapshot_cycle[index] > best_cycle):
+        best, best_cycle = index, self._snapshot_cycle[index]
+    if best < 0:
+      return None
+    return self._buffers[best], self._snapshot_count[best], self._snapshot_cycle[best], self._snapshot_complete_ns[best]
+
+
+@dataclass(slots=True)
+class _BoschExtendedHistory:
+  members: tuple[int, ...]
+  cam_key: int
+  class_code: int
+  last_confirm_ns: int
+
+
+@dataclass(slots=True)
+class _BoschExtendedRepresentative:
+  members: frozenset[int]
+  representative_pid: int
+  timestamp_ns: int
+  d_rel: float
+  y_rel: float
+  v_rel: float
+  age: int
+
+
+class BoschCameraExtendedGrouping:
+  """Frozen A0 + P2 + G0_ATOMIC + group-level E2 output overlay."""
+  def __init__(self, mode=BOSCH_CAMERA_EXTENDED_MODE):
+    if mode not in (BOSCH_CAMERA_EXTENDED_OFF, BOSCH_CAMERA_EXTENDED_SHADOW, BOSCH_CAMERA_EXTENDED_ACTIVE):
+      raise ValueError('invalid Bosch camera extended-grouping mode')
+    self.mode = mode
+    self.camera = BoschCameraCycleCache() if mode != BOSCH_CAMERA_EXTENDED_OFF else None
+    self.histories: dict[tuple[int, ...], _BoschExtendedHistory] = {}
+    self.representatives: list[_BoschExtendedRepresentative] = []
+    self.last_ns = None
+    self.last_groups: tuple[tuple[int, ...], ...] = ()
+    self.last_association_count = 0
+    self.last_associations = {}
+    self.last_candidate_count = 0
+    self.last_coast_count = 0
+    self.max_state_count = 0
+    self.representative_switches = 0
+    self.max_representative_jump = [0.0, 0.0, 0.0]
+    self.perf_sum = Counter()
+    self.perf_max = Counter()
+    self.perf_scans = 0
+
+  @staticmethod
+  def _geometry(a, b, v_ego, yaw_rate):
+    dd = abs(a.d_rel - b.d_rel)
+    dy = abs(a.y_rel - b.y_rel)
+    dv = abs(a.v_rel - b.v_rel)
+    conflict = False
+    if math.isfinite(v_ego):
+      yaw = yaw_rate if yaw_rate is not None and math.isfinite(yaw_rate) else 0.0
+      wa = abs(a.v_rel + v_ego - yaw * a.y_rel)
+      wb = abs(b.v_rel + v_ego - yaw * b.y_rel)
+      conflict = min(wa, wb) <= 0.6 and max(wa, wb) >= 1.4
+    return dd, dy, dv, 3.0 < dd <= 12.0 and dy <= 1.5 and dv <= 1.5 and not conflict
+
+  @staticmethod
+  def _associate(obj, camera_objects, count):
+    bearing = math.atan2(-obj.y_rel, max(obj.d_rel, 0.5))
+    best = second = math.inf
+    best_obj = None
+    passed = 0
+    for index in range(count):
+      cam = camera_objects[index]
+      extra = max(cam.width_m - BOSCH_CAMERA_WIDTH_REF_M, 0.0)
+      l_pos = max(5.0 + 4.0 * extra, 0.5)
+      l_neg = max(8.0 * extra, 0.0)
+      d_long = cam.long_m - obj.d_rel
+      d_lat = cam.lat_m + obj.y_rel
+      lo, hi = min(cam.angle_left, cam.angle_right), max(cam.angle_left, cam.angle_right)
+      bear_out = max(lo - bearing, bearing - hi)
+      if d_long > l_pos or d_long < -l_neg or bear_out > 0.020 or abs(d_lat) > 2.5:
+        continue
+      passed += 1
+      half = (hi - lo) * 0.5
+      bear_n = (half + bear_out) / max(half + 0.020, 1e-6)
+      cost = (4.0 * bear_n + 2.0 * abs(cam.vrel_mps - obj.v_rel) / 3.0 +
+              abs(d_lat) / 2.5 + 0.5 * abs(d_long) / max(l_pos + l_neg, 1e-6))
+      if cost < best:
+        second, best, best_obj = best, cost, cam
+      elif cost < second:
+        second = cost
+    if not passed:
+      return BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1
+    if passed >= 2 and second - best < 0.15:
+      return BOSCH_CAMERA_ASSOC_AMBIGUOUS, -1, -1
+    return BOSCH_CAMERA_ASSOC_ASSIGNED, best_obj.episode, best_obj.class_code
+
+  @staticmethod
+  def _complete_link(objects, edges, previous):
+    ids = sorted(obj.physical_track_id for obj in objects)
+    active = {pid for pair in edges for pid in pair}
+    groups = [{pid} for pid in ids if pid in active]
+    groups += [{pid} for pid in ids if pid not in active]
+    previous = [set(group) for group in previous]
+    while True:
+      choices = []
+      for i, a in enumerate(groups):
+        for j in range(i + 1, len(groups)):
+          b = groups[j]
+          if len(a) + len(b) > 8:
+            continue
+          cross = [tuple(sorted((x, y))) for x in a for y in b]
+          if all(pair in edges for pair in cross):
+            overlap = any(old & a and old & b for old in previous)
+            choices.append((not overlap, max(edges[pair] for pair in cross), min(a), min(b), i, j))
+      if not choices:
+        break
+      *_, i, j = min(choices)
+      groups[i] |= groups.pop(j)
+    return groups
+
+  def _choose_representatives(self, groups, by_pid, timestamp_ns, yaw_rate):
+    multi = [set(group) for group in groups if len(group) > 1]
+    matches = {}
+    claims = []
+    for i, group in enumerate(multi):
+      for j, prior in enumerate(self.representatives):
+        overlap = len(group & prior.members)
+        if overlap:
+          score = 10 * overlap + 3 * (prior.representative_pid in group) + min(prior.age, 1000) * 1e-5
+          claims.append((-score, min(group), prior.representative_pid, i, j))
+    used_current, used_prior = set(), set()
+    for _, _, _, i, j in sorted(claims):
+      if i not in used_current and j not in used_prior:
+        matches[i] = self.representatives[j]
+        used_current.add(i)
+        used_prior.add(j)
+    new_states = []
+    representatives = {}
+    for i, group in enumerate(multi):
+      members = [by_pid[pid] for pid in group]
+      prior = matches.get(i)
+      if prior is not None:
+        dt = (timestamp_ns - prior.timestamp_ns) / 1e9
+        angle = -(yaw_rate if yaw_rate is not None and math.isfinite(yaw_rate) else 0.0) * dt
+        dx = prior.d_rel + prior.v_rel * dt
+        px = dx * math.cos(angle) - prior.y_rel * math.sin(angle)
+        py = dx * math.sin(angle) + prior.y_rel * math.cos(angle)
+        def cost(obj):
+          continuity = abs(obj.d_rel - px) + .5 * abs(obj.y_rel - py) + .5 * abs(obj.v_rel - prior.v_rel)
+          return (continuity, obj.physical_track_id != prior.representative_pid,
+                  not obj.vision_supported, not obj.oem_selected, -obj.age_scans, obj.physical_track_id)
+      else:
+        ordered = sorted(obj.d_rel for obj in members)
+        middle = len(ordered) // 2
+        median = ordered[middle] if len(ordered) & 1 else (ordered[middle - 1] + ordered[middle]) * .5
+        def cost(obj):
+          return (abs(obj.d_rel - median), False, not obj.vision_supported,
+                  not obj.oem_selected, -obj.age_scans, obj.physical_track_id)
+      rep = min(members, key=cost)
+      if prior is not None and rep.physical_track_id != prior.representative_pid:
+        self.representative_switches += 1
+        self.max_representative_jump[0] = max(self.max_representative_jump[0], abs(rep.d_rel - px))
+        self.max_representative_jump[1] = max(self.max_representative_jump[1], abs(rep.y_rel - py))
+        self.max_representative_jump[2] = max(self.max_representative_jump[2], abs(rep.v_rel - prior.v_rel))
+      representatives[tuple(sorted(group))] = rep
+      new_states.append(_BoschExtendedRepresentative(
+        frozenset(group), rep.physical_track_id, timestamp_ns, rep.d_rel, rep.y_rel, rep.v_rel,
+        prior.age + 1 if prior is not None else 1))
+    self.representatives = new_states
+    return representatives
+
+  def _record_perf(self, name, elapsed):
+    self.perf_sum[name] += elapsed
+    self.perf_max[name] = max(self.perf_max[name], elapsed)
+
+  def update(self, timestamp_ns, objects, v_ego, yaw_rate=None):
+    if self.mode == BOSCH_CAMERA_EXTENDED_OFF:
+      return objects
+    start = time.perf_counter_ns()
+    if self.last_ns is not None and timestamp_ns - self.last_ns > BOSCH_CAMERA_OBSERVATION_GAP_NS:
+      self.histories.clear()
+      self.representatives.clear()
+    self.last_ns = timestamp_ns
+    by_pid = {obj.physical_track_id: obj for obj in objects}
+    ordered = sorted(objects, key=lambda obj: (obj.d_rel, obj.physical_track_id))
+    geometry = {}
+    candidate_nodes = set()
+    for i, a in enumerate(ordered):
+      for b in ordered[i + 1:]:
+        dd = b.d_rel - a.d_rel
+        if dd > 12.0:
+          break
+        if dd <= 3.0:
+          continue
+        dd, dy, dv, okay = self._geometry(a, b, v_ego, yaw_rate)
+        if not okay:
+          continue
+        key = tuple(sorted((a.physical_track_id, b.physical_track_id)))
+        geometry[key] = (dd, dy, dv)
+        candidate_nodes.update(key)
+    self.last_candidate_count = len(geometry)
+    now = time.perf_counter_ns()
+    self._record_perf('candidate', now - start)
+
+    snapshot = self.camera.snapshot(timestamp_ns)
+    associations = {}
+    assoc_start = now
+    if snapshot is not None and candidate_nodes:
+      camera_objects, count, _, _ = snapshot
+      for pid in candidate_nodes:
+        associations[pid] = self._associate(by_pid[pid], camera_objects, count)
+    self.last_association_count = len(associations)
+    self.last_associations = associations
+    now = time.perf_counter_ns()
+    self._record_perf('association', now - assoc_start)
+
+    strict = {}
+    for key, (dd, dy, dv) in geometry.items():
+      aa = associations.get(key[0], (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
+      ab = associations.get(key[1], (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
+      if (aa[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and ab[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and
+          aa[1] == ab[1] and aa[1] >= 0 and aa[2] == 1 and ab[2] == 1):
+        strict[key] = dd / 12.0 + dy / 1.5 + dv / 1.5
+
+    e2_start = time.perf_counter_ns()
+    edges = dict(strict)
+    next_history = {}
+    coast_groups = []
+    for members, history in list(self.histories.items()):
+      pairs = [tuple(sorted((members[i], members[j]))) for i in range(len(members)) for j in range(i + 1, len(members))]
+      verdicts = [associations.get(pid, (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1)) for pid in members]
+      assigned = [value for value in verdicts if value[0] == BOSCH_CAMERA_ASSOC_ASSIGNED]
+      okay = (all(pid in by_pid for pid in members) and all(pair in geometry for pair in pairs) and
+              timestamp_ns - history.last_confirm_ns <= BOSCH_CAMERA_E2_HOLD_NS and
+              not any(value[0] == BOSCH_CAMERA_ASSOC_AMBIGUOUS for value in verdicts) and
+              not any(value[1] != history.cam_key or value[2] != 1 for value in assigned) and
+              any(value[1] == history.cam_key for value in assigned))
+      if not okay:
+        continue
+      if not all(pair in strict for pair in pairs):
+        member_set = set(members)
+        # A coast may preserve exactly this confirmed set, never recruit a new
+        # node through a currently-confirmed cross edge.
+        for pair in [pair for pair in edges if bool(member_set & set(pair)) and not set(pair) <= member_set]:
+          del edges[pair]
+        for pair in pairs:
+          dd, dy, dv = geometry[pair]
+          edges[pair] = dd / 12.0 + dy / 1.5 + dv / 1.5
+        coast_groups.append(members)
+        next_history[members] = history
+    self.last_coast_count = len(coast_groups)
+    now = time.perf_counter_ns()
+    self._record_perf('e2', now - e2_start)
+
+    group_start = now
+    previous = [state.members for state in self.representatives]
+    groups = self._complete_link(objects, edges, previous)
+    now = time.perf_counter_ns()
+    self._record_perf('group', now - group_start)
+
+    output_start = now
+    representatives = self._choose_representatives(groups, by_pid, timestamp_ns, yaw_rate)
+    for group in groups:
+      if len(group) < 2:
+        continue
+      members = tuple(sorted(group))
+      pairs = [tuple(sorted((members[i], members[j]))) for i in range(len(members)) for j in range(i + 1, len(members))]
+      if all(pair in strict for pair in pairs):
+        episode = associations[members[0]][1]
+        next_history[members] = _BoschExtendedHistory(members, episode, 1, timestamp_ns)
+      elif members not in next_history:
+        raise AssertionError('E2 coast created an unconfirmed extended member set')
+    self.histories = next_history
+    self.max_state_count = max(self.max_state_count, len(self.histories))
+    self.last_groups = tuple(sorted(tuple(sorted(group)) for group in groups if len(group) > 1))
+    if self.mode == BOSCH_CAMERA_EXTENDED_ACTIVE:
+      suppressed = {pid for members, rep in representatives.items() for pid in members if pid != rep.physical_track_id}
+      result = tuple(obj for obj in objects if obj.physical_track_id not in suppressed)
+    else:
+      result = objects
+    done = time.perf_counter_ns()
+    self._record_perf('output', done - output_start)
+    self._record_perf('total', done - start)
+    self.perf_scans += 1
+    return result
+
+  def perf_fields(self):
+    count = max(self.perf_scans, 1)
+    fields = ' '.join(
+      f'camera_ext_{name}_ms_avg={self.perf_sum[name] * 1e-6 / count:.3f} '
+      f'camera_ext_{name}_ms_max={self.perf_max[name] * 1e-6:.3f}'
+      for name in ('candidate', 'association', 'group', 'e2', 'output', 'total'))
+    fields += (f' camera_ext_candidates={self.last_candidate_count} camera_ext_nodes={self.last_association_count}'
+               f' camera_ext_coasts={self.last_coast_count} camera_ext_state_peak={self.max_state_count}'
+               f' camera_ext_rep_switches={self.representative_switches}')
+    self.perf_sum.clear()
+    self.perf_max.clear()
+    self.perf_scans = 0
+    return fields
+
 
 def bosch_numpy_linear_sum_assignment(cost_matrix, *, potentials=False):
   """Jonker-Volgenant assignment. potentials also returns the dual row/column
@@ -2113,9 +2624,12 @@ def bosch_make_points(objects, v_ego=math.nan):
 
 
 class BoschRadarProvider:
-  def __init__(self, bus: int, *, qualification=True):
+  def __init__(self, bus: int, *, qualification=True, camera_bus=1,
+               camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE):
     self.bus = bus
+    self.camera_bus = camera_bus
     self.tracker = BoschPhysicalTracker()
+    self.camera_extended = BoschCameraExtendedGrouping(camera_extended_mode)
     self.publication_aliases = BoschPublicationAliasAllocator()
     self.qualifier = _BoschStaticOffPathFilter() if qualification else None
     self.can_error = False
@@ -2152,6 +2666,7 @@ class BoschRadarProvider:
     self._perf_physical_pairs = self._perf_physical_possible = 0
     self._perf_components = self._perf_largest_component = self._perf_fallbacks = self._perf_conflicts = 0
     self._perf_ties = 0
+    self._perf_camera_decode_count = self._perf_camera_decode_sum = self._perf_camera_decode_max = 0
 
   def record_native_time(self, elapsed_ns):
     self._perf_native_count += 1
@@ -2170,6 +2685,7 @@ class BoschRadarProvider:
     raw = self.tracker.raw_manager
     physical = self.tracker.group_manager
     backend = 'numpy' if bosch_linear_sum_assignment is bosch_numpy_linear_sum_assignment else 'scipy'
+    extended_fields = self.camera_extended.perf_fields() if self.camera_extended.mode != BOSCH_CAMERA_EXTENDED_OFF else ''
     message = (
       f'BoschPerf solver={backend} scans={self._perf_scans} raw={self._perf_raw} raw_active={raw.active_count} '
       f'physical={len(self._debug_objects)} qualified={self._perf_qualified} '
@@ -2189,7 +2705,9 @@ class BoschRadarProvider:
       f'alias_usage={self.publication_aliases.current_usage}/{BOSCH_PUBLICATION_ALIAS_COUNT} '
       f'alias_peak={self.publication_aliases.peak_usage} alias_denial={self.publication_aliases.denial_count} '
       f'alias_grace_evictions={self.publication_aliases.grace_eviction_count} '
-      f'can_error={int(self.can_error)}'
+      f'can_error={int(self.can_error)} '
+      f'camera_decode_ms_avg={self._perf_camera_decode_sum * 1e-6 / max(self._perf_camera_decode_count, 1):.3f} '
+      f'camera_decode_ms_max={self._perf_camera_decode_max * 1e-6:.3f} {extended_fields}'
     )
     self._reset_perf()
     return message
@@ -2241,15 +2759,27 @@ class BoschRadarProvider:
     # are ours, so the reject path stays two indexed comparisons: no unpacking,
     # no attribute lookups and no payload copy until a frame is actually kept.
     bus = self.bus
+    camera = self.camera_extended.camera
+    camera_bus = self.camera_bus
+    camera_start_ns = 0
     frames = self._frames
     anchors = self._anchors
     order = self._order
     for timestamp_ns, messages in can_packets:
       future = timestamp_ns > now_ns
       for message in messages:
+        address = message[0]
+        if (camera is not None and message[2] == camera_bus and
+            BOSCH_CAMERA_HEADER <= address <= BOSCH_CAMERA_LAST_FAMILY):
+          if not camera_start_ns:
+            camera_start_ns = time.perf_counter_ns()
+          if future:
+            camera.fault_ns = timestamp_ns
+          else:
+            camera.ingest(timestamp_ns, address, bytes(message[1]))
+          continue
         if message[2] != bus:
           continue
-        address = message[0]
         if address < 0x601 or address > 0x612:
           continue
         if future:
@@ -2270,6 +2800,11 @@ class BoschRadarProvider:
           frames.append(_BoschCanFrame(timestamp_ns, address, payload, order))
           order += 1
     self._order = order
+    if camera_start_ns:
+      elapsed = time.perf_counter_ns() - camera_start_ns
+      self._perf_camera_decode_count += 1
+      self._perf_camera_decode_sum += elapsed
+      self._perf_camera_decode_max = max(self._perf_camera_decode_max, elapsed)
     if len(self._anchors) > 1:
       self._anchors.sort()
     output = None
@@ -2371,9 +2906,10 @@ class BoschRadarProvider:
     self._debug_oem_slot = oem_slot
     self._debug_oem_matches = len(matches)
     self._debug_timeout = False
+    output_view = self.camera_extended.update(availability_ns, objects, v_ego, yaw_rate_left)
     qualify_start_ns = time.perf_counter_ns()
-    qualified = (self.qualifier.update(objects, availability_ns, v_ego, path, yaw_rate=yaw_rate_left)
-                 if self.qualifier is not None else objects)
+    qualified = (self.qualifier.update(output_view, availability_ns, v_ego, path, yaw_rate=yaw_rate_left)
+                 if self.qualifier is not None else output_view)
     done_ns = time.perf_counter_ns()
     qualify_ns, total_ns = done_ns - qualify_start_ns, done_ns - start_ns
     raw, physical = self.tracker.raw_manager, self.tracker.group_manager
@@ -2442,7 +2978,8 @@ class RadarInterface(RadarInterfaceBase):
     if self.radar_tracks and CP.extFlags & HyundaiExtFlags.BOSCH_RADAR:
       CAN = CanBus(CP)
       bus = CAN.ACAN if CP.extFlags & HyundaiExtFlags.BOSCH_RADAR_BUS1 else CAN.CAM
-      self.bosch = BoschRadarProvider(bus)
+      self.bosch = BoschRadarProvider(bus, camera_bus=CAN.ACAN,
+                                      camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE)
       self._bosch_make_points = bosch_make_points
     self.corner_object_tracks = bool(CP.extFlags & HyundaiExtFlags.CORNER_RADAR_OBJECTS_235.value) and self.params.get_int("EnableCornerRadar") > 0
     self.corner_object_180_tracks = bool(CP.extFlags & HyundaiExtFlags.CORNER_RADAR_OBJECTS_180.value) and self.params.get_int("EnableCornerRadar") > 0
