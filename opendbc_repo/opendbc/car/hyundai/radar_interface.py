@@ -318,6 +318,9 @@ BOSCH_TRUCK_P2_DD_MIN_M = 5.50
 BOSCH_TRUCK_P2_DD_MAX_M = 9.00
 BOSCH_TRUCK_P2_DY_MAX_M = 0.875
 BOSCH_TRUCK_P2_DV_MAX_MPS = 0.50
+BOSCH_TRUCK_A0_RECOVERY_HOLD_SCANS = 2
+BOSCH_TRUCK_A0_RECOVERY_BEARING_EXCESS_RAD = 0.010
+BOSCH_TRUCK_A0_RECOVERY_COST_MARGIN = 0.15
 
 
 def _bosch_camera_signed(value, bits):
@@ -543,6 +546,7 @@ class _BoschTruckPairHistory:
   camera_y: float
   camera_v: float
   camera_width: float
+  recovery_age: int = 0
 
 
 @dataclass(slots=True)
@@ -593,6 +597,7 @@ class BoschCameraExtendedGrouping:
     self.last_camera_ns = None
     self.last_truck_edge_count = 0
     self.max_truck_pair_state = 0
+    self.last_truck_recovery_count = 0
 
   @staticmethod
   def _geometry(a, b, v_ego, yaw_rate):
@@ -748,7 +753,41 @@ class BoschCameraExtendedGrouping:
       abs(camera.vrel_mps - prior.camera_v) <= .50 and
       abs(camera.width_m - prior.camera_width) <= .10)
 
-  def _truck_strict(self, timestamp_ns, geometry, associations, by_pid, camera_by_episode):
+  @staticmethod
+  def _truck_a0_bearing_near_miss(obj, anchor, camera_objects, count):
+    """Frozen A0 바로 바깥의 명확한 bearing miss인지 확인한다.
+
+    A0 verdict 자체는 바꾸지 않는다. 이미 seed된 대형차 pair의 빠진 한 node가
+    같은 camera object에 대해 다른 frozen gate를 모두 통과하고, raw cost도
+    경쟁 object보다 명확히 작을 때만 truck P2용 보강 evidence로 사용한다.
+    """
+    bearing = math.atan2(-obj.y_rel, max(obj.d_rel, .5))
+    anchor_cost = math.inf
+    other_cost = math.inf
+    anchor_gate = False
+    for index in range(count):
+      camera = camera_objects[index]
+      extra = max(camera.width_m - BOSCH_CAMERA_WIDTH_REF_M, 0.)
+      l_pos = max(5.0 + 4.0 * extra, .5)
+      l_neg = max(8.0 * extra, 0.)
+      d_long = camera.long_m - obj.d_rel
+      d_lat = camera.lat_m + obj.y_rel
+      lo, hi = min(camera.angle_left, camera.angle_right), max(camera.angle_left, camera.angle_right)
+      bear_out = max(lo - bearing, bearing - hi)
+      half = (hi - lo) * .5
+      bear_n = (half + bear_out) / max(half + .020, 1e-6)
+      cost = (4.0 * bear_n + 2.0 * abs(camera.vrel_mps - obj.v_rel) / 3.0 +
+              abs(d_lat) / 2.5 + .5 * abs(d_long) / max(l_pos + l_neg, 1e-6))
+      if camera.obj_id == anchor.obj_id and camera.episode == anchor.episode:
+        anchor_cost = cost
+        anchor_gate = (-l_neg <= d_long <= l_pos and abs(d_lat) <= 2.5 and
+                       .020 < bear_out <= .020 + BOSCH_TRUCK_A0_RECOVERY_BEARING_EXCESS_RAD)
+      else:
+        other_cost = min(other_cost, cost)
+    return anchor_gate and anchor_cost + BOSCH_TRUCK_A0_RECOVERY_COST_MARGIN <= other_cost
+
+  def _truck_strict(self, timestamp_ns, geometry, associations, by_pid, camera_by_episode,
+                    camera_objects=(), camera_count=0):
     candidates = []
     for key, (dd, dy, dv) in geometry.items():
       aa = associations.get(key[0], (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
@@ -780,9 +819,57 @@ class BoschCameraExtendedGrouping:
       next_history[key] = state
       if confirmations >= BOSCH_TRUCK_P2_CONFIRMATIONS:
         strict[key] = score
+
+    recovered = 0
+    recovery_candidates = []
+    if len(next_history) < BOSCH_TRUCK_P2_STATE_MAX:
+      for key, prior in self.truck_pair_histories.items():
+        if key in next_history or key not in geometry or prior.confirmations < BOSCH_TRUCK_P2_CONFIRMATIONS:
+          continue
+        prior_rep = next((rep for rep in self.representatives
+                          if len(rep.members) == len(key) and all(pid in rep.members for pid in key)), None)
+        if prior_rep is None or prior_rep.representative_pid not in by_pid:
+          continue
+        aa = associations.get(key[0], (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
+        ab = associations.get(key[1], (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
+        verdicts = (aa, ab)
+        assigned = [index for index, value in enumerate(verdicts) if value[0] == BOSCH_CAMERA_ASSOC_ASSIGNED]
+        if len(assigned) != 1:
+          continue
+        assigned_index = assigned[0]
+        missing_index = 1 - assigned_index
+        anchor_verdict, missing_verdict = verdicts[assigned_index], verdicts[missing_index]
+        if (missing_verdict[0] != BOSCH_CAMERA_ASSOC_UNRESOLVED or
+            anchor_verdict[1] != prior.episode or anchor_verdict[2] != BOSCH_TRUCK_P2_CLASS):
+          continue
+        camera = camera_by_episode.get(anchor_verdict[1])
+        dd, dy, dv = geometry[key]
+        fresh = (camera is not None and camera.obj_id == prior.camera_id and self.last_camera_ns is not None and
+                 0 <= timestamp_ns - self.last_camera_ns <= BOSCH_CAMERA_OBSERVATION_GAP_NS and
+                 by_pid[key[0]].timestamp_ns == by_pid[key[1]].timestamp_ns == timestamp_ns)
+        absolute = (fresh and camera.width_m >= BOSCH_TRUCK_P2_WIDTH_MIN_M and
+                    BOSCH_TRUCK_P2_DD_MIN_M <= dd <= BOSCH_TRUCK_P2_DD_MAX_M and
+                    dy <= BOSCH_TRUCK_P2_DY_MAX_M and dv <= BOSCH_TRUCK_P2_DV_MAX_MPS)
+        recovery_age = prior.recovery_age + 1
+        if (not absolute or recovery_age > BOSCH_TRUCK_A0_RECOVERY_HOLD_SCANS or
+            not self._truck_pair_continuous(prior, timestamp_ns, dd, dy, dv, camera) or
+            not self._truck_a0_bearing_near_miss(by_pid[key[missing_index]], camera, camera_objects, camera_count)):
+          continue
+        score = dd / 12.0 + dy / 1.5 + dv / 1.5
+        recovery_candidates.append((score, key, dd, dy, dv, camera, prior.confirmations, recovery_age))
+
+    recovery_candidates.sort(key=lambda row: (row[0], row[1]))
+    capacity = BOSCH_TRUCK_P2_STATE_MAX - len(next_history)
+    for score, key, dd, dy, dv, camera, confirmations, recovery_age in recovery_candidates[:capacity]:
+      next_history[key] = _BoschTruckPairHistory(
+        key, camera.obj_id, camera.episode, timestamp_ns, confirmations, dd, dy, dv,
+        camera.long_m, camera.lat_m, camera.vrel_mps, camera.width_m, recovery_age)
+      strict[key] = score
+      recovered += 1
     self.truck_pair_histories = next_history
     self.max_truck_pair_state = max(self.max_truck_pair_state, len(next_history))
     self.last_truck_edge_count = len(strict)
+    self.last_truck_recovery_count = recovered
     return strict
 
   def _record_perf(self, name, elapsed):
@@ -825,12 +912,14 @@ class BoschCameraExtendedGrouping:
     self.last_camera_ns = snapshot[3] if snapshot is not None else None
     associations = {}
     camera_by_episode = {}
+    camera_objects = ()
+    camera_count = 0
     assoc_start = now
     if snapshot is not None and candidate_nodes:
-      camera_objects, count, _, _ = snapshot
-      camera_by_episode = {camera_objects[index].episode: camera_objects[index] for index in range(count)}
+      camera_objects, camera_count, _, _ = snapshot
+      camera_by_episode = {camera_objects[index].episode: camera_objects[index] for index in range(camera_count)}
       for pid in candidate_nodes:
-        associations[pid] = self._associate(by_pid[pid], camera_objects, count)
+        associations[pid] = self._associate(by_pid[pid], camera_objects, camera_count)
     self.last_association_count = len(associations)
     self.last_associations = associations
     now = time.perf_counter_ns()
@@ -838,6 +927,7 @@ class BoschCameraExtendedGrouping:
 
     strict = {}
     strict_classes = {}
+    strict_episodes = {}
     for key, (dd, dy, dv) in geometry.items():
       aa = associations.get(key[0], (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
       ab = associations.get(key[1], (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
@@ -845,9 +935,12 @@ class BoschCameraExtendedGrouping:
           aa[1] == ab[1] and aa[1] >= 0 and aa[2] == 1 and ab[2] == 1):
         strict[key] = dd / 12.0 + dy / 1.5 + dv / 1.5
         strict_classes[key] = 1
-    truck_strict = self._truck_strict(timestamp_ns, geometry, associations, by_pid, camera_by_episode)
+        strict_episodes[key] = aa[1]
+    truck_strict = self._truck_strict(timestamp_ns, geometry, associations, by_pid, camera_by_episode,
+                                      camera_objects, camera_count)
     strict.update(truck_strict)
     strict_classes.update((key, BOSCH_TRUCK_P2_CLASS) for key in truck_strict)
+    strict_episodes.update((key, self.truck_pair_histories[key].episode) for key in truck_strict)
 
     e2_start = time.perf_counter_ns()
     edges = dict(strict)
@@ -894,7 +987,7 @@ class BoschCameraExtendedGrouping:
       members = tuple(sorted(group))
       pairs = [tuple(sorted((members[i], members[j]))) for i in range(len(members)) for j in range(i + 1, len(members))]
       if all(pair in strict for pair in pairs):
-        episode = associations[members[0]][1]
+        episode = strict_episodes[pairs[0]]
         class_code = strict_classes[pairs[0]]
         fresh = (self.last_camera_ns is not None and
                  0 <= timestamp_ns - self.last_camera_ns <= BOSCH_CAMERA_OBSERVATION_GAP_NS and
@@ -946,6 +1039,7 @@ class BoschCameraExtendedGrouping:
     fields += (f' camera_ext_candidates={self.last_candidate_count} camera_ext_nodes={self.last_association_count}'
                f' camera_ext_coasts={self.last_coast_count} camera_ext_state_peak={self.max_state_count}'
                f' camera_ext_truck_edges={self.last_truck_edge_count}'
+               f' camera_ext_truck_a0_recoveries={self.last_truck_recovery_count}'
                f' camera_ext_truck_state_peak={self.max_truck_pair_state}'
                f' camera_ext_rep_switches={self.representative_switches}'
                f' camera_ext_test_scans={self.test_scans}'

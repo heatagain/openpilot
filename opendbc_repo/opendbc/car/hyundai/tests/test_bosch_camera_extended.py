@@ -13,6 +13,7 @@ from opendbc.car.hyundai.radar_interface import (
   BOSCH_CAMERA_EXTENDED_OFF,
   BOSCH_CAMERA_EXTENDED_SHADOW,
   BOSCH_CAMERA_HEADER,
+  BOSCH_TRUCK_A0_RECOVERY_HOLD_SCANS,
   BoschCameraCycleCache,
   BoschCameraExtendedGrouping,
   BoschCameraObject,
@@ -744,5 +745,222 @@ class TestBoschTruckAwareP2:
     assert len(grouping.truck_pair_histories) == 16
     ns += 100_000_000
     self.statuses(grouping, ns, {})
+    grouping.update(ns, (), 10.)
+    assert grouping.truck_pair_histories == {}
+
+
+class TestBoschLargeVehicleA0Recovery:
+  IDS = (1_004_581, 1_004_624)
+
+  @classmethod
+  def objects(cls, ns, *, far_pid=None, far_d=26., far_y=-4.5, far_v=0.):
+    return (physical(cls.IDS[0], 20., -4., 0., ns),
+            physical(cls.IDS[1] if far_pid is None else far_pid, far_d, far_y, far_v, ns))
+
+  @staticmethod
+  def camera(*, camera_id=203, episode=186, camera_d=23., camera_y=4.25,
+             camera_v=0., width=2.45, class_code=6, left=.205, right=.197):
+    return BoschCameraObject(camera_id, episode, camera_d, camera_y, camera_v,
+                             width, class_code, left, right)
+
+  @classmethod
+  def configure(cls, grouping, ns, mapping, *, camera_ns=None, cameras=None, **camera_kwargs):
+    grouping._associate = lambda obj, *_: mapping.get(obj.physical_track_id, (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
+    values = [cls.camera(**camera_kwargs)] if cameras is None else cameras
+    grouping.camera.snapshot = lambda _: (values, len(values), 0, ns if camera_ns is None else camera_ns)
+
+  @classmethod
+  def assigned(cls, *, episode=186, class_code=6, far_pid=None):
+    return {cls.IDS[0]: (BOSCH_CAMERA_ASSOC_ASSIGNED, episode, class_code),
+            cls.IDS[1] if far_pid is None else far_pid: (BOSCH_CAMERA_ASSOC_ASSIGNED, episode, class_code)}
+
+  @classmethod
+  def one_sided(cls, *, episode=186, class_code=6, missing=1, far_pid=None, missing_status=BOSCH_CAMERA_ASSOC_UNRESOLVED):
+    ids = (cls.IDS[0], cls.IDS[1] if far_pid is None else far_pid)
+    mapping = {ids[0]: (BOSCH_CAMERA_ASSOC_ASSIGNED, episode, class_code),
+               ids[1]: (BOSCH_CAMERA_ASSOC_ASSIGNED, episode, class_code)}
+    mapping[ids[missing]] = (missing_status, -1, -1)
+    return mapping
+
+  @classmethod
+  def seed(cls, grouping):
+    for i in range(10):
+      ns = 1_000_000_000 + i * 100_000_000
+      cls.configure(grouping, ns, cls.assigned())
+      grouping.update(ns, cls.objects(ns), 10.)
+    return ns
+
+  def test_frozen_a0_verdict_is_exact_and_near_miss_remains_unresolved(self):
+    camera = self.camera()
+    near, far = self.objects(1_000_000_000)
+    assert BoschCameraExtendedGrouping._associate(near, [camera], 1) == (BOSCH_CAMERA_ASSOC_ASSIGNED, 186, 6)
+    assert BoschCameraExtendedGrouping._associate(far, [camera], 1) == (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1)
+
+  def test_unseeded_one_side_a0_never_recovers(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = 1_000_000_000
+    self.configure(grouping, ns, self.one_sided())
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.last_groups == () and grouping.truck_pair_histories == {}
+
+  def test_seeded_large_pair_recovers_one_side_transient_unresolved(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    self.configure(grouping, ns, self.one_sided())
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.last_associations[self.IDS[1]][0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+    assert grouping.last_groups == (self.IDS,)
+    assert grouping.last_truck_recovery_count == 1
+
+  def test_both_unresolved_never_recovers(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    self.configure(grouping, ns, {})
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.last_groups == () and grouping.truck_pair_histories == {}
+
+  def test_camera_id_change_resets_recovery_state(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    self.configure(grouping, ns, self.one_sided(), camera_id=204)
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.truck_pair_histories == {} and grouping.last_truck_recovery_count == 0
+
+  def test_episode_change_resets_recovery_state(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    self.configure(grouping, ns, self.one_sided(episode=187), episode=187)
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.truck_pair_histories == {} and grouping.last_groups == ()
+
+  def test_class_change_resets_recovery_state(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    self.configure(grouping, ns, self.one_sided(class_code=2), class_code=2)
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.truck_pair_histories == {} and grouping.last_groups == ()
+
+  def test_stale_camera_resets_recovery_state(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    self.configure(grouping, ns, self.one_sided(), camera_ns=ns - 160_000_001)
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.truck_pair_histories == {} and grouping.last_truck_recovery_count == 0
+
+  def test_ambiguous_missing_side_never_recovers(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    self.configure(grouping, ns, self.one_sided(missing_status=BOSCH_CAMERA_ASSOC_AMBIGUOUS))
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.truck_pair_histories == {} and grouping.last_truck_recovery_count == 0
+
+  def test_pair_g0_failure_resets_recovery_state(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    self.configure(grouping, ns, self.one_sided())
+    grouping.update(ns, self.objects(ns, far_d=32.1), 10.)
+    assert grouping.last_groups == () and grouping.truck_pair_histories == {}
+
+  @pytest.mark.parametrize(('field', 'kwargs'), (
+    ('dd', {'far_d': 27.}), ('dy', {'far_y': -4.}), ('dv', {'far_v': .5}),
+  ))
+  def test_radar_dd_dy_dv_discontinuity_resets_recovery(self, field, kwargs):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    self.configure(grouping, ns, self.one_sided())
+    grouping.update(ns, self.objects(ns, **kwargs), 10.)
+    assert grouping.truck_pair_histories == {}, field
+
+  @pytest.mark.parametrize(('field', 'kwargs'), (
+    ('d', {'camera_d': 24.}), ('y', {'camera_y': 4.5}),
+    ('v', {'camera_v': 1.}), ('width', {'width': 2.60}),
+  ))
+  def test_camera_motion_or_width_jump_resets_recovery(self, field, kwargs):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    self.configure(grouping, ns, self.one_sided(), **kwargs)
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.truck_pair_histories == {}, field
+
+  def test_member_pid_change_cannot_inherit_seed(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    new_pid = self.IDS[1] + 1
+    self.configure(grouping, ns, self.one_sided(far_pid=new_pid), cameras=[self.camera()])
+    grouping.update(ns, self.objects(ns, far_pid=new_pid), 10.)
+    assert grouping.truck_pair_histories == {}
+
+  def test_missing_representative_identity_cannot_recover(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    grouping.representatives.clear()
+    self.configure(grouping, ns, self.one_sided())
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.truck_pair_histories == {} and grouping.last_truck_recovery_count == 0
+
+  def test_recovery_hold_timeout_retires_pair_state(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping)
+    for age in range(1, BOSCH_TRUCK_A0_RECOVERY_HOLD_SCANS + 1):
+      ns += 100_000_000
+      self.configure(grouping, ns, self.one_sided())
+      grouping.update(ns, self.objects(ns), 10.)
+      assert grouping.truck_pair_histories[self.IDS].recovery_age == age
+    ns += 100_000_000
+    self.configure(grouping, ns, self.one_sided())
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.truck_pair_histories == {} and grouping.last_truck_recovery_count == 0
+
+  def test_different_vehicle_pair_without_seed_is_rejected(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(20):
+      ns = 1_000_000_000 + i * 100_000_000
+      mapping = {self.IDS[0]: (BOSCH_CAMERA_ASSOC_ASSIGNED, 186, 6),
+                 self.IDS[1]: (BOSCH_CAMERA_ASSOC_ASSIGNED, 187, 6)}
+      self.configure(grouping, ns, mapping)
+      grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.last_groups == () and grouping.truck_pair_histories == {}
+
+  def test_adjacent_or_cut_in_geometry_fails_open(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)
+    ns = self.seed(grouping) + 100_000_000
+    self.configure(grouping, ns, self.one_sided())
+    grouping.update(ns, self.objects(ns, far_y=-2.5), 10.)
+    # 기존 E2 coast는 허용하지만 새 strict recovery/M2 suppression은 열지 않는다.
+    assert grouping.truck_pair_histories == {} and grouping.last_truck_recovery_count == 0
+    assert grouping.mature_groups == ()
+
+  def test_narrow_phantom_pair_cannot_form_recovery_seed(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(12):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.configure(grouping, ns, self.assigned(), width=2.35)
+      grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.last_groups == () and grouping.truck_pair_histories == {}
+
+  def test_class1_path_is_immediate_and_has_no_recovery_state(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = 1_000_000_000
+    self.configure(grouping, ns, self.assigned(class_code=1), class_code=1)
+    grouping.update(ns, self.objects(ns), 10.)
+    assert grouping.last_groups == (self.IDS,) and grouping.truck_pair_histories == {}
+
+  def test_existing_truck_n10_is_exact_without_recovery(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(10):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.configure(grouping, ns, self.assigned())
+      grouping.update(ns, self.objects(ns), 10.)
+      assert bool(grouping.last_groups) is (i == 9)
+      assert grouping.last_truck_recovery_count == 0
+
+  def test_recovery_state_is_bounded_and_cleans_up(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = self.seed(grouping) + 100_000_000
+    self.configure(grouping, ns, self.one_sided())
+    grouping.update(ns, self.objects(ns), 10.)
+    assert len(grouping.truck_pair_histories) == 1
+    ns += 100_000_000
+    self.configure(grouping, ns, {})
     grouping.update(ns, (), 10.)
     assert grouping.truck_pair_histories == {}
