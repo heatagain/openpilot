@@ -15,6 +15,7 @@ from opendbc.car.hyundai.radar_interface import (
   RADAR_REQUIRED_MSG_COUNT,
   RADAR_START_ADDR_CANFD3,
   BoschObjectGroupManager,
+  BoschPhysicalObject,
   BoschPhysicalTracker,
   BoschPublicationAliasAllocator,
   BoschRadarProvider,
@@ -535,6 +536,155 @@ class TestCornerRadar430CandidateFilter:
 
     assert 300 not in points
     assert all(str(point.radarSource) != "corner430" for point in points.values())
+
+
+class TestBoschStaticOffPathTemporal:
+  PID = 1_000_900
+  START_NS = 1_000_000_000
+
+  @classmethod
+  def obj(cls, index=0, *, pid=None, raw_id=900, d=80., y=-7., v=-9.35,
+          oem=False, vision=False, age=None):
+    ns = cls.START_NS + index * 100_000_000
+    detection = BoschRawDetection(ns, raw_id % 32, float(d), float(y), float(v), 1)
+    member = BoschRawTrack(raw_id, detection, age or index + 1, False)
+    return BoschPhysicalObject(pid or cls.PID, ns, (member,), raw_id, float(d), float(y), float(v),
+                               oem, vision, age or index + 1, 'single_return')
+
+  @staticmethod
+  def filter():
+    return radar_interface_module._BoschStaticOffPathFilter()
+
+  @classmethod
+  def wall(cls, index, **kwargs):
+    kwargs.setdefault('d', 80. - 9.35 * index * .1)
+    return cls.obj(index, **kwargs)
+
+  def test_single_boundary_scan_is_fail_open_keep(self):
+    qualifier = self.filter()
+    obj = self.wall(0, v=-9.35)  # compensated residual 0.65 m/s
+    assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
+    assert not qualifier._states[self.PID][8]
+    assert qualifier.update((obj,), obj.timestamp_ns + 1, math.nan) == (obj,)
+    assert not qualifier._states
+
+  def test_long_lived_far_offpath_static_drops_after_evidence(self):
+    qualifier = self.filter()
+    # Existing <=0.6 behavior drops immediately but also establishes causal
+    # evidence. The first boundary sample after 800 ms is then suppressed.
+    for index in range(8):
+      obj = self.wall(index, v=-9.5)
+      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == ()
+    obj = self.wall(8, v=-9.35)
+    assert qualifier.update((obj,), obj.timestamp_ns, 10.) == ()
+    assert qualifier._states[self.PID][8]
+
+  @pytest.mark.parametrize(('field', 'value'), (('vision', True), ('oem', True)))
+  def test_supported_object_is_immediate_fail_open_keep(self, field, value):
+    qualifier = self.filter()
+    for index in range(9):
+      obj = self.wall(index)
+      qualifier.update((obj,), obj.timestamp_ns, 10.)
+    kwargs = {field: value}
+    obj = self.wall(9, **kwargs)
+    assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
+    assert self.PID not in qualifier._states
+
+  def test_in_path_real_stationary_target_is_kept(self):
+    qualifier = self.filter()
+    for index in range(20):
+      obj = self.obj(index, d=30. - index, y=.25, v=-10.)
+      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
+    assert self.PID not in qualifier._states
+
+  def test_slow_moving_vehicle_is_kept(self):
+    qualifier = self.filter()
+    for index in range(20):
+      obj = self.obj(index, d=50. - .88 * index, y=-7., v=-8.8)
+      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
+    assert self.PID not in qualifier._states
+
+  def test_crossing_vehicle_lateral_motion_resets_and_keeps(self):
+    qualifier = self.filter()
+    for index in range(12):
+      obj = self.obj(index, d=70. - .935 * index, y=-10. + .5 * index, v=-9.35)
+      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
+    assert not qualifier._states
+
+  def test_opposite_direction_vehicle_is_kept(self):
+    qualifier = self.filter()
+    for index in range(12):
+      obj = self.obj(index, d=90. - 2. * index, y=8., v=10.)
+      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
+
+  def test_cut_in_resets_established_static_confidence(self):
+    qualifier = self.filter()
+    for index in range(9):
+      obj = self.wall(index)
+      qualifier.update((obj,), obj.timestamp_ns, 10.)
+    assert qualifier._states[self.PID][8]
+    obj = self.wall(9, y=-6.5)
+    assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
+    assert self.PID not in qualifier._states
+
+  def test_member_identity_change_resets_history(self):
+    qualifier = self.filter()
+    for index in range(8):
+      obj = self.wall(index)
+      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
+    changed = self.wall(8, raw_id=901)
+    assert qualifier.update((changed,), changed.timestamp_ns, 10.) == (changed,)
+    assert self.PID not in qualifier._states
+
+  def test_observation_gap_resets_history(self):
+    qualifier = self.filter()
+    for index in range(8):
+      obj = self.wall(index)
+      qualifier.update((obj,), obj.timestamp_ns, 10.)
+    gap = self.obj(10, d=70.65, y=-7., v=-9.35)
+    assert qualifier.update((gap,), gap.timestamp_ns, 10.) == (gap,)
+    assert self.PID not in qualifier._states
+
+  def test_state_is_bounded_and_disappearing_pid_is_retired(self):
+    qualifier = self.filter()
+    objects = tuple(self.obj(0, pid=self.PID + i, raw_id=1_000 + i, d=40. + i) for i in range(32))
+    qualifier.update(objects, self.START_NS, 10.)
+    assert len(qualifier._states) == qualifier.state_peak == 32
+    qualifier.update((), self.START_NS + 100_000_000, 10.)
+    assert qualifier._states == {}
+
+  def test_phantom_wall_sequence_uses_speed_hysteresis(self):
+    qualifier = self.filter()
+    for index in range(9):
+      qualifier.update((self.wall(index),), self.wall(index).timestamp_ns, 10.)
+    hysteresis = self.wall(9, v=-9.1)  # residual 0.9: above enter, below exit
+    assert qualifier.update((hysteresis,), hysteresis.timestamp_ns, 10.) == ()
+    moving = self.wall(10, v=-8.75)
+    assert qualifier.update((moving,), moving.timestamp_ns, 10.) == (moving,)
+    assert self.PID not in qualifier._states
+
+  def test_curve_yaw_in_path_real_vehicle_is_kept(self):
+    qualifier = self.filter()
+    path = ((0., 0.), (50., 4.), (100., 8.))
+    for index in range(12):
+      d = 80. - .855 * index
+      y = d * .08 + .4
+      obj = self.obj(index, d=d, y=y, v=-8.55)
+      assert qualifier.update((obj,), obj.timestamp_ns, 10., path, yaw_rate=.1) == (obj,)
+
+  def test_camera_mode_contract_does_not_change_qualifier(self):
+    results = []
+    for mode in (0, 1, 3):  # OFF, SHADOW, ACTIVE_TEST
+      provider = BoschRadarProvider(1, camera_extended_mode=mode)
+      sequence = []
+      for index in range(10):
+        obj = self.wall(index)
+        objects = (obj,)
+        assert provider.camera_extended.update(obj.timestamp_ns, objects, 10., 0.) is objects
+        sequence.append(tuple(x.physical_track_id for x in provider.qualifier.update(
+          objects, obj.timestamp_ns, 10.)))
+      results.append(sequence)
+    assert results[0] == results[1] == results[2]
 
 
 class TestBoschPublicationAlias:
