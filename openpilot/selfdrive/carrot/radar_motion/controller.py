@@ -957,6 +957,7 @@ class DPathRadarController:
       model,
       yaw_rate_rad_s=yaw_rate_rad_s,
       vision_required_front=self.motion_sensor == "corner",
+      primary_lead=lead_one,
       cross_sensor_matches=front_kinematic_matches,
     )
     estimate_identities = {
@@ -1055,7 +1056,7 @@ class DPathRadarController:
       # A side pass cannot retain a full lead role. Keep the independently
       # gated, bounded low-speed pre-deceleration path above available when
       # substantial inward motion still warrants a precaution.
-      if estimate.passing_before_overlap:
+      if estimate.passing_before_overlap or estimate.parallel_drift or estimate.rear_pass:
         if active_identity == identity:
           self.lead_two_tracker.reset()
         continue
