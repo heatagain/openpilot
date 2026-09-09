@@ -2682,6 +2682,8 @@ class _BoschStaticOffPathFilter:
   _LONGITUDINAL_RESIDUAL_M = 2.5
   _LATERAL_STEP_M = 0.375
   _INWARD_STEP_M = 0.35
+  _MAX_LATERAL_EXCURSION_M = 2.0
+  _MIN_EGO_SPEED_MPS = 3.0
 
   def __init__(self):
     from openpilot.selfdrive.carrot.radar_motion.predictor import model_path_y
@@ -2747,9 +2749,16 @@ class _BoschStaticOffPathFilter:
       established = bool(previous and previous[8])
       speed_limit = self._EXIT_SPEED_MPS if established else self._ENTER_SPEED_MPS
       offset_limit = self._EXIT_OFFSET_M if established else self._ENTER_OFFSET_M
-      eligible = len(obj.members) == 1 and speed <= speed_limit and abs(offset) >= offset_limit
+      # Very-low-speed roadside scenes cannot reliably distinguish a parked
+      # vehicle from structure using radar-only static evidence. Likewise, a
+      # cumulative lateral excursion is direct evidence that a far-side object
+      # may be a turning/crossing vehicle even when each individual step is
+      # small. Both cases fail open for the temporal extension while preserving
+      # the pre-existing <=0.6 m/s immediate static/off-path decision below.
+      eligible = (len(obj.members) == 1 and v_ego >= self._MIN_EGO_SPEED_MPS
+                  and speed <= speed_limit and abs(offset) >= offset_limit)
       if eligible and previous is not None:
-        since_ns, last_ns, member_id, representative_id, d_rel, y_rel, v_rel, old_offset, was_established = previous
+        since_ns, last_ns, member_id, representative_id, d_rel, y_rel, v_rel, old_offset, was_established, anchor_y = previous
         dt_s = (timestamp_ns - last_ns) * 1e-9
         eligible = (
           0.0 < dt_s <= self._GAP_NS * 1e-9
@@ -2759,16 +2768,18 @@ class _BoschStaticOffPathFilter:
           and abs(obj.v_rel - v_rel) <= 1.0
           and abs(obj.y_rel - y_rel) <= self._LATERAL_STEP_M
           and abs(old_offset) - abs(offset) <= self._INWARD_STEP_M
+          and abs(obj.y_rel - anchor_y) <= self._MAX_LATERAL_EXCURSION_M
         )
       if eligible:
         if previous is None:
           since_ns = timestamp_ns
           established = False
+          anchor_y = obj.y_rel
         elif not established:
           established = timestamp_ns - since_ns >= self._EVIDENCE_NS
         states[obj.physical_track_id] = (
           since_ns, timestamp_ns, obj.members[0].raw_track_id, obj.representative_raw_track_id,
-          obj.d_rel, obj.y_rel, obj.v_rel, offset, established)
+          obj.d_rel, obj.y_rel, obj.v_rel, offset, established, anchor_y)
 
       # 기존 <=0.6 static/off-path 동작은 유지한다. 새 상태는 그 관측도
       # evidence로 사용하되, 0.6 초과 표적만 충분한 이력 뒤 추가 억제한다.

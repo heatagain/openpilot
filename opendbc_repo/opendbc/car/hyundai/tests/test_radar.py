@@ -672,6 +672,49 @@ class TestBoschStaticOffPathTemporal:
       obj = self.obj(index, d=d, y=y, v=-8.55)
       assert qualifier.update((obj,), obj.timestamp_ns, 10., path, yaw_rate=.1) == (obj,)
 
+  @pytest.mark.parametrize('side', (-1., 1.))
+  def test_side_lead_turning_vehicle_cumulative_lateral_motion_is_kept(self, side):
+    qualifier = self.filter()
+    # PID1019926형 좌/우 side-role 차량: scan 간 이동은 continuity gate 안이지만
+    # 누적 2 m를 넘으면 실제 turning/crossing evidence로 fail-open한다.
+    for index in range(16):
+      obj = self.wall(index, y=side * (10. + .3 * index))
+      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
+    assert self.PID not in qualifier._states
+
+  def test_low_speed_parked_roadside_vehicle_is_kept(self):
+    qualifier = self.filter()
+    for index in range(16):
+      obj = self.obj(index, d=40. - .135 * index, y=-9., v=-1.35)
+      assert qualifier.update((obj,), obj.timestamp_ns, 2.) == (obj,)
+    assert self.PID not in qualifier._states
+
+  def test_low_speed_veto_preserves_existing_immediate_static_drop(self):
+    qualifier = self.filter()
+    obj = self.obj(0, d=40., y=-9., v=-1.5)
+    assert qualifier.update((obj,), obj.timestamp_ns, 2.) == ()
+    assert self.PID not in qualifier._states
+
+  def test_guardrail_near_supported_real_vehicle_is_kept(self):
+    qualifier = self.filter()
+    for index in range(16):
+      obj = self.wall(index, y=-6., vision=True)
+      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
+    assert self.PID not in qualifier._states
+
+  def test_multi_member_object_never_uses_temporal_extension(self):
+    qualifier = self.filter()
+    for index in range(16):
+      obj = self.wall(index)
+      second_detection = BoschRawDetection(obj.timestamp_ns, 6, obj.d_rel + .5, obj.y_rel, obj.v_rel, 1)
+      second_member = BoschRawTrack(901, second_detection, index + 1, False)
+      multi = BoschPhysicalObject(obj.physical_track_id, obj.timestamp_ns, obj.members + (second_member,),
+                                  obj.representative_raw_track_id, obj.d_rel, obj.y_rel, obj.v_rel,
+                                  obj.oem_selected, obj.vision_supported, obj.age_scans,
+                                  'temporal_complete_link')
+      assert qualifier.update((multi,), multi.timestamp_ns, 10.) == (multi,)
+    assert self.PID not in qualifier._states
+
   def test_camera_mode_contract_does_not_change_qualifier(self):
     results = []
     for mode in (0, 1, 3):  # OFF, SHADOW, ACTIVE_TEST
