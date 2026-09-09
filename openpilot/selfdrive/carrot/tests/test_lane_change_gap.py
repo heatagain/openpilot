@@ -43,7 +43,7 @@ def departure(direction=1, *, stopped_ego=False, blindspot=False, target_distanc
       now=t, direction=direction, v_ego=15.0, yaw_rate=direction * yaw,
       path_t=tuple(times), path_x=tuple(xs), path_y=tuple(ys),
       primary=lead(lateral=radar_y),
-      side_leads=(lead(target_distance, lateral=-direction * 3.6, track=2 + int(target_switch and i % 2 == 0)),),
+      secondary=lead(target_distance, lateral=-direction * 3.6, track=2 + int(target_switch and i % 2 == 0)),
       blindspot=blindspot,
     ))
   return tracker, results
@@ -62,7 +62,7 @@ def test_measured_departure_requires_confirmation_and_preserves_target(direction
 def test_intent_blindspot_reentry_and_unstable_targets_never_grant_credit(kwargs):
   _, plans = departure(**kwargs)
   assert all(p.confidence == 0.0 for p in plans)
-  assert plans[-1].targets  # destination constraint survives denied relief
+  assert plans[-1].targets  # selected leadTwo remains an acceleration-credit guard only
 
 
 def plan(**kwargs):
@@ -115,20 +115,20 @@ def test_missing_destination_or_small_base_tf_cannot_grant_credit():
 def test_cancel_or_invalid_input_revokes_immediately(direction, valid):
   tracker, _ = departure()
   p = tracker.update(now=2.6, direction=direction, valid=valid, v_ego=15., yaw_rate=.04,
-                     path_t=(), path_x=(), path_y=(), primary=lead(), side_leads=(lead(120., track=2),))
+                     path_t=(), path_x=(), path_y=(), primary=lead(), secondary=lead(120., track=2))
   assert p.confidence == 0.0
 
 
-def test_missing_pose_retains_destination_obstacles_without_relief():
+def test_missing_pose_retains_selected_lead_metadata_without_relief():
   p = LaneChangeGapTracker().update(now=1., direction=1, v_ego=15., yaw_rate=math.nan,
-                                  path_t=(), path_x=(), path_y=(), primary=lead(), side_leads=(lead(25., track=2),))
+                                  path_t=(), path_x=(), path_y=(), primary=lead(), secondary=lead(25., track=2))
   assert p.targets and p.confidence == 0.0
 
 
 def test_repeated_or_stale_frames_cannot_accumulate_evidence():
   tracker, _ = departure()
   p = tracker.update(now=10., direction=1, v_ego=15., yaw_rate=.04,
-                     path_t=(), path_x=(), path_y=(), primary=lead(), side_leads=(lead(120., track=2),))
+                     path_t=(), path_x=(), path_y=(), primary=lead(), secondary=lead(120., track=2))
   assert p.confidence == 0.0
 
 
@@ -138,8 +138,9 @@ def test_production_tf_update_cycle_has_no_repeated_reduction(changing, ratio):
   path = Path(__file__).resolve().parents[1] / 'carrot_functions.py'
   tree = ast.parse(path.read_text(encoding='utf-8'))
   cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'CarrotPlanner')
-  methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ('get_T_FOLLOW', 'dynamic_t_follow', 'apply_t_follow')]
-  namespace = {'np': np, 'DT_MDL': .05, 'ramp_t_follow': ramp_t_follow, 'log': NS(LongitudinalPersonality=NS(standard=1))}
+  methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ('get_T_FOLLOW',)]
+  namespace = {'LEAD_ACCEL_DEADBAND': .1, 'LEAD_ACCEL_CONFIGURED_TF_MIN': 4, 'np': np, 'DT_MDL': .05,
+               'ramp_t_follow': ramp_t_follow, 'log': NS(LongitudinalPersonality=NS(standard=1))}
   exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), 'exec'), namespace)
   planner_type = type('ActualTFMethods', (), {n.name: namespace[n.name] for n in methods})
   p = planner_type()
@@ -151,9 +152,46 @@ def test_production_tf_update_cycle_has_no_repeated_reduction(changing, ratio):
   p._tf_decel_extra = 0.
   p.t_follow_last = 1.3
   p.lane_change_active = changing
-  p.dynamicTFollowLC, p.dynamicTFollow, p.jerk_factor = ratio, .2, .7
+  p.dynamicTFollowLC, p.leadAccelResponse, p.jerk_factor = ratio, 0, .7
   p.desireState, p.desireStateCount = 1., 1
   for _ in range(100):
     tf = p.get_T_FOLLOW()
     assert tf == pytest.approx(1.3)
-    assert p.dynamic_t_follow(tf, NS(status=True, jLead=2.), 0., 0.) == pytest.approx(1.3 if changing else 1.1)
+    assert p.t_follow_last == pytest.approx(1.3)
+
+
+@pytest.mark.parametrize('replace_primary', [True, False])
+def test_entry_pair_change_revokes_credit_for_rest_of_maneuver(replace_primary):
+  tracker, plans = departure()
+  assert plans[-1].confidence > 0.0
+  assert plans[-1].entry_ids == (1, 2)
+  args = {'direction': 1, 'v_ego': 15., 'yaw_rate': .04, 'path_t': (), 'path_x': (), 'path_y': ()}
+  changed = tracker.update(now=3.55, primary=lead(track=9 if replace_primary else 1),
+                           secondary=lead(120., track=2) if replace_primary else None, **args)
+  assert changed.reason == 'selected-leads-changed'
+  assert changed.confidence == 0.0
+  assert changed.entry_ids == (1, 2)
+  restored = tracker.update(now=3.60, primary=lead(), secondary=lead(120., track=2), **args)
+  assert restored.reason == 'selected-leads-changed'
+  assert restored.confidence == 0.0
+
+
+def test_production_adapter_reads_only_selected_pair():
+  path = Path(__file__).resolve().parents[1] / 'carrot_functions.py'
+  tree = ast.parse(path.read_text(encoding='utf-8'))
+  method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_update_lane_change_gap')
+  namespace = {'LaneChangeGapPlan': LaneChangeGapPlan}
+  exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), 'exec'), namespace)
+  planner = NS(lane_change_active=True, _lane_change_tracker=LaneChangeGapTracker(), _lane_change_model_ns=0)
+  empty = NS(status=False)
+  # No side candidate attributes exist: any read would fail this test.
+  sm = {'carState': NS(leftBlinker=False, rightBlinker=True, rightBlindspot=False, vEgo=26.),
+        'modelV2': NS(position=NS(t=(), x=(), y=())),
+        'radarState': NS(leadOne=empty, leadTwo=empty),
+        'livePose': NS(inputsOK=True, sensorsOK=True, angularVelocityDevice=NS(valid=True, z=.01))}
+  class SM(dict):
+    valid = alive = dict.fromkeys(sm, True)
+    logMonoTime = dict.fromkeys(sm, 1_000_000_000)
+  namespace['_update_lane_change_gap'](planner, SM(sm))
+  assert planner.lane_change_gap.targets == ()
+  assert planner.lane_change_gap.entry_ids == (-1, -1)

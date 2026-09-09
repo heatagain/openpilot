@@ -10,8 +10,10 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.modeld.constants import index_function
 from openpilot.selfdrive.controls.radar_constants import LEAD_ACCEL_TAU
 from openpilot.selfdrive.carrot.traffic_stop import get_traffic_stop_distance_adjust, get_traffic_stop_obstacle_distance
-from openpilot.selfdrive.controls.lib.longitudinal_preview import LEAD_ACCEL_MIN_TRACK_FRAMES, get_lead_accel_mpc_request
+from openpilot.selfdrive.controls.lib.longitudinal_preview import LEAD_ACCEL_MIN_TRACK_FRAMES, LeadAccelResponseState, get_lead_accel_mpc_request
 from openpilot.selfdrive.controls.lib.longitudinal_cutout import cutout_obstacle_relief
+from openpilot.selfdrive.controls.lib.longitudinal_approach import CLOSING_DEADBAND, LeadApproachState, approach_margin, approach_reference
+from openpilot.selfdrive.controls.lib.longitudinal_safe_follow import SafeFollowState
 from openpilot.selfdrive.carrot.radar_motion.lane_change_gap import LaneChangeGapPlan
 
 if __name__ == '__main__':  # generating code
@@ -287,6 +289,10 @@ class LongitudinalMpc:
     self.lead_accel_response_active = False
     self.lead_accel_response_level = 0
     # timers
+    self.lead_response_state = LeadAccelResponseState()
+    self.safe_follow_state = SafeFollowState()
+    self.lead_approach_states = (LeadApproachState(), LeadApproachState())
+    self.lead_approach_margins = np.zeros((N+1, 2))
     self.solve_time = 0.0
     self.time_qp_solution = 0.0
     self.time_linearization = 0.0
@@ -416,6 +422,7 @@ class LongitudinalMpc:
       lead_status=tf_lead_valid,
       lead_accel=tf_lead.aLeadK if tf_lead_valid else 0.0,
     )
+    jerk_factor = carrot.jerk_factor
 
     lead_xv_0, lead_v_0 = self.process_lead(radarstate.leadOne)
     lead_xv_1, lead_v_1 = self.process_lead(radarstate.leadTwo)
@@ -432,10 +439,6 @@ class LongitudinalMpc:
       stop_x = 1000.0
     else:
       v_cruise, stop_x, mode = carrot.v_cruise, carrot.stop_dist, carrot.mode
-      desired_distance = desired_follow_distance(v_ego, lead_v_0, comfort_brake, stop_distance, t_follow)
-      t_follow = carrot.dynamic_t_follow(t_follow, radarstate.leadOne, desired_distance, self.prev_a)
-      if getattr(carrot, 'lane_change_active', False):
-        jerk_factor = carrot.jerk_factor  # no previous-cycle dynamic jerk boost on entry
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
@@ -482,14 +485,8 @@ class LongitudinalMpc:
             radarstate.leadOne, v_ego, T_IDXS, t_follow, stop_distance,
           )
       x_obstacles = np.column_stack([lead_0_follow_obstacle, lead_1_obstacle, cruise_obstacle, x2])
-      # The destination front vehicles retain the normal TF over the entire
-      # horizon. Fold them into lead1 so all downstream source logic remains
-      # compatible, without replacing radarState or changing measured leads.
-      if lane_change.active and not reset_state:
-        for target in lane_change.targets:
-          target_xv, _ = self.process_lead(target)
-          target_obstacle = target_xv[:,0] + get_stopped_equivalence_factor(target_xv[:,1])
-          x_obstacles[:,1] = np.minimum(x_obstacles[:,1], target_obstacle)
+      # Only currently selected leadOne/leadTwo may constrain braking.
+      # Entry snapshots and lane-change credit guards never add obstacles.
       self.source = SOURCES[np.argmin(x_obstacles[0])]
 
       if v_cruise == 0 and self.source == 'cruise':
@@ -550,8 +547,19 @@ class LongitudinalMpc:
       gap_margin=response_gap_margin,
       speed_error=v_cruise - v_ego,
     )
+    response_request = self.lead_response_state.update(response_request, self.dt, response_lead.radarTrackId)
     self.lead_accel_response_active = response_request.active
     self.lead_accel_response_level = response_request.level if response_request.active else 0
+    self.params[:,1] = self.safe_follow_state.acceleration_limits(
+      self.params[:,1], T_IDXS,
+      level=carrot.leadAccelResponse, driving_mode=carrot.myDrivingMode,
+      enabled=(mode == 'acc' and lead_accel_response_enabled and not reset_state
+               and not getattr(carrot, 'lane_change_active', False) and response_track_stable
+               and response_lead.status and response_lead.radar),
+      track_id=response_lead.radarTrackId, gap_margin=response_gap_margin,
+      v_rel=response_lead.vRel, a_lead=response_lead.aLeadK,
+      a_ego=max(a_ego, measured_a_ego), dt=self.dt,
+    )
     self.set_weights(
       prev_accel_constraint,
       personality=personality,
@@ -561,6 +569,25 @@ class LongitudinalMpc:
       jerk_cost_factor=response_request.jerk_cost_factor,
     )
 
+    # Keep physical obstacles, danger limits, source selection and TF unchanged.
+    # Only the soft distance preference gets temporary closing headroom. A prior
+    # solution supplies the ego trajectory used to form this cycle's references.
+    approach_v = np.maximum(0.0, self.x_sol[:,1] + v_ego - self.x_sol[0,1])
+    approach_x = np.cumsum(T_DIFFS * np.r_[approach_v[0], (approach_v[1:] + approach_v[:-1]) * 0.5])
+    self.lead_approach_margins[:] = 0.0
+    for lead_index, (lead, lead_xv) in enumerate(((radarstate.leadOne, lead_xv_0), (radarstate.leadTwo, lead_xv_1))):
+      eligible = (
+        mode == 'acc' and lead_accel_response_enabled and not reset_state
+        and not getattr(carrot, 'lane_change_active', False)
+        and len(lead_track_frames) > lead_index and lead_track_frames[lead_index] >= LEAD_ACCEL_MIN_TRACK_FRAMES
+        and lead.status and lead.radar and lead.vRel < -CLOSING_DEADBAND
+      )
+      strength = self.lead_approach_states[lead_index].update(carrot.leadAccelResponse, lead.radarTrackId, eligible, self.dt)
+      if strength > 0.0:
+        self.lead_approach_margins[:,lead_index] = strength * approach_margin(
+          carrot.leadAccelResponse, approach_v, lead_xv[:,1], lead_xv[:,0] - approach_x, stop_distance,
+        )
+    self.yref[:,0] = approach_reference(x_obstacles, self.lead_approach_margins, approach_v)
     self.yref[:,1] = x
     self.yref[:,2] = v
     self.yref[:,3] = a

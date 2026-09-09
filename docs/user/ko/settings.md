@@ -186,15 +186,15 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 | [가속 성향·속도별 가속값](cruise-gap.md#acceleration-table) | `CruiseMaxVals0`, `CruiseMaxVals1`, `CruiseMaxVals2`, `CruiseMaxVals3`, `CruiseMaxVals4`, `CruiseMaxVals5`, `CruiseMaxVals6` | 속도 구간별 최대 가속 성향 |
 | [정차·재출발](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `VEgoStopping`, `AChangeCostStarting` | 정지 위치, 정지 진입과 재출발 특성 |
 | [가감속 튜닝](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | 현기차는 Kp/Ki/Kf `100/0/100` 고정·숨김, 다른 브랜드는 조정 가능 |
-| [차간거리](cruise-gap.md#following-gap) | `TFollowGap1`, `TFollowGap2`, `TFollowGap3`, `TFollowGap4`, `DynamicTFollow`, `DynamicTFollowLC`, `EnableSpeedTF`, `TFollowDecelBoost` | 차간 단계별 시간, 동적 차간, 차로 변경 이탈 확인 후 제한적 완화와 감속 여유 |
-| [선행차 반응](cruise-gap.md#lead-response) | `LeadAccelResponse`, `JLeadFactor3`, `RadarReactionFactor` | 모든 차간 단계의 앞차 가속과 선행차 변화에 대한 반응 특성 |
+| [차간거리](cruise-gap.md#following-gap) | `TFollowGap1`, `TFollowGap2`, `TFollowGap3`, `TFollowGap4`, `DynamicTFollowLC`, `EnableSpeedTF`, `TFollowDecelBoost` | 차간 단계별 시간, 정상 선택 앞차 기준 차로 변경 완화와 감속 여유(기본 0%) |
+| [선행차 반응](cruise-gap.md#lead-response) | `LeadAccelResponse` | 모든 차간 단계의 앞차 출발·가속 추종과 접근 반응 |
 | [당근 크루즈](cruise-gap.md#carrot-cruise) | `CruiseEcoControl`, `CarrotCruiseDecel`, `CarrotCruiseAtcDecel` | 연비 제어와 당근 크루즈 감속 특성 |
 
 `MyDrivingMode`는 `1` 연비, `2` 안전, `3` 일반, `4` 고속 모드입니다. 고속 모드는 신호 감지를 무시하고 가속 성향을 높이므로 모드 이름만 보고 선택하지 말고 설명을 확인하세요.
 
-`TFollowGap1`~`TFollowGap4`는 저장값에 `0.01초`를 곱한 시간 간격입니다. 값을 줄이면 선행차와 가까워집니다. `DynamicTFollow` 관련 기능은 고정 차간에서 기준 동작을 확인한 다음 적용하세요.
+`TFollowGap1`~`TFollowGap4`는 저장값에 `0.01초`를 곱한 시간 간격입니다. 값을 줄이면 선행차와 가까워집니다. 앞차 가속 추종은 `LeadAccelResponse`로 조절합니다. 1~3은 완만한 반응, 4는 빠른 추종, 5는 최대 추종이며 감속 추가 여유는 반복 누적하지 않습니다.
 
-`LeadAccelResponse`는 모든 차간 단계에서 앞차의 출발·가속을 따라가는 운전자 성향을 0~5단계로 조절합니다. 선택한 차간 단계의 TF를 기준으로 동작하며, 반응 강도 4~5는 앞차 가속 중 해당 단계의 `TFollowGap1~4` 설정을 우선합니다. 1단계는 약한 반응, 2단계는 완만한 반응, 3단계는 일상적으로 조금 급한 경쾌함, 4단계는 급한 추종, 시험용 5단계는 최대 추종입니다. 단계가 높을수록 MPC의 활성 가속변화 비용과 jerk 비용을 낮춰 `vTargetNow`와 `aTarget`이 함께 더 빠르게 상승하며, `CruiseMaxVals`·곡선·끼어들기·위험거리 상한은 그대로 유지합니다. 설정 TF에 도달하거나 앞차 가속이 끝나면 즉시 기존 MPC 비용과 감속 제어로 돌아갑니다. 적용 조건과 단계별 비용은 [선행차 반응 설명](cruise-gap.md#lead-response)을 확인하세요.
+`LeadAccelResponse`는 모든 차간 단계에서 앞차의 출발·가속을 따라가는 운전자 성향을 0~5단계로 조절합니다. 선택한 차간 단계의 TF를 기준으로 동작하며, 반응 강도 4~5는 앞차 가속 중 해당 단계의 `TFollowGap1~4` 설정을 우선합니다. 1~3단계는 작은 변화와 목표 간격 부근에서 반응을 완화하며, 4단계는 빠른 추종, 5단계는 기존 최대 추종입니다. 1~4단계는 가속 강화 시작을 점진적으로 적용하고, 5단계는 시작 지연 없이 반응합니다. 단계가 높을수록 MPC의 활성 가속변화 비용과 jerk 비용을 낮춰 `vTargetNow`와 `aTarget`이 함께 더 빠르게 상승하며, `CruiseMaxVals`·곡선·끼어들기·위험거리 상한은 그대로 유지합니다. 설정 TF에 도달하거나 앞차 가속이 끝나면 즉시 기존 MPC 비용과 감속 제어로 돌아갑니다. 적용 조건과 단계별 비용은 [선행차 반응 설명](cruise-gap.md#lead-response)을 확인하세요. 1~4단계는 느린 앞차에 접근할 때 MPC의 선호 거리에 한시적인 여유를 적용하며, 낮은 단계일수록 여유가 큽니다. 0과 5는 이 접근 보정을 적용하지 않습니다. 같은 속도가 되면 추가 여유가 사라지고 기존 TF가 기준으로 남습니다. 가까운 정지차처럼 필요한 감속이 큰 상황에서는 추가 여유를 줄이며 기존 제동 제약은 유지합니다. Safe 모드의 4~5단계는 기존 출발 반응과 가속 강화 시작을 유지합니다. 자차가 앞차보다 강하게 가속하면서 목표 간격을 따라잡을 때만 미래의 양의 가속 상한을 점진적으로 낮춥니다. 앞차가 다시 가속하거나 간격이 충분히 벌어지면 추가 제한을 해제합니다. 새 차간 여유는 추가하지 않으며, 기존 Safe 가속 상한·TF 처리와 제동 제한은 유지합니다.
 
 `LongTuning*`, `LongActuatorDelay`, `StoppingAccel`은 openpilot이 가감속을 제어하는 차량에서 직접적인 영향을 줄 수 있는 고급 항목입니다. 현대·기아·제네시스에서는 `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`가 안전값 `100/0/100`으로 고정되어 설정 화면에 나오지 않으며, 순정 ACC 차량에서는 관련 없는 항목도 있습니다.
 
