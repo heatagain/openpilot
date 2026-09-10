@@ -730,6 +730,140 @@ class TestBoschStaticOffPathTemporal:
     assert results[0] == results[1] == results[2]
 
 
+class TestBoschP91PersistentSpatialClone:
+  START_NS = 8_000_000_000
+  PARENT_PID = 1_001_000
+  CANDIDATE_PID = 1_001_001
+
+  @classmethod
+  def obj(cls, pid, index, *, d, y, v=0., vision=False, oem=False, raw_id=None, members=1):
+    ns = cls.START_NS + index * 100_000_000
+    raw_id = raw_id if raw_id is not None else pid % 100_000
+    tracks = []
+    for member_index in range(members):
+      detection = BoschRawDetection(ns, (raw_id + member_index) % 32, d + .25 * member_index,
+                                    y, v, raw_word=raw_id + member_index)
+      tracks.append(BoschRawTrack(raw_id + member_index, detection, index + 1, False))
+    return BoschPhysicalObject(pid, ns, tuple(tracks), raw_id, d, y, v, oem, vision,
+                               index + 1, 'single_return' if members == 1 else 'temporal_complete_link')
+
+  @classmethod
+  def pair(cls, index, *, candidate_y=5., candidate_d=41.3, candidate_v=0.,
+           candidate_vision=False, candidate_oem=False, candidate_members=1):
+    parent = cls.obj(cls.PARENT_PID, index, d=30., y=0., v=0., vision=True)
+    candidate = cls.obj(cls.CANDIDATE_PID, index, d=candidate_d, y=candidate_y,
+                        v=candidate_v, vision=candidate_vision, oem=candidate_oem,
+                        members=candidate_members)
+    return parent, candidate
+
+  @staticmethod
+  def detector(mode=radar_interface_module.BOSCH_P91_ACTIVE_TEST):
+    return radar_interface_module._BoschPersistentSpatialCloneFilter(mode)
+
+  def mature(self, detector, count=31):
+    result = frozenset()
+    for index in range(count):
+      pair = self.pair(index)
+      result = detector.update(pair, pair[0].timestamp_ns, 20.)
+    return result
+
+  def test_supported_parent_persistent_spatial_copy_suppresses_after_warmup(self):
+    detector = self.detector()
+    for index in range(30):
+      pair = self.pair(index)
+      assert detector.update(pair, pair[0].timestamp_ns, 20.) == frozenset()
+    pair = self.pair(30)
+    assert detector.update(pair, pair[0].timestamp_ns, 20.) == frozenset({self.CANDIDATE_PID})
+    decision = detector.decisions[self.CANDIDATE_PID]
+    assert decision['parent_pid'] == self.PARENT_PID
+    assert decision['evidence_age_s'] >= 3.
+    assert decision['v_rmse_mps'] == 0.
+
+  def test_candidate_camera_support_is_immediate_keep_and_reset(self):
+    detector = self.detector()
+    assert self.mature(detector) == frozenset({self.CANDIDATE_PID})
+    pair = self.pair(31, candidate_vision=True)
+    assert detector.update(pair, pair[0].timestamp_ns, 20.) == frozenset()
+    assert self.CANDIDATE_PID not in detector._states
+
+  def test_candidate_word1_selection_is_immediate_keep_and_reset(self):
+    detector = self.detector()
+    assert self.mature(detector) == frozenset({self.CANDIDATE_PID})
+    pair = self.pair(31, candidate_oem=True)
+    assert detector.update(pair, pair[0].timestamp_ns, 20.) == frozenset()
+    assert self.CANDIDATE_PID not in detector._states
+
+  def test_candidate_word0_selection_is_immediate_keep_and_reset(self):
+    detector = self.detector()
+    assert self.mature(detector) == frozenset({self.CANDIDATE_PID})
+    pair = self.pair(31)
+    assert detector.update(pair, pair[0].timestamp_ns, 20.,
+                           word0_pids=(self.CANDIDATE_PID,)) == frozenset()
+    assert self.CANDIDATE_PID not in detector._states
+
+  def test_lateral_cutin_excursion_never_matures(self):
+    detector = self.detector()
+    for index in range(40):
+      pair = self.pair(index, candidate_y=7. - .25 * index)
+      assert detector.update(pair, pair[0].timestamp_ns, 20.) == frozenset()
+
+  def test_legitimate_large_vehicle_companion_is_kept(self):
+    detector = self.detector()
+    for index in range(50):
+      pair = self.pair(index, candidate_y=.8, candidate_d=40., candidate_members=2)
+      assert detector.update(pair, pair[0].timestamp_ns, 20.) == frozenset()
+    assert not detector._states
+
+  def test_short_lived_similar_speed_adjacent_object_is_kept(self):
+    detector = self.detector()
+    assert self.mature(detector, 20) == frozenset()
+
+  def test_parent_disappearance_releases_and_resets(self):
+    detector = self.detector()
+    assert self.mature(detector) == frozenset({self.CANDIDATE_PID})
+    candidate = self.pair(31)[1]
+    assert detector.update((candidate,), candidate.timestamp_ns, 20.) == frozenset()
+    assert not detector._states
+
+  def test_state_cleanup_is_bounded_by_live_candidates(self):
+    detector = self.detector()
+    parent = self.pair(0)[0]
+    candidates = tuple(self.obj(self.CANDIDATE_PID + index, 0, d=41. + index * .1,
+                                y=5., raw_id=2_000 + index) for index in range(20))
+    detector.update((parent,) + candidates, parent.timestamp_ns, 20.)
+    assert len(detector._states) <= len(candidates)
+    detector.update((), parent.timestamp_ns + 100_000_000, 20.)
+    assert detector._states == {} and detector._support_until == {}
+
+  def test_shadow_mode_leaves_publication_and_aliases_unchanged(self):
+    provider = BoschRadarProvider(1, qualification=False, camera_extended_mode=0,
+                                  p91_mode=radar_interface_module.BOSCH_P91_SHADOW)
+    for index in range(31):
+      pair = self.pair(index)
+      provider.p91.update(pair, pair[0].timestamp_ns, 20.)
+    pair = self.pair(30)
+    aliases = provider.publication_aliases.update(pair[0].timestamp_ns,
+                                                   [obj.physical_track_id for obj in pair],
+                                                   {obj.physical_track_id for obj in pair})
+    assert provider.p91.would_suppress == frozenset({self.CANDIDATE_PID})
+    assert provider.publication_view(pair, pair[0].timestamp_ns) == pair
+    assert set(aliases) == {self.PARENT_PID, self.CANDIDATE_PID}
+
+  def test_active_test_veto_preserves_internal_pid_and_alias_binding(self):
+    provider = BoschRadarProvider(1, qualification=False, camera_extended_mode=0,
+                                  p91_mode=radar_interface_module.BOSCH_P91_ACTIVE_TEST)
+    for index in range(31):
+      pair = self.pair(index)
+      provider.p91.update(pair, pair[0].timestamp_ns, 20.)
+    pair = self.pair(30)
+    provider.publication_aliases.update(pair[0].timestamp_ns,
+                                        [obj.physical_track_id for obj in pair],
+                                        {obj.physical_track_id for obj in pair})
+    assert provider.publication_view(pair, pair[0].timestamp_ns) == (pair[0],)
+    assert self.CANDIDATE_PID in provider.publication_aliases.physical_to_alias
+    assert self.CANDIDATE_PID in provider.p91._states
+
+
 class TestBoschPublicationAlias:
   PID = 1_000_475
 

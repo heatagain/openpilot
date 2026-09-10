@@ -280,6 +280,16 @@ BOSCH_STALE_NS = 300_000_000
 BOSCH_OUTPUT_INTERVAL_NS = 100_000_000
 BOSCH_SAMPLE_HOLD_NS = 150_000_000  # one 10 Hz observation period plus one SCC publication period
 
+# Candidate P91 changes only the final Bosch publication view; raw detections,
+# grouping, physical IDs, qualification and alias bindings remain. SHADOW
+# diagnostics stay available for replay and on-device comparison.
+BOSCH_P91_OFF = 0
+BOSCH_P91_SHADOW = 1
+BOSCH_P91_ACTIVE = 2
+BOSCH_P91_ACTIVE_TEST = BOSCH_P91_ACTIVE  # compatibility name for existing synthetic tests
+BOSCH_P91_MODE = BOSCH_P91_ACTIVE
+BOSCH_P91_SUPPORT_HOLD_NS = 500_000_000
+
 # Frozen Bosch <-> OEM-camera extended grouping candidate.  Keep production
 # disabled until the on-device SHADOW timing pass is complete; tests and replay
 # may opt into SHADOW/ACTIVE explicitly when constructing BoschRadarProvider.
@@ -2791,6 +2801,199 @@ class _BoschStaticOffPathFilter:
     return objects if len(kept) == len(objects) else tuple(kept)
 
 
+@dataclass
+class _BoschP91PairState:
+  parent_pid: int
+  since_ns: int
+  last_ns: int
+  samples: int
+  candidate_raw_id: int
+  parent_representative_raw_id: int
+  d_offset_mean: float
+  d_offset_m2: float
+  y_offset_mean: float
+  y_offset_m2: float
+  dv_sq_sum: float
+  anchor_candidate_y: float
+  anchor_y_offset: float
+  last_candidate_y: float
+  last_d_offset: float
+  last_y_offset: float
+
+
+class _BoschPersistentSpatialCloneFilter:
+  """Bosch-only persistent unsupported spatial-copy shadow detector.
+
+  This is not an 0x601 authenticity filter. Supported objects form a small
+  parent pool; support on the candidate is instead an immediate fail-open.
+  One fixed-size state is retained per live candidate PID, never a full pair
+  history. The Bosch research branch keeps SHADOW diagnostics while ACTIVE
+  removes only a mature candidate from the final publication view.
+  """
+  _EVIDENCE_NS = 3_000_000_000
+  # Bosch singleton returns may be absent for one 10 Hz scan; measured P91
+  # component gaps peak just below 300 ms. Keep fixed state through that one
+  # missing observation, while never suppressing an absent object.
+  _GAP_NS = 320_000_000
+  _MIN_SAMPLES = 25
+  _MIN_EGO_SPEED_MPS = 3.0
+  _MIN_WORLD_SPEED_MPS = 4.0
+  _MAX_DV_MPS = .75
+  _MAX_V_RMSE_MPS = .35
+  _MIN_D_OFFSET_M = 6.0
+  _MAX_D_OFFSET_M = 30.0
+  _MIN_Y_SEPARATION_M = 3.5
+  _MAX_D_OFFSET_STD_M = .75
+  _MAX_Y_OFFSET_STD_M = .80
+  _MAX_D_OFFSET_STEP_M = 1.5
+  _MAX_Y_OFFSET_STEP_M = .75
+  _MAX_CANDIDATE_Y_STEP_M = .75
+  _MAX_LATERAL_EXCURSION_M = 2.5
+
+  def __init__(self, mode=BOSCH_P91_MODE):
+    if mode not in (BOSCH_P91_OFF, BOSCH_P91_SHADOW, BOSCH_P91_ACTIVE):
+      raise ValueError('invalid Bosch Candidate P91 mode')
+    self.mode = mode
+    self._states: dict[int, _BoschP91PairState] = {}
+    self._support_until: dict[int, int] = {}
+    self.last_ns = None
+    self.would_suppress = frozenset()
+    self.decisions = {}
+    self.parent_pool_last = self.parent_pool_peak = 0
+    self.pair_evaluations_last = self.pair_evaluations_total = self.pair_evaluations_peak = 0
+    self.state_peak = 0
+    self.publication_suppressed = 0
+
+  @staticmethod
+  def _std(mean, m2, samples):
+    return math.sqrt(max(0., m2 / samples)) if samples else math.inf
+
+  @staticmethod
+  def _welford(mean, m2, samples, value):
+    delta = value - mean
+    mean += delta / samples
+    return mean, m2 + delta * (value - mean)
+
+  def update(self, objects, timestamp_ns, v_ego, *, word0_pids=(), yaw_rate=None):
+    self.last_ns = timestamp_ns
+    self.would_suppress = frozenset()
+    self.decisions = {}
+    self.pair_evaluations_last = 0
+    if self.mode == BOSCH_P91_OFF:
+      self._states = {}
+      self._support_until = {}
+      return self.would_suppress
+    if not math.isfinite(v_ego) or v_ego < self._MIN_EGO_SPEED_MPS or not objects:
+      self._states = {}
+      self._support_until = {}
+      return self.would_suppress
+
+    live = {obj.physical_track_id for obj in objects}
+    word0 = frozenset(word0_pids)
+    support_until = {pid: expiry for pid, expiry in self._support_until.items()
+                     if pid in live and expiry >= timestamp_ns}
+    for obj in objects:
+      if obj.vision_supported or obj.oem_selected or obj.physical_track_id in word0:
+        support_until[obj.physical_track_id] = timestamp_ns + BOSCH_P91_SUPPORT_HOLD_NS
+    self._support_until = support_until
+    supported = {pid for pid, expiry in support_until.items() if expiry >= timestamp_ns}
+    parents = tuple(obj for obj in objects if obj.physical_track_id in supported)
+    self.parent_pool_last = len(parents)
+    self.parent_pool_peak = max(self.parent_pool_peak, len(parents))
+    if not parents:
+      self._states = {}
+      return self.would_suppress
+
+    rotation = yaw_rate if yaw_rate is not None and math.isfinite(yaw_rate) else 0.
+    previous_states = self._states
+    states = {}
+    suppress = set()
+    for candidate in objects:
+      pid = candidate.physical_track_id
+      # Any recent independent support is an immediate KEEP/reset. Multi-member
+      # objects stay inside the existing large-vehicle/member-aware path.
+      if pid in supported or len(candidate.members) != 1:
+        continue
+      world_speed = candidate.v_rel + v_ego - rotation * candidate.y_rel
+      if not math.isfinite(world_speed) or world_speed < self._MIN_WORLD_SPEED_MPS:
+        continue
+
+      previous = previous_states.get(pid)
+      plausible = []
+      for parent in parents:
+        if parent.physical_track_id == pid:
+          continue
+        self.pair_evaluations_last += 1
+        d_offset = candidate.d_rel - parent.d_rel
+        y_offset = candidate.y_rel - parent.y_rel
+        dv = candidate.v_rel - parent.v_rel
+        if (self._MIN_D_OFFSET_M <= d_offset <= self._MAX_D_OFFSET_M and
+            abs(y_offset) >= self._MIN_Y_SEPARATION_M and abs(dv) <= self._MAX_DV_MPS):
+          plausible.append((abs(dv), -parent.age_scans, parent.physical_track_id,
+                            parent, d_offset, y_offset, dv))
+      if not plausible:
+        continue
+      if previous is not None:
+        chosen = next((item for item in plausible if item[3].physical_track_id == previous.parent_pid), None)
+      else:
+        chosen = None
+      _, _, _, parent, d_offset, y_offset, dv = chosen or min(plausible)
+      member_id = candidate.members[0].raw_track_id
+      continuous = bool(
+        previous is not None and previous.parent_pid == parent.physical_track_id and
+        0 < timestamp_ns - previous.last_ns <= self._GAP_NS and
+        previous.candidate_raw_id == member_id and
+        previous.parent_representative_raw_id == parent.representative_raw_track_id and
+        abs(d_offset - previous.last_d_offset) <= self._MAX_D_OFFSET_STEP_M and
+        abs(y_offset - previous.last_y_offset) <= self._MAX_Y_OFFSET_STEP_M and
+        abs(candidate.y_rel - previous.last_candidate_y) <= self._MAX_CANDIDATE_Y_STEP_M and
+        abs(candidate.y_rel - previous.anchor_candidate_y) <= self._MAX_LATERAL_EXCURSION_M and
+        abs(y_offset - previous.anchor_y_offset) <= self._MAX_LATERAL_EXCURSION_M)
+      if not continuous:
+        state = _BoschP91PairState(parent.physical_track_id, timestamp_ns, timestamp_ns, 1,
+                                   member_id, parent.representative_raw_track_id,
+                                   d_offset, 0., y_offset, 0., dv * dv,
+                                   candidate.y_rel, y_offset, candidate.y_rel, d_offset, y_offset)
+      else:
+        samples = previous.samples + 1
+        d_mean, d_m2 = self._welford(previous.d_offset_mean, previous.d_offset_m2, samples, d_offset)
+        y_mean, y_m2 = self._welford(previous.y_offset_mean, previous.y_offset_m2, samples, y_offset)
+        state = _BoschP91PairState(parent.physical_track_id, previous.since_ns, timestamp_ns, samples,
+                                   member_id, parent.representative_raw_track_id,
+                                   d_mean, d_m2, y_mean, y_m2, previous.dv_sq_sum + dv * dv,
+                                   previous.anchor_candidate_y, previous.anchor_y_offset,
+                                   candidate.y_rel, d_offset, y_offset)
+      states[pid] = state
+      age_ns = timestamp_ns - state.since_ns
+      v_rmse = math.sqrt(state.dv_sq_sum / state.samples)
+      d_std = self._std(state.d_offset_mean, state.d_offset_m2, state.samples)
+      y_std = self._std(state.y_offset_mean, state.y_offset_m2, state.samples)
+      established = (age_ns >= self._EVIDENCE_NS and state.samples >= self._MIN_SAMPLES and
+                     v_rmse <= self._MAX_V_RMSE_MPS and d_std <= self._MAX_D_OFFSET_STD_M and
+                     y_std <= self._MAX_Y_OFFSET_STD_M)
+      if established:
+        suppress.add(pid)
+      self.decisions[pid] = {
+        'would_suppress': established, 'reason': 'persistent_spatial_copy' if established else 'warming',
+        'parent_pid': parent.physical_track_id, 'candidate_pid': pid,
+        'evidence_age_s': age_ns * 1e-9, 'samples': state.samples,
+        'v_rmse_mps': v_rmse, 'd_offset_mean_m': state.d_offset_mean,
+        'd_offset_std_m': d_std, 'y_offset_mean_m': state.y_offset_mean,
+        'y_offset_std_m': y_std, 'world_speed_mps': world_speed,
+      }
+    parent_ids = {parent.physical_track_id for parent in parents}
+    for pid, state in previous_states.items():
+      if (pid not in live and state.parent_pid in parent_ids and
+          timestamp_ns - state.last_ns <= self._GAP_NS):
+        states[pid] = state
+    self._states = states
+    self.would_suppress = frozenset(suppress)
+    self.pair_evaluations_total += self.pair_evaluations_last
+    self.pair_evaluations_peak = max(self.pair_evaluations_peak, self.pair_evaluations_last)
+    self.state_peak = max(self.state_peak, len(states))
+    return self.would_suppress
+
+
 BOSCH_PUBLICATION_ALIAS_START = 32
 BOSCH_PUBLICATION_ALIAS_COUNT = 64
 BOSCH_PUBLICATION_ALIAS_GRACE_S = 0.5
@@ -2944,6 +3147,22 @@ def bosch_decode_frame(timestamp_ns: int, address: int, payload: bytes):
   return tuple(detections), unsupported
 
 
+def _bosch_match_processed_target_word(objects, word):
+  """Conservatively map 0x601 bytes0..3 decoded geometry to physical PIDs.
+
+  The record is not assumed to be a raw-track copy or assigned a protocol
+  name. Ambiguous near matches all count as fail-open support.
+  """
+  if word is None or word == BOSCH_INACTIVE_WORD or word & (1 << 31):
+    return frozenset()
+  d_rel = (word & 0x3FF) * .25
+  y_rel = ((word >> 10) & 0x7FF) * .03125 - 32
+  v_rel = ((word >> 21) & 0x3FF) * .25 - 128
+  return frozenset(obj.physical_track_id for obj in objects
+                   if abs(obj.d_rel - d_rel) <= 1.0 and abs(obj.y_rel - y_rel) <= .5 and
+                   abs(obj.v_rel - v_rel) <= .5)
+
+
 def bosch_make_points(objects, v_ego=math.nan):
   """Native physical IDs and original observations; unknown fields stay NaN."""
   if not objects:
@@ -2954,13 +3173,14 @@ def bosch_make_points(objects, v_ego=math.nan):
 
 class BoschRadarProvider:
   def __init__(self, bus: int, *, qualification=True, camera_bus=1,
-               camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE):
+               camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE, p91_mode=BOSCH_P91_MODE):
     self.bus = bus
     self.camera_bus = camera_bus
     self.tracker = BoschPhysicalTracker()
     self.camera_extended = BoschCameraExtendedGrouping(camera_extended_mode)
     self.publication_aliases = BoschPublicationAliasAllocator()
     self.qualifier = _BoschStaticOffPathFilter() if qualification else None
+    self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
     self.can_error = False
     self.wrong_config = False
     self.last_scan_timestamp_ns = None
@@ -2972,6 +3192,9 @@ class BoschRadarProvider:
     self._debug_oem_word = None
     self._debug_oem_slot = None
     self._debug_oem_matches = 0
+    self._debug_processed_word = None
+    self._debug_processed_pids = frozenset()
+    self._debug_p91_ns = 0
     self._debug_timeout = False
     self._frames = []
     self._anchors = []
@@ -2988,11 +3211,18 @@ class BoschRadarProvider:
     self._reset_perf()
 
   def publication_view(self, objects, timestamp_ns=None):
-    """EXPERIMENTAL: OFF-equivalent alias 할당 이후 실제 RadarData를 축소한다.
+    # Candidate P91 ACTIVE is the Bosch research-branch production path. The
+    # independent camera-extended ACTIVE_TEST path below remains experimental.
+    """Apply Bosch-only final-publication filters after alias allocation.
 
-    감독하 테스트카 로그 수집 전용이며 longitudinal engagement는 NO-GO다.
-    이 provider 입력에는 신뢰 가능한 engagement 상태가 없다.
+    P91 ACTIVE is enabled for this Bosch research branch. Camera-extended
+    ACTIVE_TEST remains supervised-test-only and independently gated.
     """
+    p91_suppressed = (self.p91.would_suppress if self.p91.mode == BOSCH_P91_ACTIVE and
+                      objects and all(obj.timestamp_ns == self.p91.last_ns for obj in objects) else frozenset())
+    if p91_suppressed:
+      self.p91.publication_suppressed += len(p91_suppressed)
+      objects = tuple(obj for obj in objects if obj.physical_track_id not in p91_suppressed)
     ext = self.camera_extended
     if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
       return objects
@@ -3046,6 +3276,7 @@ class BoschRadarProvider:
     self._perf_components = self._perf_largest_component = self._perf_fallbacks = self._perf_conflicts = 0
     self._perf_ties = 0
     self._perf_camera_decode_count = self._perf_camera_decode_sum = self._perf_camera_decode_max = 0
+    self._perf_p91_sum = self._perf_p91_max = 0
 
   def record_native_time(self, elapsed_ns):
     self._perf_native_count += 1
@@ -3090,6 +3321,11 @@ class BoschRadarProvider:
       f' camera_ext_mode={self.camera_extended.mode} camera_ext_test_publications={self.test_publications}'
       f' camera_ext_suppressed_points={self.test_suppressed_points} camera_ext_active_group_publications={self.test_active_groups}'
       f' camera_ext_active_groups={self.test_last_active_groups} camera_ext_suppressed_pid_count={len(self.test_last_suppressed)}'
+      f' p91_mode={self.p91.mode} p91_parent_pool={self.p91.parent_pool_last}/{self.p91.parent_pool_peak}'
+      f' p91_pairs={self.p91.pair_evaluations_last}/{self.p91.pair_evaluations_peak}'
+      f' p91_states={len(self.p91._states)}/{self.p91.state_peak}'
+      f' p91_would_suppress={len(self.p91.would_suppress)} p91_publication_suppressed={self.p91.publication_suppressed}'
+      f' p91_ms_avg={self._perf_p91_sum * scale:.3f} p91_ms_max={self._perf_p91_max * 1e-6:.3f}'
     )
     self._reset_perf()
     return message
@@ -3114,6 +3350,11 @@ class BoschRadarProvider:
       'can_error': self.can_error, 'wrong_config': self.wrong_config,
       'oem_word': self._debug_oem_word, 'oem_selected_slot': self._debug_oem_slot,
       'oem_match_count': self._debug_oem_matches, 'slot_to_ids': self.slot_to_ids,
+      'processed_target_word': self._debug_processed_word,
+      'processed_target_pids': sorted(self._debug_processed_pids),
+      'p91_mode': self.p91.mode, 'p91_would_suppress': sorted(self.p91.would_suppress),
+      'p91_decisions': self.p91.decisions,
+      'p91_elapsed_ns': self._debug_p91_ns,
       'objects': [{'physicalTrackId': obj.physical_track_id,
                    'rawTrackIds': [member.raw_track_id for member in obj.members],
                    'slots': list(obj.member_slots),
@@ -3230,6 +3471,7 @@ class BoschRadarProvider:
       self.can_error = True
       self._debug_objects = ()
       self._debug_timeout = True
+      self.p91.update((), now_ns, v_ego, yaw_rate=yaw_rate_left)
       self._perf_raw = self._perf_qualified = 0
       self._last_output_ns = now_ns
       return ()
@@ -3272,6 +3514,7 @@ class BoschRadarProvider:
       detections = fresh
     oem = bucket.get(0x601)
     oem_word = int.from_bytes(oem.payload[4:8], 'little') if oem else None
+    processed_word = int.from_bytes(oem.payload[0:4], 'little') if oem else None
     matches = [detection.slot for detection in detections if oem_word == detection.raw_word]
     oem_slot = matches[0] if matches else None
     objects = self.tracker.update(availability_ns, detections, yaw_rate=yaw_rate_left,
@@ -3287,13 +3530,22 @@ class BoschRadarProvider:
     self._debug_oem_word = oem_word
     self._debug_oem_slot = oem_slot
     self._debug_oem_matches = len(matches)
+    self._debug_processed_word = processed_word
     self._debug_timeout = False
     self.camera_extended.update(availability_ns, objects, v_ego, yaw_rate_left)
     qualify_start_ns = time.perf_counter_ns()
     # 모든 모드에서 qualifier 이력과 alias 할당에는 동일한 physical 집합을 전달한다.
-    # ACTIVE_TEST 필터는 allocator 이후 최종 publication에만 적용한다.
+    # P91 ACTIVE veto는 allocator 이후 최종 publication에만 적용한다.
     qualified = (self.qualifier.update(objects, availability_ns, v_ego, path, yaw_rate=yaw_rate_left)
                  if self.qualifier is not None else objects)
+    processed_pids = _bosch_match_processed_target_word(qualified, processed_word)
+    self._debug_processed_pids = processed_pids
+    p91_start_ns = time.perf_counter_ns()
+    self.p91.update(qualified, availability_ns, v_ego, word0_pids=processed_pids, yaw_rate=yaw_rate_left)
+    p91_ns = time.perf_counter_ns() - p91_start_ns
+    self._debug_p91_ns = p91_ns
+    self._perf_p91_sum += p91_ns
+    self._perf_p91_max = max(self._perf_p91_max, p91_ns)
     done_ns = time.perf_counter_ns()
     qualify_ns, total_ns = done_ns - qualify_start_ns, done_ns - start_ns
     raw, physical = self.tracker.raw_manager, self.tracker.group_manager
