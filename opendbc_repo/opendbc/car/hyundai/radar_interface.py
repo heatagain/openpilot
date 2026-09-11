@@ -778,7 +778,13 @@ class BoschCameraExtendedGrouping:
         def cost(obj):
           return (abs(obj.d_rel - median), False, not obj.vision_supported,
                   not obj.oem_selected, -obj.age_scans, obj.physical_track_id)
-      rep = min(members, key=cost)
+      # publication_view hides every member of a mature group except this one,
+      # so this choice decides which surface of one vehicle downstream keeps.
+      # Every pair inside a group passed 3.0 < dd <= 12.0, so range order is
+      # unambiguous by at least 3 m and cannot chatter on measurement noise.
+      # Prefer the member the OEM selected; otherwise the nearest, because
+      # hiding the nearest surface of a vehicle overstates the lead range.
+      rep = min(members, key=lambda obj: (not obj.oem_selected, obj.d_rel, cost(obj)))
       if prior is not None and rep.physical_track_id != prior.representative_pid:
         self.representative_switches += 1
         self.max_representative_jump[0] = max(self.max_representative_jump[0], abs(rep.d_rel - px))

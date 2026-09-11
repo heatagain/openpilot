@@ -260,14 +260,31 @@ class TestBoschCameraPublicationSafety:
     assert (data.points[1].yRel, data.points[1].vRel) == (near.y_rel, near.v_rel)
     assert data.points[0].dRel == pytest.approx(16.27, abs=1e-6)
 
-  def test_original_continuity_can_keep_farther_previous_representative(self):
+  def test_a_nearer_member_takes_the_representative_from_a_farther_one(self):
+    # publication_view hides every other member of a mature group, so the
+    # nearest surface of the vehicle is the one downstream has to keep. A
+    # nearer member joining the group takes the representative even though
+    # continuity would have held the previous farther one.
     overlay = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
     first = (physical(1_000_001, 16.25), physical(1_000_003, 20.))
     assert self.group(overlay, first, 1_000_000_000) is first
     assert overlay.representatives[0].representative_pid == first[0].physical_track_id
     current = (physical(1_000_001, 16.25, ns=1_100_000_000), physical(1_000_002, 13., ns=1_100_000_000))
     assert self.group(overlay, current, 1_100_000_000) is current
-    assert overlay.representatives[0].representative_pid == current[0].physical_track_id
+    assert overlay.representatives[0].representative_pid == current[1].physical_track_id
+    assert overlay.representative_switches == 1
+
+  def test_range_order_inside_a_group_cannot_chatter(self):
+    # Every pair in a group passed 3.0 < dd <= 12.0, so the members are at
+    # least 3 m apart and quantisation cannot reorder them. Walk a rigid pair
+    # through a closing approach and confirm the representative never moves.
+    overlay = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    for i in range(30):
+      ns = 1_000_000_000 + i * 100_000_000
+      near = physical(1_000_002, 30. - .25 * i, .0625 * (i % 3), -2.5, ns)
+      far = physical(1_000_001, 36.5 - .25 * i, -.0625 * (i % 2), -2.5, ns)
+      assert self.group(overlay, (far, near), ns) == (far, near)
+      assert overlay.representatives[0].representative_pid == near.physical_track_id
     assert overlay.representative_switches == 0
 
   def test_reordered_members_do_not_chatter(self):
