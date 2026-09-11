@@ -363,6 +363,17 @@ BOSCH_CAMERA_EXTENDED_ACTIVE_TEST = 3
 # 감독하 테스트카 로그 수집에만 사용하며 longitudinal control engagement는 승인되지 않았다.
 # 원복은 아래 MODE 한 줄을 OFF 또는 SHADOW로 변경하고 card를 재시작한다.
 BOSCH_CAMERA_EXTENDED_TEST_INTERVALS = 2
+# A scan that keeps an extended group alive through the E2 coast but has no
+# strict camera edge used to throw the accumulated maturity away, so a single
+# missing camera confirmation restarted the two-interval warm-up. Hold it while
+# the member motion still tracks the prediction, bounded by the last strict
+# confirmation. A coasting group still may not collapse publication: the camera
+# has not re-confirmed the pair this scan, so both contacts stay published.
+BOSCH_CAMERA_MATURITY_HOLD_NS = 200_000_000
+# The OEM selected the same member of this exact set on the previous scan too,
+# which is independent evidence that the set is one vehicle. Shorten the
+# interval requirement for that case only; the geometry checks are unchanged.
+BOSCH_CAMERA_MATURITY_WORD1_INTERVALS = 1
 BOSCH_CAMERA_EXTENDED_MODE = BOSCH_CAMERA_EXTENDED_ACTIVE_TEST
 BOSCH_CAMERA_HEADER = 0x738
 BOSCH_CAMERA_FIRST_OBJECT = 0x739
@@ -383,7 +394,7 @@ BOSCH_CAMERA_ASSOC_AMBIGUOUS = 2
 # 아래의 독립적인 폭/rigid-pair 증거를 모두 만족할 때만 대형차 P2를 보조하며,
 # 기존 class-1 경로는 별도 분기로 그대로 유지한다.
 BOSCH_TRUCK_P2_CLASS = 6
-BOSCH_TRUCK_P2_CONFIRMATIONS = 10
+BOSCH_TRUCK_P2_CONFIRMATIONS = 5
 BOSCH_TRUCK_P2_STATE_MAX = 16
 BOSCH_TRUCK_P2_WIDTH_MIN_M = 2.40
 BOSCH_TRUCK_P2_DD_MIN_M = 5.50
@@ -602,6 +613,8 @@ class _BoschExtendedHistory:
   stable_intervals: int = 0
   sample_ns: int = 0
   observations: tuple[tuple[float, float, float], ...] = ()
+  # physical ID the OEM word1 selected inside this member set, or -1.
+  oem_anchor: int = -1
 
 
 @dataclass(slots=True)
@@ -797,7 +810,8 @@ class BoschCameraExtendedGrouping:
     self.representatives = new_states
     return representatives
 
-  def _maturity(self, members, episode, class_code, timestamp_ns, by_pid, yaw_rate):
+  def _maturity(self, members, episode, class_code, timestamp_ns, by_pid, yaw_rate,
+                *, confirmed=True, confirm_ns=None):
     # 연구 M2 정의 그대로: 첫 confirmed scan은 0, 두 이전 안정 간격 후 2.
     # camera ID/episode만으로 연속성을 인정하지 않고 모든 member의 d/y/v를 확인한다.
     prior = self.histories.get(members)
@@ -815,9 +829,21 @@ class BoschCameraExtendedGrouping:
                   abs(obj.v_rel - v) <= .25 + 5 * dt):
             break
         else:
-          age = min(prior.stable_intervals + 1, BOSCH_CAMERA_EXTENDED_TEST_INTERVALS)
-    return _BoschExtendedHistory(members, episode, class_code, timestamp_ns, age, timestamp_ns,
-                                 tuple((by_pid[p].d_rel, by_pid[p].y_rel, by_pid[p].v_rel) for p in members))
+          # confirmed=False is a coast: this scan has no strict camera edge. The
+          # same motion-continuity test above is still required; only the
+          # accumulated interval survives instead of being discarded.
+          age = (min(prior.stable_intervals + 1, BOSCH_CAMERA_EXTENDED_TEST_INTERVALS)
+                 if confirmed else prior.stable_intervals)
+    anchor = -1
+    for pid in members:
+      if by_pid[pid].oem_selected:
+        anchor = pid
+        break
+    return _BoschExtendedHistory(members, episode, class_code,
+                                 timestamp_ns if confirm_ns is None else confirm_ns,
+                                 age, timestamp_ns,
+                                 tuple((by_pid[p].d_rel, by_pid[p].y_rel, by_pid[p].v_rel) for p in members),
+                                 anchor)
 
   @staticmethod
   def _truck_pair_continuous(prior, timestamp_ns, dd, dy, dv, camera):
@@ -1073,19 +1099,33 @@ class BoschCameraExtendedGrouping:
         if self.mode == BOSCH_CAMERA_EXTENDED_ACTIVE_TEST and fresh:
           state = self._maturity(members, episode, class_code, timestamp_ns, by_pid, yaw_rate)
           next_history[members] = state
-          if state.stable_intervals >= BOSCH_CAMERA_EXTENDED_TEST_INTERVALS:
+          prior = self.histories.get(members)
+          required = BOSCH_CAMERA_EXTENDED_TEST_INTERVALS
+          if prior is not None and state.oem_anchor >= 0 and prior.oem_anchor == state.oem_anchor:
+            required = BOSCH_CAMERA_MATURITY_WORD1_INTERVALS
+          if state.stable_intervals >= required:
             mature.append(members)
-            prior = self.histories.get(members)
-            if prior is None or prior.stable_intervals < BOSCH_CAMERA_EXTENDED_TEST_INTERVALS:
+            if prior is None or prior.stable_intervals < required:
               self.test_maturity_reached += 1
         else:
           next_history[members] = _BoschExtendedHistory(members, episode, class_code, timestamp_ns)
       elif members not in next_history:
         raise AssertionError('E2 coast created an unconfirmed extended member set')
       else:
-        # E2 association은 유지해도 strict P2 없는 coast의 maturity는 즉시 폐기한다.
+        # E2 association은 유지되지만 이 scan에 strict edge가 없는 coast다. 마지막
+        # strict 확인 이후 bounded window 안이고 모든 member의 운동 연속성이 계속
+        # 성립하면 누적 interval을 보존한다. coast 중에는 mature에 넣지 않으므로
+        # publication은 축소되지 않는다(camera 재확인 전에는 두 contact 유지).
         state = next_history[members]
-        next_history[members] = _BoschExtendedHistory(members, state.cam_key, state.class_code, state.last_confirm_ns)
+        if (self.mode == BOSCH_CAMERA_EXTENDED_ACTIVE_TEST and state.observations and
+            state.stable_intervals > 0 and
+            timestamp_ns - state.last_confirm_ns <= BOSCH_CAMERA_MATURITY_HOLD_NS):
+          next_history[members] = self._maturity(
+            members, state.cam_key, state.class_code, timestamp_ns, by_pid, yaw_rate,
+            confirmed=False, confirm_ns=state.last_confirm_ns)
+        else:
+          next_history[members] = _BoschExtendedHistory(members, state.cam_key, state.class_code,
+                                                        state.last_confirm_ns)
     self.last_maturity_resets = sum(bool(old.observations) and
       (key not in next_history or not next_history[key].observations or next_history[key].stable_intervals == 0)
       for key, old in prior_maturity.items())

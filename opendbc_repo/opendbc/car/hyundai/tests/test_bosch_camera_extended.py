@@ -14,6 +14,7 @@ from opendbc.car.hyundai.radar_interface import (
   BOSCH_CAMERA_EXTENDED_SHADOW,
   BOSCH_CAMERA_HEADER,
   BOSCH_TRUCK_A0_RECOVERY_HOLD_SCANS,
+  BOSCH_TRUCK_P2_CONFIRMATIONS,
   BoschCameraCycleCache,
   BoschCameraExtendedGrouping,
   BoschCameraObject,
@@ -449,6 +450,70 @@ class TestBoschActiveTestPublication:
     if mode == BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
       assert p.camera_extended.histories[(1_000_001, 1_000_002)].stable_intervals == 2
 
+  def test_coast_holds_maturity_but_never_collapses_publication(self):
+    # A scan that keeps the group through the E2 coast has no strict camera
+    # edge, so it must not suppress. The accumulated maturity survives, so the
+    # next confirmed scan is mature again instead of restarting the warm-up.
+    p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)
+    members = (1_000_001, 1_000_002)
+    for i in range(3):
+      _, view = self.scan(p, 1_000_000_000 + i * 100_000_000)
+    assert len(view) == 1 and p.camera_extended.histories[members].stable_intervals == 2
+    ns = 1_300_000_000
+    objects = (physical(1_000_001, 15., ns=ns), physical(1_000_002, 19., ns=ns))
+    coast = {1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1),
+             1_000_002: (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1)}
+    _, view = self.scan(p, ns, objects, coast)
+    assert view is objects                                   # coast publishes both
+    assert p.camera_extended.histories[members].stable_intervals == 2   # but keeps maturity
+    _, view = self.scan(p, 1_400_000_000)
+    assert len(view) == 1                                    # confirmed again, immediately mature
+
+  def test_coast_beyond_the_hold_window_discards_maturity(self):
+    p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)
+    members = (1_000_001, 1_000_002)
+    for i in range(3):
+      self.scan(p, 1_000_000_000 + i * 100_000_000)
+    coast = {1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1),
+             1_000_002: (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1)}
+    ns = 1_200_000_000
+    for _ in range(3):                                       # 300 ms of coasting
+      ns += 100_000_000
+      objects = (physical(1_000_001, 15., ns=ns), physical(1_000_002, 19., ns=ns))
+      _, view = self.scan(p, ns, objects, coast)
+      assert view is objects
+    # past BOSCH_CAMERA_E2_HOLD_NS the coast drops the set, so the maturity is
+    # gone either way: absent, or present with nothing accumulated.
+    held = p.camera_extended.histories.get(members)
+    assert held is None or held.stable_intervals == 0
+
+  def test_a_stable_word1_anchor_matures_in_one_interval(self):
+    # The OEM selected the same member of this exact set on the previous scan,
+    # so one stable interval is enough. Without that the requirement stays two.
+    p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)
+    anchored = lambda ns: (replace(physical(1_000_001, 15., ns=ns), oem_selected=True),
+                           physical(1_000_002, 19., ns=ns))
+    _, view = self.scan(p, 1_000_000_000, anchored(1_000_000_000))
+    assert view is not None and len(view) == 2
+    _, view = self.scan(p, 1_100_000_000, anchored(1_100_000_000))
+    assert len(view) == 1
+    assert p.camera_extended.histories[(1_000_001, 1_000_002)].oem_anchor == 1_000_001
+
+  def test_a_moving_word1_anchor_still_needs_two_intervals(self):
+    p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)
+    first = (replace(physical(1_000_001, 15.), oem_selected=True), physical(1_000_002, 19.))
+    _, view = self.scan(p, 1_000_000_000, first)
+    assert len(view) == 2
+    ns = 1_100_000_000
+    moved = (physical(1_000_001, 15., ns=ns),
+             replace(physical(1_000_002, 19., ns=ns), oem_selected=True))
+    _, view = self.scan(p, ns, moved)
+    assert len(view) == 2                                    # anchor changed: no acceleration
+    _, view = self.scan(p, 1_200_000_000, (
+      physical(1_000_001, 15., ns=1_200_000_000),
+      replace(physical(1_000_002, 19., ns=1_200_000_000), oem_selected=True)))
+    assert len(view) == 1
+
   @pytest.mark.parametrize('failure', ('tuple', 'missing', 'p2', 'ambiguous', 'class', 'episode',
                                       'g0', 'conflict', 'stale_member', 'stale_camera', 'future_camera',
                                       'motion_jump', 'gap', 'duplicate_ns'))
@@ -493,8 +558,15 @@ class TestBoschActiveTestPublication:
     ext.update(ns, objects, 10.)
     assert p.publication_view(objects) is objects
     assert not ext.mature_groups
-    assert ext.last_maturity_resets == 1
-    assert all(s.stable_intervals == 0 for s in ext.histories.values())
+    if failure == 'p2':
+      # A missing strict edge with the set otherwise intact is a coast, not a
+      # failure: inside BOSCH_CAMERA_MATURITY_HOLD_NS the accumulated maturity
+      # is held. Publication still opens, which is what this test guards.
+      assert ext.last_maturity_resets == 0
+      assert ext.histories[(1_000_001, 1_000_002)].stable_intervals == 2
+    else:
+      assert ext.last_maturity_resets == 1
+      assert all(s.stable_intervals == 0 for s in ext.histories.values())
 
   def test_missing_qualified_representative_or_member_is_fail_open(self):
     p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)
@@ -602,20 +674,21 @@ class TestBoschTruckAwareP2:
 
   def test_same_episode_class6_and_current_g0_still_require_history(self):
     grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
-    for i in range(9):
+    for i in range(BOSCH_TRUCK_P2_CONFIRMATIONS - 1):
       ns = 1_000_000_000 + i * 100_000_000
       self.statuses(grouping, ns, self.assigned())
       grouping.update(ns, self.objects(ns), 10.)
       assert grouping.last_groups == ()
 
-  def test_stable_large_vehicle_opens_only_on_tenth_confirmation(self):
+  def test_stable_large_vehicle_opens_only_on_the_confirmation_threshold(self):
     grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
-    for i in range(10):
+    for i in range(BOSCH_TRUCK_P2_CONFIRMATIONS):
       ns = 1_000_000_000 + i * 100_000_000
       self.statuses(grouping, ns, self.assigned())
       grouping.update(ns, self.objects(ns), 10.)
+      assert bool(grouping.last_groups) is (i == BOSCH_TRUCK_P2_CONFIRMATIONS - 1)
     assert grouping.last_groups == (self.IDS,)
-    assert grouping.truck_pair_histories[self.IDS].confirmations == 10
+    assert grouping.truck_pair_histories[self.IDS].confirmations == BOSCH_TRUCK_P2_CONFIRMATIONS
 
   @pytest.mark.parametrize(('reset', 'kwargs'), (
     ('episode', {'episode': 187}),
@@ -627,7 +700,7 @@ class TestBoschTruckAwareP2:
   ))
   def test_camera_identity_or_motion_discontinuity_resets(self, reset, kwargs):
     grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
-    for i in range(9):
+    for i in range(BOSCH_TRUCK_P2_CONFIRMATIONS - 1):
       ns = 1_000_000_000 + i * 100_000_000
       self.statuses(grouping, ns, self.assigned())
       grouping.update(ns, self.objects(ns), 10.)
@@ -645,7 +718,7 @@ class TestBoschTruckAwareP2:
   ))
   def test_radar_geometry_discontinuity_resets(self, name, objects):
     grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
-    for i in range(9):
+    for i in range(BOSCH_TRUCK_P2_CONFIRMATIONS - 1):
       ns = 1_000_000_000 + i * 100_000_000
       self.statuses(grouping, ns, self.assigned())
       grouping.update(ns, self.objects(ns, far_d=28.), 10.)
@@ -657,7 +730,7 @@ class TestBoschTruckAwareP2:
 
   def test_member_pid_change_starts_a_new_pair_at_one(self):
     grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
-    for i in range(9):
+    for i in range(BOSCH_TRUCK_P2_CONFIRMATIONS - 1):
       ns = 1_000_000_000 + i * 100_000_000
       self.statuses(grouping, ns, self.assigned())
       grouping.update(ns, self.objects(ns), 10.)
@@ -671,7 +744,7 @@ class TestBoschTruckAwareP2:
   @pytest.mark.parametrize('failure', ('stale', 'ambiguous', 'class_change'))
   def test_stale_ambiguity_or_class_change_clears_pair_state(self, failure):
     grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
-    for i in range(9):
+    for i in range(BOSCH_TRUCK_P2_CONFIRMATIONS - 1):
       ns = 1_000_000_000 + i * 100_000_000
       self.statuses(grouping, ns, self.assigned())
       grouping.update(ns, self.objects(ns), 10.)
@@ -742,7 +815,7 @@ class TestBoschTruckAwareP2:
   ))
   def test_absolute_truck_gate_boundaries(self, field, value, accepted):
     grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
-    for i in range(10):
+    for i in range(BOSCH_TRUCK_P2_CONFIRMATIONS):
       ns = 1_000_000_000 + i * 100_000_000
       width = value if field == 'width' else 2.45
       far_d = 20. + value if field == 'dd' else 28.
@@ -801,7 +874,7 @@ class TestBoschLargeVehicleA0Recovery:
 
   @classmethod
   def seed(cls, grouping):
-    for i in range(10):
+    for i in range(BOSCH_TRUCK_P2_CONFIRMATIONS):
       ns = 1_000_000_000 + i * 100_000_000
       cls.configure(grouping, ns, cls.assigned())
       grouping.update(ns, cls.objects(ns), 10.)
@@ -962,13 +1035,13 @@ class TestBoschLargeVehicleA0Recovery:
     grouping.update(ns, self.objects(ns), 10.)
     assert grouping.last_groups == (self.IDS,) and grouping.truck_pair_histories == {}
 
-  def test_existing_truck_n10_is_exact_without_recovery(self):
+  def test_existing_truck_seed_is_exact_without_recovery(self):
     grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
-    for i in range(10):
+    for i in range(BOSCH_TRUCK_P2_CONFIRMATIONS):
       ns = 1_000_000_000 + i * 100_000_000
       self.configure(grouping, ns, self.assigned())
       grouping.update(ns, self.objects(ns), 10.)
-      assert bool(grouping.last_groups) is (i == 9)
+      assert bool(grouping.last_groups) is (i == BOSCH_TRUCK_P2_CONFIRMATIONS - 1)
       assert grouping.last_truck_recovery_count == 0
 
   def test_recovery_state_is_bounded_and_cleans_up(self):
