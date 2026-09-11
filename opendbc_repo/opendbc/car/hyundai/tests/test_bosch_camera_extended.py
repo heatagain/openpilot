@@ -1193,3 +1193,116 @@ class TestBoschCompanionDeferral:
       assert view is objects
     finally:
       module.BOSCH_COMPANION_DEFER_MODE = original
+
+
+class TestBoschOemNearerPublication:
+  """Publication-stage range correction.
+
+  A physical object publishes its representative member's range, and the
+  representative is held by continuity, so a farther member can keep the role
+  for the life of the object. When the OEM's own word1 target is a member of
+  that object and is nearer, the published coordinates move to it. The
+  correction is the last step of publication_view and its result goes straight
+  to RadarData, so nothing inside the provider can be affected by it.
+  """
+  SCAN_NS = 1_000_000_000
+
+  @staticmethod
+  def member(raw_track_id, slot, d_rel, y_rel=0., v_rel=0., ns=SCAN_NS):
+    detection = BoschRawDetection(ns, slot, float(d_rel), float(y_rel), float(v_rel), 1)
+    return BoschRawTrack(raw_track_id, detection, 4)
+
+  @classmethod
+  def grouped(cls, pid, members, *, representative, ns=SCAN_NS, oem_selected=True):
+    rep = next(m for m in members if m.raw_track_id == representative)
+    return BoschPhysicalObject(pid, ns, tuple(members), rep.raw_track_id, rep.d_rel, rep.y_rel,
+                               rep.v_rel, oem_selected, False, 40, 'temporal_complete_link')
+
+  @classmethod
+  def provider(cls, oem_slot=4, scan_ns=SCAN_NS):
+    provider = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_OFF)
+    provider.last_oem_slot = oem_slot
+    provider.last_scan_timestamp_ns = scan_ns
+    return provider
+
+  @classmethod
+  def standstill_object(cls, pid=1_000_001, ns=SCAN_NS):
+    # the Route259 shape: OEM word1 on slot 4 at 3.0 m, representative at 6.0 m
+    return cls.grouped(pid, (cls.member(877, 4, 3.0, .25, ns=ns),
+                             cls.member(1024, 17, 4.75, .3, ns=ns),
+                             cls.member(943, 2, 6.0, .31, ns=ns)), representative=943, ns=ns)
+
+  def test_publishes_the_oem_member_when_it_is_nearer(self):
+    provider = self.provider()
+    obj = self.standstill_object()
+    view = provider.publication_view((obj,), self.SCAN_NS)
+    assert len(view) == 1
+    assert view[0].d_rel == 3.0 and view[0].y_rel == .25
+    assert view[0].representative_raw_track_id == 877
+    assert view[0].physical_track_id == obj.physical_track_id
+    assert provider.oem_nearer_corrections == 1
+    assert provider.last_oem_nearer == (obj.physical_track_id,)
+
+  def test_never_moves_a_contact_farther(self):
+    provider = self.provider(oem_slot=2)          # word1 now on the far member
+    obj = self.standstill_object()
+    view = provider.publication_view((obj,), self.SCAN_NS)
+    assert view is (obj,) or view[0].d_rel == obj.d_rel
+    assert provider.oem_nearer_corrections == 0
+
+  def test_leaves_the_physical_object_and_its_members_untouched(self):
+    provider = self.provider()
+    obj = self.standstill_object()
+    view = provider.publication_view((obj,), self.SCAN_NS)
+    assert obj.d_rel == 6.0                        # the tracker's object is unchanged
+    assert view[0].members is obj.members          # membership is never rewritten
+    assert {m.raw_track_id for m in view[0].members} == {877, 1024, 943}
+
+  @pytest.mark.parametrize(('kwargs', 'reason'), (
+    ({'oem_slot': None}, 'no OEM target this scan'),
+    ({'oem_slot': 9}, 'OEM target is not a member of this object'),
+  ))
+  def test_untouched_without_an_owned_oem_member(self, kwargs, reason):
+    provider = self.provider(**kwargs)
+    objects = (self.standstill_object(),)
+    assert provider.publication_view(objects, self.SCAN_NS) is objects, reason
+
+  def test_single_member_object_is_untouched(self):
+    provider = self.provider()
+    objects = (self.grouped(1_000_002, (self.member(877, 4, 3.0),), representative=877),)
+    assert provider.publication_view(objects, self.SCAN_NS) is objects
+
+  def test_stale_object_is_untouched(self):
+    provider = self.provider(scan_ns=self.SCAN_NS + 100_000_000)
+    objects = (self.standstill_object(),)
+    assert provider.publication_view(objects, self.SCAN_NS) is objects
+
+  def test_correction_is_bounded_by_the_objects_own_members(self):
+    provider = self.provider()
+    obj = self.standstill_object()
+    view = provider.publication_view((obj,), self.SCAN_NS)
+    assert view[0].d_rel >= min(m.d_rel for m in obj.members)
+    assert view[0].d_rel <= obj.d_rel
+
+  def test_off_mode_is_exact_identity(self):
+    import opendbc.car.hyundai.radar_interface as module
+    provider = self.provider()
+    original = module.BOSCH_OEM_NEARER_PUBLICATION_MODE
+    module.BOSCH_OEM_NEARER_PUBLICATION_MODE = module.BOSCH_OEM_NEARER_PUBLICATION_OFF
+    try:
+      objects = (self.standstill_object(),)
+      assert provider.publication_view(objects, self.SCAN_NS) is objects
+    finally:
+      module.BOSCH_OEM_NEARER_PUBLICATION_MODE = original
+
+  def test_two_vehicles_are_never_mixed(self):
+    # A separate object at the OEM slot's range must not pull the other one in:
+    # the correction only ever reads members of the object it is correcting.
+    provider = self.provider()
+    lead = self.standstill_object(1_000_001)
+    other = self.grouped(1_000_002, (self.member(500, 11, 12.0), self.member(501, 12, 14.0)),
+                         representative=501, oem_selected=False)
+    view = provider.publication_view((lead, other), self.SCAN_NS)
+    corrected = {obj.physical_track_id: obj for obj in view}
+    assert corrected[1_000_001].d_rel == 3.0
+    assert corrected[1_000_002].d_rel == 14.0    # untouched: slot 4 is not its member

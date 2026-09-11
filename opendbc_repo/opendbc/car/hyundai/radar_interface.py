@@ -424,6 +424,15 @@ BOSCH_COMPANION_DEFER_DV_MAX_MPS = 1.0
 BOSCH_COMPANION_DEFER_Y_MAX_M = 2.5
 # 좁은 camera object는 여러 m 떨어진 두 return을 가질 수 없다.
 BOSCH_COMPANION_DEFER_WIDTH_DD_M = ((2.00, 5.0), (2.30, 7.0))
+# 물리 객체는 대표 member의 거리를 발행한다. 대표는 연속성을 첫 키로 고르므로 한 번
+# 더 먼 member가 대표가 되면 객체가 사는 동안 유지되고, 정차한 앞차를 자기 최근접
+# 표면보다 1~3 m 뒤로 발행한다(cluster 지름 상한 3.0 m). 같은 scan에서 OEM이 자기
+# 제어 대상으로 고른 0x601 word1 slot이 그 객체의 member이고 대표보다 가까우면, 발행
+# 좌표만 그 member로 바꾼다. publication_view의 마지막 단계이므로 tracker/grouping/
+# qualifier/P91/OEM gate는 전혀 영향받지 않고, 발행 거리는 가까워지는 방향으로만 바뀐다.
+BOSCH_OEM_NEARER_PUBLICATION_OFF = 0
+BOSCH_OEM_NEARER_PUBLICATION_ACTIVE = 1
+BOSCH_OEM_NEARER_PUBLICATION_MODE = BOSCH_OEM_NEARER_PUBLICATION_ACTIVE
 
 
 def _bosch_camera_signed(value, bits):
@@ -3581,6 +3590,10 @@ class BoschRadarProvider:
     self._companion_ns = None
     self._companion_prev_ns = None
     self._companion_hidden = {}
+    self.last_oem_slot = None
+    self.oem_nearer_corrections = 0
+    self.oem_nearer_scans = 0
+    self.last_oem_nearer = ()
     self._reset_perf()
 
   def _companion_pairs_update(self, objects):
@@ -3646,6 +3659,45 @@ class BoschRadarProvider:
     self.companion_pairs = next_pairs
     return hidden
 
+  def _oem_nearer_view(self, objects):
+    """같은 scan의 OEM word1 member가 대표보다 가까우면 발행 좌표를 그 member로 바꾼다.
+
+    `publication_view`의 마지막 단계에서만 동작하고 반환 tuple은 곧바로 RadarData가
+    되므로 provider 내부 상태에 되먹임이 없다. 거리는 가까워지는 방향으로만 바뀐다.
+    """
+    if (BOSCH_OEM_NEARER_PUBLICATION_MODE != BOSCH_OEM_NEARER_PUBLICATION_ACTIVE or
+        not objects or self.last_oem_slot is None or self.last_scan_timestamp_ns is None):
+      self.last_oem_nearer = ()
+      return objects
+    slot = self.last_oem_slot
+    scan_ns = self.last_scan_timestamp_ns
+    corrected = None
+    moved = []
+    for index, obj in enumerate(objects):
+      if len(obj.members) < 2 or obj.timestamp_ns != scan_ns:
+        continue
+      owned = next((m for m in obj.members if m.slot == slot), None)
+      if owned is None or owned.d_rel >= obj.d_rel:
+        continue
+      if corrected is None:
+        corrected = list(objects)
+      # Rebuild explicitly: everything except the published coordinates and the
+      # representative id is carried over untouched.
+      corrected[index] = BoschPhysicalObject(
+        obj.physical_track_id, obj.timestamp_ns, obj.members, owned.raw_track_id,
+        owned.d_rel, owned.y_rel, owned.v_rel, obj.oem_selected, obj.vision_supported,
+        obj.age_scans, obj.grouping_evidence)
+      moved.append(obj.physical_track_id)
+    self.last_oem_nearer = tuple(moved)
+    if corrected is None:
+      return objects
+    self.oem_nearer_corrections += len(moved)
+    self.oem_nearer_scans += 1
+    return tuple(corrected)
+
+  def _final_view(self, objects):
+    return self._oem_nearer_view(self._companion_view(objects))
+
   def _companion_view(self, objects):
     """OEM anchor가 확인한 same-vehicle pair에서 더 먼 표면을 발행에서 미룬다."""
     ext = self.camera_extended
@@ -3691,13 +3743,13 @@ class BoschRadarProvider:
       objects = tuple(obj for obj in objects if obj.physical_track_id not in withheld)
     ext = self.camera_extended
     if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
-      return self._companion_view(objects)
+      return self._final_view(objects)
     if timestamp_ns is not None:
       self.test_publications += 1
     if not ext.mature_groups or not objects:
       self.test_last_suppressed = ()
       self.test_last_active_groups = 0
-      return self._companion_view(objects)
+      return self._final_view(objects)
     # 다른 scan의 tuple 또는 qualification에서 대표가 빠진 그룹은 baseline으로 연다.
     by_pid = {obj.physical_track_id: obj for obj in objects}
     suppressed = set()
@@ -3728,7 +3780,7 @@ class BoschRadarProvider:
                     f'suppressed_pids={",".join(str(p) for p in members if p != rep.representative_pid)} '
                     f'suppressed_count={len(members) - 1} camera_id={camera_id} episode={state.cam_key} '
                     f'camera_ns={ext.last_camera_ns} members_pid_alias_d_y_v={detail}')
-    return self._companion_view(
+    return self._final_view(
       tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects)
 
   def _reset_perf(self):
@@ -4054,6 +4106,7 @@ class BoschRadarProvider:
     self._debug_word1_active = word1_active
     self._debug_oem_state = oem_state
     self.last_oem_state = oem_state
+    self.last_oem_slot = oem_slot
     gate_start_ns = time.perf_counter_ns()
     self.oem_gate.update(qualified, availability_ns, v_ego, state=oem_state,
                          word0_pids=processed_pids, oem_valid=scc_valid)
