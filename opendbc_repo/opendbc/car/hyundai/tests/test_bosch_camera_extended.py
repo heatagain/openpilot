@@ -25,10 +25,16 @@ from opendbc.car.hyundai.radar_interface import (
   BoschPhysicalObject,
   BoschRawDetection,
   BoschRawTrack,
+  BoschObjectGroupManager,
+  BoschPhysicalTracker,
+  BoschPublishedSurface,
   BoschRadarProvider,
   RadarInterface,
   bosch_append_points,
+  bosch_fill_point,
+  bosch_published_surface,
 )
+from opendbc.car import structs
 
 
 def signed(value, bits):
@@ -1237,8 +1243,9 @@ class TestBoschOemNearerPublication:
     obj = self.standstill_object()
     view = provider.publication_view((obj,), self.SCAN_NS)
     assert len(view) == 1
-    assert view[0].d_rel == 3.0 and view[0].y_rel == .25
-    assert view[0].representative_raw_track_id == 877
+    # the published surface moves; the continuity anchor stays where it was
+    assert bosch_published_surface(view[0]) == (877, 3.0, .25, 0.)
+    assert (view[0].d_rel, view[0].representative_raw_track_id) == (obj.d_rel, obj.representative_raw_track_id)
     assert view[0].physical_track_id == obj.physical_track_id
     assert provider.oem_nearer_corrections == 1
     assert provider.last_oem_nearer == (obj.physical_track_id,)
@@ -1247,7 +1254,7 @@ class TestBoschOemNearerPublication:
     provider = self.provider(oem_slot=2)          # word1 now on the far member
     obj = self.standstill_object()
     view = provider.publication_view((obj,), self.SCAN_NS)
-    assert view is (obj,) or view[0].d_rel == obj.d_rel
+    assert bosch_published_surface(view[0])[1] == obj.d_rel
     assert provider.oem_nearer_corrections == 0
 
   def test_leaves_the_physical_object_and_its_members_untouched(self):
@@ -1281,8 +1288,9 @@ class TestBoschOemNearerPublication:
     provider = self.provider()
     obj = self.standstill_object()
     view = provider.publication_view((obj,), self.SCAN_NS)
-    assert view[0].d_rel >= min(m.d_rel for m in obj.members)
-    assert view[0].d_rel <= obj.d_rel
+    published = bosch_published_surface(view[0])[1]
+    assert published >= min(m.d_rel for m in obj.members)
+    assert published <= obj.d_rel
 
   def test_off_mode_is_exact_identity(self):
     import opendbc.car.hyundai.radar_interface as module
@@ -1304,5 +1312,159 @@ class TestBoschOemNearerPublication:
                          representative=501, oem_selected=False)
     view = provider.publication_view((lead, other), self.SCAN_NS)
     corrected = {obj.physical_track_id: obj for obj in view}
-    assert corrected[1_000_001].d_rel == 3.0
-    assert corrected[1_000_002].d_rel == 14.0    # untouched: slot 4 is not its member
+    assert bosch_published_surface(corrected[1_000_001])[1] == 3.0
+    # untouched: slot 4 is not its member, so it still publishes its anchor
+    assert bosch_published_surface(corrected[1_000_002]) == (501, 14.0, 0., 0.)
+
+
+class TestBoschContinuityAnchorPublicationSplit:
+  """A physical object carries two roles, and they are separate fields.
+
+  CONTINUITY ANCHOR -- `d_rel`/`y_rel`/`v_rel` and `representative_raw_track_id`.
+  Internal state: the next scan projects it forward, the representative
+  continuity term scores against that projection, the physical-ID assignment
+  score rewards a cluster that still holds it, and the qualifier, P91, the OEM
+  gate and the camera grouping all keep state derived from it.
+
+  PUBLISHED SURFACE -- `published_surface`, the one member whose geometry
+  reaches RadarData. Only the last step of `publication_view` may set one, and
+  nothing inside the provider reads it, so moving it cannot change an identity.
+  """
+  SCAN_NS = 1_000_000_000
+  STEP_NS = 100_000_000
+
+  @staticmethod
+  def track(raw_track_id, slot, d_rel, y_rel=0., v_rel=0., ns=SCAN_NS):
+    return BoschRawTrack(raw_track_id, BoschRawDetection(ns, slot, float(d_rel), float(y_rel),
+                                                         float(v_rel), 1), 4)
+
+  @classmethod
+  def grouped(cls, pid, members, representative, ns=SCAN_NS, surface=None):
+    rep = next(m for m in members if m.raw_track_id == representative)
+    return BoschPhysicalObject(pid, ns, tuple(members), rep.raw_track_id, rep.d_rel, rep.y_rel,
+                               rep.v_rel, True, False, 40, 'temporal_complete_link', surface)
+
+  @classmethod
+  def suv(cls, ns=SCAN_NS):
+    # Route259 shape: OEM word1 on slot 4 at 3.0 m, continuity anchor at 6.0 m
+    return (cls.track(877, 4, 3.0, .25, -.5, ns),
+            cls.track(1024, 17, 4.75, .3, -.5, ns),
+            cls.track(943, 2, 6.0, .31, -.5, ns))
+
+  def test_without_a_surface_the_anchor_is_published(self):
+    obj = self.grouped(1_000_001, self.suv(), 943)
+    assert obj.published_surface is None
+    assert bosch_published_surface(obj) == (943, 6.0, .31, -.5)
+    point = structs.RadarData.RadarPoint()
+    bosch_fill_point(point, obj, 10.)
+    assert (point.dRel, point.vRel) == (6.0, -.5)
+    assert point.yRel == pytest.approx(.31)
+    assert point.vLead == pytest.approx(9.5)
+
+  def test_a_surface_moves_only_the_published_coordinates(self):
+    anchor = self.grouped(1_000_001, self.suv(), 943)
+    moved = replace(anchor, published_surface=BoschPublishedSurface(877, 3.0, .25, -.5))
+    assert (moved.d_rel, moved.y_rel, moved.v_rel) == (anchor.d_rel, anchor.y_rel, anchor.v_rel)
+    assert moved.representative_raw_track_id == anchor.representative_raw_track_id
+    assert moved.members is anchor.members
+    point = structs.RadarData.RadarPoint()
+    bosch_fill_point(point, moved, 10.)
+    assert point.dRel == 3.0
+    assert point.yRel == pytest.approx(.25)
+
+  def test_the_surface_is_one_whole_member(self):
+    provider = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_OFF)
+    provider.last_oem_slot, provider.last_scan_timestamp_ns = 4, self.SCAN_NS
+    members = self.suv()
+    view = provider.publication_view((self.grouped(1_000_001, members, 943),), self.SCAN_NS)
+    raw, d_rel, y_rel, v_rel = bosch_published_surface(view[0])
+    member = next(m for m in members if m.raw_track_id == raw)
+    assert (d_rel, y_rel, v_rel) == (member.d_rel, member.y_rel, member.v_rel)
+
+  def test_the_published_range_ages_on_the_surface_member(self):
+    # the two members were measured 40 ms apart; the extrapolation must use the
+    # age of the member actually being published, not the anchor's
+    members = (self.track(877, 4, 3.0, .25, -2., self.SCAN_NS),
+               self.track(943, 2, 6.0, .31, -2., self.SCAN_NS - 40_000_000))
+    obj = self.grouped(1_000_001, members, 943)
+    moved = replace(obj, published_surface=BoschPublishedSurface(877, 3.0, .25, -2.))
+    now_ns = self.SCAN_NS + 20_000_000
+    for candidate, expected in ((obj, 6.0 - 2. * .06), (moved, 3.0 - 2. * .02)):
+      data = structs.RadarData.new_message()
+      bosch_append_points(data, (candidate,), 10., now_ns)
+      assert data.points[0].dRel == pytest.approx(expected, abs=1e-4)
+
+  def test_the_tracker_never_emits_a_surface(self):
+    objects = BoschPhysicalTracker().update(self.SCAN_NS, [m.detection for m in self.suv()])
+    assert objects and all(obj.published_surface is None for obj in objects)
+
+  def test_publication_view_leaves_the_tracker_state_untouched(self):
+    provider = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_OFF,
+                                  qualification=False)
+    manager = provider.tracker.group_manager
+    objects = provider.tracker.update(self.SCAN_NS, [m.detection for m in self.suv()], oem_slot=4)
+    provider.last_oem_slot, provider.last_scan_timestamp_ns = 4, self.SCAN_NS
+    before = {pid: state.observation for pid, state in manager.states.items()}
+    provider.publication_view(objects, self.SCAN_NS)
+    assert {pid: state.observation for pid, state in manager.states.items()} == before
+    assert all(state.observation.published_surface is None for state in manager.states.values())
+
+  def test_publishing_a_nearer_surface_does_not_move_the_anchor_next_scan(self):
+    """The anchor the next scan projects is the one the tracker chose, always."""
+    provider = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_OFF,
+                                  qualification=False)
+    published, anchors = [], []
+    for step in range(4):
+      ns = self.SCAN_NS + step * self.STEP_NS
+      objects = provider.tracker.update(ns, [m.detection for m in self.suv(ns)], oem_slot=4)
+      provider.last_oem_slot, provider.last_scan_timestamp_ns = 4, ns
+      view = provider.publication_view(objects, ns)
+      published.append([bosch_published_surface(obj)[:2] for obj in view])
+      anchors.append([(obj.representative_raw_track_id, obj.d_rel) for obj in objects])
+    assert anchors[-1] == anchors[-2]
+    assert published[-1] == published[-2]
+
+  def test_a_surface_cannot_reach_the_physical_assignment(self):
+    """Same raw input, with and without a surface attached to the published
+    tuple: the manager state, IDs and statistics are identical."""
+    def run(attach):
+      manager = BoschObjectGroupManager()
+      signature = []
+      for step in range(5):
+        ns = self.SCAN_NS + step * self.STEP_NS
+        objects = manager.update(ns, self.suv(ns), oem_slot=4)
+        if attach:
+          # exactly what publication does: a copy, never the stored observation
+          [replace(obj, published_surface=BoschPublishedSurface(877, 3.0, .25, -.5))
+           for obj in objects]
+        signature.append([(obj.physical_track_id, obj.representative_raw_track_id, obj.d_rel,
+                           obj.age_scans, obj.member_slots) for obj in objects])
+      return manager, signature
+
+    plain, plain_signature = run(False)
+    surfaced, surfaced_signature = run(True)
+    assert plain_signature == surfaced_signature
+    assert dict(plain.stats) == dict(surfaced.stats)
+    assert plain.next_id == surfaced.next_id
+    assert sorted(plain.states) == sorted(surfaced.states)
+
+  def test_anchor_survives_a_nearer_member_joining(self):
+    manager = BoschObjectGroupManager()
+    anchors = []
+    for step in range(6):
+      ns = self.SCAN_NS + step * self.STEP_NS
+      members = self.suv(ns)[1:] if step < 3 else self.suv(ns)
+      objects = manager.update(ns, members, oem_slot=4)
+      anchors.append([(obj.physical_track_id, obj.representative_raw_track_id) for obj in objects])
+    # a nearer member joining the cluster does not take the anchor away from the
+    # member the continuity term already holds
+    assert all(raw != 877 for _pid, raw in anchors[-1])
+
+  def test_stale_object_state_is_released(self):
+    manager = BoschObjectGroupManager()
+    objects = manager.update(self.SCAN_NS, self.suv(), oem_slot=4)
+    pid = objects[0].physical_track_id
+    assert pid in manager.states
+    late = self.SCAN_NS + 10 * self.STEP_NS
+    manager.update(late, (self.track(4242, 30, 80.0, 0., 0., late),))
+    assert pid not in manager.states

@@ -2116,6 +2116,32 @@ class BoschVisionCue:
 
 
 @dataclass(frozen=True)
+class BoschPublishedSurface:
+  """The one member whose geometry downstream receives for a physical object.
+
+  A physical object carries two roles that used to share one set of fields.
+
+  CONTINUITY ANCHOR -- `d_rel`/`y_rel`/`v_rel` and `representative_raw_track_id`
+  on `BoschPhysicalObject`. Internal state: the next scan projects it forward,
+  the representative-continuity term scores against that projection, and the
+  physical-ID assignment score rewards a cluster that still holds it. Changing
+  it changes which physical ID a cluster inherits.
+
+  PUBLISHED SURFACE -- what the car is asked to follow longitudinally. Normally
+  the same member, but it does not have to be: the most continuous return of a
+  group can sit behind the vehicle's nearest surface for the life of the
+  object, and the anchor has to stay there for identity while the published
+  range does not.
+
+  One member's whole tuple, never a mix of two members' coordinates.
+  """
+  raw_track_id: int
+  d_rel: float
+  y_rel: float
+  v_rel: float
+
+
+@dataclass(frozen=True)
 class BoschPhysicalObject:
   physical_track_id: int
   timestamp_ns: int
@@ -2128,6 +2154,10 @@ class BoschPhysicalObject:
   vision_supported: bool
   age_scans: int
   grouping_evidence: str
+  # None means the continuity anchor above is also the published surface, which
+  # is what every object the tracker itself emits carries. Only the final
+  # publication stage may set one, and nothing inside the provider reads it.
+  published_surface: BoschPublishedSurface | None = None
 
   @property
   def member_slots(self):
@@ -3421,11 +3451,24 @@ class BoschPublicationAliasAllocator:
     return {physical_id: self.physical_to_alias[physical_id] for physical_id in published}
 
 
+def bosch_published_surface(obj):
+  """(raw_track_id, d_rel, y_rel, v_rel) that reaches RadarData for `obj`.
+
+  Without a surface the continuity anchor is published, which is the state of
+  every object the tracker emits.
+  """
+  surface = obj.published_surface
+  if surface is None:
+    return obj.representative_raw_track_id, obj.d_rel, obj.y_rel, obj.v_rel
+  return surface.raw_track_id, surface.d_rel, surface.y_rel, surface.v_rel
+
+
 def bosch_fill_point(point, obj, v_ego, alias=None):
   point.trackId = obj.physical_track_id if alias is None else alias[obj.physical_track_id]
-  point.dRel, point.yRel, point.vRel = obj.d_rel, obj.y_rel, obj.v_rel
+  _, d_rel, y_rel, v_rel = bosch_published_surface(obj)
+  point.dRel, point.yRel, point.vRel = d_rel, y_rel, v_rel
   point.aRel = point.yvRel = point.aLead = point.jLead = math.nan
-  point.vLead = v_ego + obj.v_rel
+  point.vLead = v_ego + v_rel
   point.radarSource = 'frontRadar'
   point.trackState = 0
   point.measured = True
@@ -3447,8 +3490,11 @@ def bosch_append_points(radar, objects, v_ego, now_ns, alias=None):
     if len(members) == 1:
       representative = members[0]
     else:
+      # The age the published range is extrapolated over is the surface's own
+      # measurement age, not the anchor's.
+      published_id = bosch_published_surface(obj)[0]
       representative = next(member for member in members
-                            if member.raw_track_id == obj.representative_raw_track_id)
+                            if member.raw_track_id == published_id)
     # Read the native Float32 fields before projection, exactly as the original
     # temporary RadarData path did. This also preserves rounding for test inputs.
     age_s = (now_ns - representative.timestamp_ns) * 1e-9
@@ -3681,12 +3727,15 @@ class BoschRadarProvider:
         continue
       if corrected is None:
         corrected = list(objects)
-      # Rebuild explicitly: everything except the published coordinates and the
-      # representative id is carried over untouched.
+      # Move the published surface only. The continuity anchor -- the object's
+      # own d/y/v and representative_raw_track_id -- is carried over untouched,
+      # so the object handed to RadarData still reports the state the tracker
+      # will project forward next scan.
       corrected[index] = BoschPhysicalObject(
-        obj.physical_track_id, obj.timestamp_ns, obj.members, owned.raw_track_id,
-        owned.d_rel, owned.y_rel, owned.v_rel, obj.oem_selected, obj.vision_supported,
-        obj.age_scans, obj.grouping_evidence)
+        obj.physical_track_id, obj.timestamp_ns, obj.members,
+        obj.representative_raw_track_id, obj.d_rel, obj.y_rel, obj.v_rel,
+        obj.oem_selected, obj.vision_supported, obj.age_scans, obj.grouping_evidence,
+        BoschPublishedSurface(owned.raw_track_id, owned.d_rel, owned.y_rel, owned.v_rel))
       moved.append(obj.physical_track_id)
     self.last_oem_nearer = tuple(moved)
     if corrected is None:
