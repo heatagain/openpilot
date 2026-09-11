@@ -1258,3 +1258,257 @@ class TestBoschRawAssociationTrace:
     # closer one; without the trace that alternative leaves no record at all.
     assert born.candidate_count == 1
     assert born.best_alternative_cost == pytest.approx((3.25 / 3.5) ** 2 / 3 - 0.03)
+
+
+class TestBoschOemValidationGate:
+  """0x601 word0/word1 read as a state, with the stock SCC as veto evidence."""
+  START_NS = 12_000_000_000
+  PID = 2_000_001
+  OTHER_PID = 2_000_002
+
+  @classmethod
+  def obj(cls, index, *, pid=None, d=70., y=-0.5, v=-9., vision=False, oem=False, members=1):
+    pid = cls.PID if pid is None else pid
+    ns = cls.START_NS + index * 100_000_000
+    raw_id = pid % 100_000
+    tracks = []
+    for member in range(members):
+      detection = BoschRawDetection(ns, (raw_id + member) % 32, d + .25 * member, y, v,
+                                    raw_word=raw_id + member)
+      tracks.append(BoschRawTrack(raw_id + member, detection, index + 1, False))
+    return BoschPhysicalObject(pid, ns, tuple(tracks), raw_id, d, y, v, oem, vision,
+                               index + 1, 'single_return' if members == 1 else 'temporal_complete_link')
+
+  @staticmethod
+  def gate(mode=None):
+    mode = radar_interface_module.BOSCH_OEM_GATE_ACTIVE if mode is None else mode
+    return radar_interface_module._BoschOemValidationGate(mode)
+
+  @classmethod
+  def feed_intent(cls, gate, index, value=0.):
+    """Three fresh SCC12 samples inside the scan window, as the car sends them."""
+    ns = cls.START_NS + index * 100_000_000
+    for offset in (-40_000_000, -20_000_000, 0):
+      gate.intent.ingest(ns + offset, value)
+
+  @classmethod
+  def run(cls, gate, count, *, start=0, intent=0., **kwargs):
+    result = frozenset()
+    for index in range(start, start + count):
+      obj = cls.obj(index, **kwargs)
+      if intent is not None:
+        cls.feed_intent(gate, index, intent)
+      result = gate.update((obj,), obj.timestamp_ns, 30.,
+                           state=radar_interface_module.BOSCH_OEM_STATE_TENTATIVE,
+                           word0_pids=(obj.physical_track_id,), oem_valid=False)
+    return result
+
+  def test_state_classification_covers_all_four_combinations(self):
+    classify = radar_interface_module._BoschOemValidationGate.classify
+    assert classify(True, True) == radar_interface_module.BOSCH_OEM_STATE_VALIDATED
+    assert classify(False, True) == radar_interface_module.BOSCH_OEM_STATE_SELECTED
+    assert classify(True, False) == radar_interface_module.BOSCH_OEM_STATE_TENTATIVE
+    assert classify(False, False) == radar_interface_module.BOSCH_OEM_STATE_NONE
+
+  def test_sustained_tentative_in_path_object_is_withheld(self):
+    persist = radar_interface_module.BOSCH_OEM_GATE_PERSIST_SCANS
+    gate = self.gate()
+    assert self.run(gate, persist - 1) == frozenset()
+    assert self.run(gate, 1, start=persist - 1) == frozenset({self.PID})
+    assert gate.reasons[self.PID]["reason"] == "tentative_oem_disagreement"
+
+  def test_validated_state_never_withholds(self):
+    gate = self.gate()
+    for index in range(8):
+      obj = self.obj(index, oem=True)
+      self.feed_intent(gate, index)
+      assert gate.update((obj,), obj.timestamp_ns, 30.,
+                         state=radar_interface_module.BOSCH_OEM_STATE_VALIDATED,
+                         word0_pids=(self.PID,), oem_valid=True) == frozenset()
+
+  def test_selected_only_side_target_is_published(self):
+    gate = self.gate()
+    for index in range(8):
+      obj = self.obj(index, y=-4.5, oem=True)
+      self.feed_intent(gate, index)
+      assert gate.update((obj,), obj.timestamp_ns, 30.,
+                         state=radar_interface_module.BOSCH_OEM_STATE_SELECTED,
+                         word0_pids=(), oem_valid=True) == frozenset()
+
+  @pytest.mark.parametrize("kwargs,reason", [
+    ({"vision": True}, "recent_evidence"),
+    ({"oem": True}, "was_validated"),
+    ({"members": 2}, "recent_evidence"),
+    ({"d": 25.}, "close_range"),
+    ({"v": -25.}, "short_ttc"),
+  ])
+  def test_independent_evidence_and_safety_windows_fail_open(self, kwargs, reason):
+    gate = self.gate()
+    assert self.run(gate, 8, **kwargs) == frozenset()
+    assert gate.reasons[self.PID]["reason"] == reason
+
+  def test_low_speed_is_fail_open(self):
+    gate = self.gate()
+    held = frozenset()
+    for index in range(8):
+      obj = self.obj(index)
+      self.feed_intent(gate, index)
+      held = gate.update((obj,), obj.timestamp_ns, 3.,
+                         state=radar_interface_module.BOSCH_OEM_STATE_TENTATIVE,
+                         word0_pids=(self.PID,), oem_valid=False)
+    assert held == frozenset()
+    assert gate.reasons[self.PID]["reason"] == "low_speed"
+
+  def test_scc_validity_acquisition_is_immediate_keep(self):
+    gate = self.gate()
+    assert self.run(gate, 8) == frozenset({self.PID})
+    obj = self.obj(8)
+    self.feed_intent(gate, 8)
+    assert gate.update((obj,), obj.timestamp_ns, 30.,
+                       state=radar_interface_module.BOSCH_OEM_STATE_TENTATIVE,
+                       word0_pids=(self.PID,), oem_valid=True) == frozenset()
+    assert gate.reasons[self.PID]["reason"] == "scc_valid"
+
+  def test_word1_acquisition_recovers_without_identity_churn(self):
+    gate = self.gate()
+    assert self.run(gate, 8) == frozenset({self.PID})
+    obj = self.obj(8, oem=True)
+    self.feed_intent(gate, 8)
+    assert gate.update((obj,), obj.timestamp_ns, 30.,
+                       state=radar_interface_module.BOSCH_OEM_STATE_VALIDATED,
+                       word0_pids=(self.PID,), oem_valid=True) == frozenset()
+    # The gate owns no identity, so recovery cannot renumber a PID or an alias.
+    assert gate.publication_withheld == 0
+
+  def test_short_validation_dropout_keeps_grace(self):
+    """11 -> 10 -> 11 must not demote a lead the OEM has ever validated."""
+    gate = self.gate()
+    for index in range(6):
+      obj = self.obj(index, oem=True)
+      self.feed_intent(gate, index)
+      gate.update((obj,), obj.timestamp_ns, 30.,
+                  state=radar_interface_module.BOSCH_OEM_STATE_VALIDATED,
+                  word0_pids=(self.PID,), oem_valid=True)
+    for index in range(6, 10):
+      obj = self.obj(index)
+      self.feed_intent(gate, index)
+      assert gate.update((obj,), obj.timestamp_ns, 30.,
+                         state=radar_interface_module.BOSCH_OEM_STATE_TENTATIVE,
+                         word0_pids=(self.PID,), oem_valid=False) == frozenset()
+    assert gate.reasons[self.PID]["reason"] == "was_validated"
+
+  def test_camera_support_grace_survives_a_short_vision_dropout(self):
+    gate = self.gate()
+    for index in range(4):
+      obj = self.obj(index, vision=True)
+      self.feed_intent(gate, index)
+      gate.update((obj,), obj.timestamp_ns, 30.,
+                  state=radar_interface_module.BOSCH_OEM_STATE_TENTATIVE,
+                  word0_pids=(self.PID,), oem_valid=False)
+    assert self.run(gate, 4, start=4) == frozenset()
+    assert gate.reasons[self.PID]["reason"] == "recent_evidence"
+
+  def test_out_of_path_candidate_is_never_withheld(self):
+    gate = self.gate()
+    assert self.run(gate, 8, y=-2.4) == frozenset()
+    assert gate.reasons[self.PID]["reason"] == "not_in_path"
+
+  def test_object_settled_in_the_path_is_never_withheld(self):
+    settled = radar_interface_module.BOSCH_OEM_GATE_SETTLED_SCANS
+    gate = self.gate()
+    assert self.run(gate, settled + 4) == frozenset()
+    assert gate.reasons[self.PID]["reason"] == "settled_in_path"
+
+  def test_companion_of_a_validated_large_vehicle_is_kept(self):
+    """One return of a box truck is the OEM target; the other is not a ghost."""
+    gate = self.gate()
+    held = frozenset()
+    for index in range(6):
+      near = self.obj(index, d=64., y=-0.2, oem=True)
+      far = self.obj(index, pid=self.OTHER_PID, d=72., y=-0.4)
+      self.feed_intent(gate, index)
+      held = gate.update((near, far), near.timestamp_ns, 30.,
+                         state=radar_interface_module.BOSCH_OEM_STATE_TENTATIVE,
+                         word0_pids=(self.OTHER_PID,), oem_valid=False)
+    assert held == frozenset()
+    assert gate.reasons[self.OTHER_PID]["reason"] == "validated_sibling"
+
+  def test_monotone_lateral_cutin_is_fail_open(self):
+    gate = self.gate()
+    held = frozenset()
+    for index in range(8):
+      obj = self.obj(index, y=-2.2 + .2 * index)
+      self.feed_intent(gate, index)
+      held = gate.update((obj,), obj.timestamp_ns, 30.,
+                         state=radar_interface_module.BOSCH_OEM_STATE_TENTATIVE,
+                         word0_pids=(self.PID,), oem_valid=False)
+    assert held == frozenset()
+    assert gate.reasons[self.PID]["reason"] == "lateral_cutin"
+
+  def test_oscillating_lateral_excursion_does_not_earn_the_cutin_exemption(self):
+    """A large-vehicle ghost wanders in and back out; only unbroken runs count.
+
+    The offsets are the measured route274 segment 19 car-carrier return, whose
+    lateral excursion looked enough like a cut-in to promote it to leadOne.
+    """
+    gate = self.gate()
+    held = frozenset()
+    for index, y in enumerate((-1.50, -1.41, -1.12, -1.03, -0.94, -0.41, -0.91,
+                               -0.94, -0.84, -0.47, -0.50, -0.44)):
+      obj = self.obj(index, y=y)
+      self.feed_intent(gate, index)
+      held = gate.update((obj,), obj.timestamp_ns, 30.,
+                         state=radar_interface_module.BOSCH_OEM_STATE_TENTATIVE,
+                         word0_pids=(self.PID,), oem_valid=False)
+    assert held == frozenset({self.PID})
+
+  def test_oem_deceleration_request_is_fail_open(self):
+    gate = self.gate()
+    assert self.run(gate, 8, intent=-0.8) == frozenset()
+    assert gate.reasons[self.PID]["reason"] == "oem_decelerating"
+
+  def test_absent_oem_intent_is_fail_open(self):
+    gate = self.gate()
+    assert self.run(gate, 8, intent=None) == frozenset()
+    assert gate.reasons[self.PID]["reason"] == "oem_intent_unavailable"
+
+  def test_stale_oem_intent_is_fail_open(self):
+    gate = self.gate()
+    gate.intent.ingest(self.START_NS - 1_000_000_000, 0.)
+    assert self.run(gate, 8, intent=None) == frozenset()
+    assert gate.reasons[self.PID]["reason"] == "oem_intent_unavailable"
+
+  def test_out_of_band_intent_samples_are_ignored(self):
+    gate = self.gate()
+    assert self.run(gate, 8, intent=-10.23) == frozenset()
+    assert gate.reasons[self.PID]["reason"] == "oem_intent_unavailable"
+
+  def test_ambiguous_word0_match_is_fail_open(self):
+    gate = self.gate()
+    held = frozenset()
+    for index in range(8):
+      first = self.obj(index)
+      second = self.obj(index, pid=self.OTHER_PID, d=70.5)
+      self.feed_intent(gate, index)
+      held = gate.update((first, second), first.timestamp_ns, 30.,
+                         state=radar_interface_module.BOSCH_OEM_STATE_TENTATIVE,
+                         word0_pids=(self.PID, self.OTHER_PID), oem_valid=False)
+    assert held == frozenset()
+
+  def test_shadow_mode_decides_without_changing_publication(self):
+    gate = self.gate(radar_interface_module.BOSCH_OEM_GATE_SHADOW)
+    assert self.run(gate, 8) == frozenset({self.PID})
+    assert gate.publication_withheld == 0
+
+  def test_off_mode_holds_no_state(self):
+    gate = self.gate(radar_interface_module.BOSCH_OEM_GATE_OFF)
+    assert self.run(gate, 8) == frozenset()
+    assert gate._states == {}
+
+  def test_departed_objects_leave_no_state_behind(self):
+    gate = self.gate()
+    self.run(gate, 8)
+    assert self.PID in gate._states
+    gate.update((), self.START_NS + 900_000_000, 30.,
+                state=radar_interface_module.BOSCH_OEM_STATE_NONE)
+    assert gate._states == {}

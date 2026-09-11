@@ -290,6 +290,68 @@ BOSCH_P91_ACTIVE_TEST = BOSCH_P91_ACTIVE  # compatibility name for existing synt
 BOSCH_P91_MODE = BOSCH_P91_ACTIVE
 BOSCH_P91_SUPPORT_HOLD_NS = 500_000_000
 
+# Behavioural naming for the two 0x601 records. No proprietary signal name is
+# claimed. word1 (bytes 4..7) is bit-identical to exactly one raw record in
+# 63,819 of 63,822 active scans across 146 segments, and its activity equals
+# SCC11.ObjValid in 99 % of frames; word0 (bytes 0..3) matches no raw record in
+# 96 % of active scans and is gated by lateral offset and by range near 100 m.
+# The pair is therefore read as a state, not as one boolean support flag.
+BOSCH_OEM_STATE_NONE = 0
+BOSCH_OEM_STATE_TENTATIVE = 1   # word0 only: in-path candidate, no selected member
+BOSCH_OEM_STATE_SELECTED = 2    # word1 only: selected member outside the word0 gate
+BOSCH_OEM_STATE_VALIDATED = 3   # word0 and word1
+
+BOSCH_OEM_GATE_OFF = 0
+BOSCH_OEM_GATE_SHADOW = 1
+BOSCH_OEM_GATE_ACTIVE = 2
+BOSCH_OEM_GATE_MODE = BOSCH_OEM_GATE_ACTIVE
+# A validated target that drops word1 for one or two scans must not become
+# gate-eligible. Measured bracketed word1 dropouts on 146 segments are 58 in
+# total and only 12 % are shorter than five scans, so the hold is cheap.
+BOSCH_OEM_EVIDENCE_HOLD_NS = 500_000_000
+# SCC12 keeps computing a longitudinal request while openpilot drives. It is an
+# independent OEM intent observation, never an actuator command: it only helps
+# decide whether an unvalidated in-path candidate may reach the published view.
+# Raw field 0 decodes to the -10.23 floor and means "not populated" here, so a
+# sane band is required before the sample counts at all.
+BOSCH_OEM_INTENT_MIN_MPS2 = -9.0
+BOSCH_OEM_INTENT_MAX_MPS2 = 3.0
+BOSCH_OEM_INTENT_FRESH_NS = 150_000_000
+BOSCH_OEM_INTENT_WINDOW_NS = 300_000_000
+BOSCH_OEM_INTENT_MIN_SAMPLES = 3
+# Gate thresholds. Every value is set from the route273/26d/274 sweep in
+# analysis/bosch_oem_validation; none is a guessed round number.
+BOSCH_OEM_GATE_NEUTRAL_MPS2 = -0.25
+BOSCH_OEM_GATE_PERSIST_SCANS = 3
+BOSCH_OEM_GATE_MIN_SPEED_MPS = 8.0
+BOSCH_OEM_GATE_MIN_RANGE_M = 30.0
+BOSCH_OEM_GATE_MIN_TTC_S = 4.0
+BOSCH_OEM_GATE_CUTIN_MPS = 0.90
+BOSCH_OEM_GATE_CUTIN_SCANS = 3
+BOSCH_OEM_GATE_LATERAL_WINDOW_NS = 600_000_000
+# Only a lead candidate can be withheld, and only while it is new to the path.
+# Widening the corridor past 1.0 m or letting a settled object stay eligible
+# both reintroduced real-lead losses in the route273/26d/274 sweep.
+BOSCH_OEM_GATE_IN_PATH_M = 1.0
+BOSCH_OEM_GATE_SETTLED_SCANS = 10
+# A large vehicle answers as several returns. When one of them is the OEM's
+# validated target the others are companions of a confirmed object, not
+# unvalidated candidates; without this the second return of a followed box
+# truck was withheld for 0.6 s on route26d segment 87.
+BOSCH_OEM_GATE_SIBLING_D_M = 12.0
+BOSCH_OEM_GATE_SIBLING_Y_M = 3.0
+BOSCH_OEM_GATE_SIBLING_V_MPS = 1.5
+# Stock SCC observation, read on the Bosch provider's own CAN stream so the
+# samples carry receive timestamps and no shared CANParser changes. Offsets are
+# the hyundai_kia_generic SCC11/SCC12 little-endian start bits.
+BOSCH_SCC_BUS = 2
+BOSCH_SCC11_ADDR = 0x420
+BOSCH_SCC12_ADDR = 0x421
+BOSCH_SCC11_OBJ_VALID_BIT = 16      # SCC11.ObjValid
+BOSCH_SCC12_AREQ_RAW_BIT = 24       # SCC12.aReqRaw, 11 bits, (0.01, -10.23)
+BOSCH_SCC_ADDRESSES = frozenset((BOSCH_SCC11_ADDR, BOSCH_SCC12_ADDR))
+BOSCH_SCC_STALE_NS = 300_000_000
+
 # Frozen Bosch <-> OEM-camera extended grouping candidate.  Keep production
 # disabled until the on-device SHADOW timing pass is complete; tests and replay
 # may opt into SHADOW/ACTIVE explicitly when constructing BoschRadarProvider.
@@ -2994,6 +3056,224 @@ class _BoschPersistentSpatialCloneFilter:
     return self.would_suppress
 
 
+@dataclass
+class _BoschOemGateState:
+  """Bounded per-candidate probation state. No pair matrix, no history list."""
+  tentative_scans: int
+  since_ns: int
+  last_ns: int
+  evidence_ns: int
+  ever_validated: bool
+  in_path_scans: int
+  last_abs_y: float
+  inward_scans: int
+  inward_from_abs_y: float
+  inward_since_ns: int
+  withheld: bool
+
+
+class _BoschOemIntentTracker:
+  """Short bounded window over the stock SCC longitudinal request.
+
+  SCC12 runs at 50 Hz while the object list runs at 10 Hz, so a single 20 ms
+  sample is never used. Freshness and a sane decoded band are required before
+  the value counts; otherwise the caller fails open.
+  """
+
+  def __init__(self):
+    self._samples = deque()
+    self.last_ns = 0
+
+  def reset(self):
+    self._samples.clear()
+    self.last_ns = 0
+
+  def ingest(self, timestamp_ns, value):
+    if value is None or not math.isfinite(value):
+      return
+    if not BOSCH_OEM_INTENT_MIN_MPS2 <= value <= BOSCH_OEM_INTENT_MAX_MPS2:
+      return
+    if self._samples and timestamp_ns < self._samples[-1][0]:
+      self._samples.clear()
+    self._samples.append((timestamp_ns, value))
+    self.last_ns = timestamp_ns
+    horizon = timestamp_ns - BOSCH_OEM_INTENT_WINDOW_NS
+    while self._samples and self._samples[0][0] < horizon:
+      self._samples.popleft()
+
+  def median(self, timestamp_ns):
+    """Window median, or None when the stream is stale or too sparse."""
+    if not self._samples or timestamp_ns - self.last_ns > BOSCH_OEM_INTENT_FRESH_NS:
+      return None
+    horizon = timestamp_ns - BOSCH_OEM_INTENT_WINDOW_NS
+    values = sorted(value for ns, value in self._samples if ns >= horizon)
+    if len(values) < BOSCH_OEM_INTENT_MIN_SAMPLES:
+      return None
+    return values[len(values) // 2]
+
+
+class _BoschOemValidationGate:
+  """Withhold publication of a sustained unvalidated in-path candidate.
+
+  The 0x601 pair is read as a state rather than one support flag. Only the
+  single candidate the word0 record points at can be withheld, and only while
+  every independent real-object cue is absent and the stock SCC is also not
+  asking for deceleration. The physical track, its members, its ID and its
+  alias are untouched: this is a publication-view decision that reverses on the
+  first scan any evidence returns.
+  """
+
+  def __init__(self, mode=BOSCH_OEM_GATE_MODE):
+    if mode not in (BOSCH_OEM_GATE_OFF, BOSCH_OEM_GATE_SHADOW, BOSCH_OEM_GATE_ACTIVE):
+      raise ValueError('invalid Bosch OEM validation gate mode')
+    self.mode = mode
+    self.neutral_mps2 = BOSCH_OEM_GATE_NEUTRAL_MPS2
+    self.persist_scans = BOSCH_OEM_GATE_PERSIST_SCANS
+    self.min_speed_mps = BOSCH_OEM_GATE_MIN_SPEED_MPS
+    self.min_range_m = BOSCH_OEM_GATE_MIN_RANGE_M
+    self.min_ttc_s = BOSCH_OEM_GATE_MIN_TTC_S
+    self.cutin_mps = BOSCH_OEM_GATE_CUTIN_MPS
+    self.cutin_scans = BOSCH_OEM_GATE_CUTIN_SCANS
+    self.evidence_hold_ns = BOSCH_OEM_EVIDENCE_HOLD_NS
+    self.in_path_m = BOSCH_OEM_GATE_IN_PATH_M
+    self.settled_scans = BOSCH_OEM_GATE_SETTLED_SCANS
+    self.sibling_d_m = BOSCH_OEM_GATE_SIBLING_D_M
+    self.sibling_y_m = BOSCH_OEM_GATE_SIBLING_Y_M
+    self.sibling_v_mps = BOSCH_OEM_GATE_SIBLING_V_MPS
+    self.intent = _BoschOemIntentTracker()
+    self._states: dict[int, _BoschOemGateState] = {}
+    self.last_ns = None
+    self.state = BOSCH_OEM_STATE_NONE
+    self.would_withhold = frozenset()
+    self.reasons = {}
+    self.publication_withheld = 0
+    self.state_peak = 0
+
+  @staticmethod
+  def classify(word0_active, word1_active):
+    if word1_active:
+      return BOSCH_OEM_STATE_VALIDATED if word0_active else BOSCH_OEM_STATE_SELECTED
+    return BOSCH_OEM_STATE_TENTATIVE if word0_active else BOSCH_OEM_STATE_NONE
+
+  def update(self, objects, timestamp_ns, v_ego, *, state, word0_pids=(), oem_valid=None):
+    self.last_ns = timestamp_ns
+    self.state = state
+    self.would_withhold = frozenset()
+    self.reasons = {}
+    if self.mode == BOSCH_OEM_GATE_OFF:
+      self._states = {}
+      return self.would_withhold
+
+    live = {obj.physical_track_id for obj in objects}
+    previous = self._states
+    states = {}
+    # Any independent cue refreshes the evidence clock, including on objects the
+    # gate will never consider. A candidate that was validated moments ago keeps
+    # its grace through a short word1 dropout.
+    validated_word0 = state == BOSCH_OEM_STATE_VALIDATED and oem_valid is not False
+    word0 = frozenset(word0_pids)
+    for obj in objects:
+      pid = obj.physical_track_id
+      prior = previous.get(pid)
+      evidence_ns = prior.evidence_ns if prior is not None else 0
+      ever = prior.ever_validated if prior is not None else False
+      if (obj.vision_supported or obj.oem_selected or len(obj.members) > 1 or
+          (validated_word0 and pid in word0)):
+        evidence_ns = timestamp_ns
+      # Once the OEM has confirmed an object it is never a gate candidate again
+      # for the rest of that track's life. The route274 S19 return was never
+      # confirmed in sixty seconds; a real lead is confirmed within one.
+      if obj.oem_selected or (validated_word0 and pid in word0):
+        ever = True
+      # A real cut-in closes on the path scan after scan. A large-vehicle ghost
+      # wanders in and back out, so only an unbroken inward run counts, never a
+      # single noisy step of a 0.03125 m lateral grid seen at seventy metres.
+      abs_y = abs(obj.y_rel)
+      in_path = (prior.in_path_scans + 1 if prior is not None and abs_y <= self.in_path_m
+                 else int(abs_y <= self.in_path_m))
+      if prior is None or timestamp_ns - prior.last_ns > BOSCH_OEM_GATE_LATERAL_WINDOW_NS:
+        inward_scans, inward_from, inward_since = 0, abs_y, timestamp_ns
+      elif abs_y < prior.last_abs_y:
+        inward_scans = prior.inward_scans + 1
+        inward_from = prior.inward_from_abs_y if prior.inward_scans else prior.last_abs_y
+        inward_since = prior.inward_since_ns if prior.inward_scans else prior.last_ns
+      else:
+        inward_scans, inward_from, inward_since = 0, abs_y, timestamp_ns
+      states[pid] = _BoschOemGateState(
+        prior.tentative_scans if prior is not None else 0,
+        prior.since_ns if prior is not None else timestamp_ns,
+        timestamp_ns, evidence_ns, ever, in_path, abs_y, inward_scans, inward_from,
+        inward_since, prior.withheld if prior is not None else False)
+
+    withhold = set()
+    # Exactly one unambiguous word0 candidate is eligible. An ambiguous match
+    # cannot name a target and stays fail-open, as elsewhere in this provider.
+    eligible = word0 & live if state == BOSCH_OEM_STATE_TENTATIVE and len(word0) == 1 else frozenset()
+    intent = self.intent.median(timestamp_ns)
+    confirmed = tuple(obj for obj in objects if states[obj.physical_track_id].ever_validated)
+    for obj in objects:
+      pid = obj.physical_track_id
+      entry = states[pid]
+      if pid not in eligible:
+        entry.tentative_scans = 0
+        entry.since_ns = timestamp_ns
+        entry.withheld = False
+        continue
+      entry.tentative_scans += 1
+      if entry.tentative_scans == 1:
+        entry.since_ns = timestamp_ns
+      lateral_rate = ((entry.inward_from_abs_y - entry.last_abs_y) /
+                      max(1e-3, (timestamp_ns - entry.inward_since_ns) * 1e-9)
+                      if entry.inward_scans >= self.cutin_scans else 0.)
+      closing = -obj.v_rel
+      ttc = obj.d_rel / closing if closing > .1 else math.inf
+      fail_open = None
+      if entry.ever_validated:
+        fail_open = 'was_validated'
+      elif entry.in_path_scans > self.settled_scans:
+        fail_open = 'settled_in_path'
+      elif abs(obj.y_rel) > self.in_path_m:
+        fail_open = 'not_in_path'
+      elif any(other.physical_track_id != pid and
+               abs(obj.d_rel - other.d_rel) <= self.sibling_d_m and
+               abs(obj.y_rel - other.y_rel) <= self.sibling_y_m and
+               abs(obj.v_rel - other.v_rel) <= self.sibling_v_mps for other in confirmed):
+        fail_open = 'validated_sibling'
+      elif oem_valid is True:
+        fail_open = 'scc_valid'
+      elif not math.isfinite(v_ego) or v_ego < self.min_speed_mps:
+        fail_open = 'low_speed'
+      elif obj.d_rel < self.min_range_m:
+        fail_open = 'close_range'
+      elif ttc < self.min_ttc_s:
+        fail_open = 'short_ttc'
+      elif timestamp_ns - entry.evidence_ns <= self.evidence_hold_ns and entry.evidence_ns:
+        fail_open = 'recent_evidence'
+      elif lateral_rate >= self.cutin_mps:
+        fail_open = 'lateral_cutin'
+      elif intent is None:
+        fail_open = 'oem_intent_unavailable'
+      elif intent <= self.neutral_mps2:
+        fail_open = 'oem_decelerating'
+      elif entry.tentative_scans < self.persist_scans:
+        fail_open = 'warming'
+      if fail_open is None:
+        withhold.add(pid)
+      entry.withheld = fail_open is None
+      self.reasons[pid] = {
+        'withhold': fail_open is None, 'reason': fail_open or 'tentative_oem_disagreement',
+        'tentative_scans': entry.tentative_scans, 'in_path_scans': entry.in_path_scans,
+        'd_rel': obj.d_rel, 'y_rel': obj.y_rel,
+        'v_rel': obj.v_rel, 'ttc_s': ttc, 'lateral_rate_mps': lateral_rate,
+        'oem_intent_mps2': intent, 'scc_obj_valid': oem_valid,
+        'evidence_age_s': (timestamp_ns - entry.evidence_ns) * 1e-9 if entry.evidence_ns else None,
+      }
+    self._states = states
+    self.state_peak = max(self.state_peak, len(states))
+    self.would_withhold = frozenset(withhold)
+    return self.would_withhold
+
+
 BOSCH_PUBLICATION_ALIAS_START = 32
 BOSCH_PUBLICATION_ALIAS_COUNT = 64
 BOSCH_PUBLICATION_ALIAS_GRACE_S = 0.5
@@ -3173,14 +3453,19 @@ def bosch_make_points(objects, v_ego=math.nan):
 
 class BoschRadarProvider:
   def __init__(self, bus: int, *, qualification=True, camera_bus=1,
-               camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE, p91_mode=BOSCH_P91_MODE):
+               camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE, p91_mode=BOSCH_P91_MODE,
+               oem_gate_mode=BOSCH_OEM_GATE_MODE, scc_bus=BOSCH_SCC_BUS):
     self.bus = bus
     self.camera_bus = camera_bus
+    self.scc_bus = scc_bus
     self.tracker = BoschPhysicalTracker()
     self.camera_extended = BoschCameraExtendedGrouping(camera_extended_mode)
     self.publication_aliases = BoschPublicationAliasAllocator()
     self.qualifier = _BoschStaticOffPathFilter() if qualification else None
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
+    self.oem_gate = _BoschOemValidationGate(oem_gate_mode)
+    self.scc_obj_valid = None
+    self.scc_obj_valid_ns = 0
     self.can_error = False
     self.wrong_config = False
     self.last_scan_timestamp_ns = None
@@ -3194,6 +3479,12 @@ class BoschRadarProvider:
     self._debug_oem_matches = 0
     self._debug_processed_word = None
     self._debug_processed_pids = frozenset()
+    self._debug_word0_active = False
+    self._debug_word1_active = False
+    self._debug_oem_state = BOSCH_OEM_STATE_NONE
+    self._debug_gate_suppress = frozenset()
+    self._debug_gate_reasons = {}
+    self._debug_oem_intent = None
     self._debug_p91_ns = 0
     self._debug_timeout = False
     self._frames = []
@@ -3223,6 +3514,12 @@ class BoschRadarProvider:
     if p91_suppressed:
       self.p91.publication_suppressed += len(p91_suppressed)
       objects = tuple(obj for obj in objects if obj.physical_track_id not in p91_suppressed)
+    gate = self.oem_gate
+    withheld = (gate.would_withhold if gate.mode == BOSCH_OEM_GATE_ACTIVE and
+                objects and all(obj.timestamp_ns == gate.last_ns for obj in objects) else frozenset())
+    if withheld:
+      gate.publication_withheld += len(withheld)
+      objects = tuple(obj for obj in objects if obj.physical_track_id not in withheld)
     ext = self.camera_extended
     if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
       return objects
@@ -3269,6 +3566,7 @@ class BoschRadarProvider:
     self._perf_raw_sum = self._perf_raw_max = 0
     self._perf_physical_sum = self._perf_physical_max = 0
     self._perf_qualify_sum = self._perf_qualify_max = 0
+    self._perf_gate_sum = self._perf_gate_max = 0
     self._perf_total_sum = self._perf_total_max = 0
     self._perf_native_count = self._perf_native_sum = self._perf_native_max = 0
     self._perf_raw_pairs = self._perf_raw_possible = 0
@@ -3306,6 +3604,9 @@ class BoschRadarProvider:
       f'raw_ms_avg={self._perf_raw_sum * scale:.3f} raw_ms_max={self._perf_raw_max * 1e-6:.3f} '
       f'physical_ms_avg={self._perf_physical_sum * scale:.3f} physical_ms_max={self._perf_physical_max * 1e-6:.3f} '
       f'qualify_ms_avg={self._perf_qualify_sum * scale:.3f} qualify_ms_max={self._perf_qualify_max * 1e-6:.3f} '
+      f'oemgate={self.oem_gate.mode} oemstate={self._debug_oem_state} '
+      f'oemgate_withheld={self.oem_gate.publication_withheld} oemgate_state={self.oem_gate.state_peak} '
+      f'oemgate_ms_avg={self._perf_gate_sum * scale:.3f} oemgate_ms_max={self._perf_gate_max * 1e-6:.3f} '
       f'total_ms_avg={self._perf_total_sum * scale:.3f} total_ms_max={self._perf_total_max * 1e-6:.3f} '
       f'native_ms_avg={self._perf_native_sum * 1e-6 / max(self._perf_native_count, 1):.3f} '
       f'native_ms_max={self._perf_native_max * 1e-6:.3f} '
@@ -3355,6 +3656,10 @@ class BoschRadarProvider:
       'p91_mode': self.p91.mode, 'p91_would_suppress': sorted(self.p91.would_suppress),
       'p91_decisions': self.p91.decisions,
       'p91_elapsed_ns': self._debug_p91_ns,
+      'oem_state': self._debug_oem_state, 'oem_word0_active': self._debug_word0_active,
+      'oem_word1_active': self._debug_word1_active, 'scc_obj_valid': self._scc_validity(self.last_scan_timestamp_ns or 0),
+      'oem_intent_mps2': self._debug_oem_intent, 'oem_gate_mode': self.oem_gate.mode,
+      'oem_gate_withhold': sorted(self._debug_gate_suppress), 'oem_gate_reasons': self._debug_gate_reasons,
       'objects': [{'physicalTrackId': obj.physical_track_id,
                    'rawTrackIds': [member.raw_track_id for member in obj.members],
                    'slots': list(obj.member_slots),
@@ -3364,6 +3669,28 @@ class BoschRadarProvider:
                                                if member.raw_track_id == obj.representative_raw_track_id),
                    'oem_selected': obj.oem_selected} for obj in self._debug_objects],
     }
+
+  def _ingest_scc(self, timestamp_ns, address, payload):
+    """Decode the two stock-SCC observations this provider consumes.
+
+    Both are read as evidence about the OEM's own target decision. A short or
+    malformed frame is dropped rather than reported: a missing observation must
+    fail open, never fault the radar.
+    """
+    if len(payload) < 8:
+      return
+    value = int.from_bytes(bytes(payload), 'little')
+    if address == BOSCH_SCC11_ADDR:
+      self.scc_obj_valid = bool((value >> BOSCH_SCC11_OBJ_VALID_BIT) & 1)
+      self.scc_obj_valid_ns = timestamp_ns
+    else:
+      self.oem_gate.intent.ingest(timestamp_ns, ((value >> BOSCH_SCC12_AREQ_RAW_BIT) & 0x7FF) * .01 - 10.23)
+
+  def _scc_validity(self, timestamp_ns):
+    """SCC11.ObjValid at this scan, or None when the stream is absent/stale."""
+    if self.scc_obj_valid is None or timestamp_ns - self.scc_obj_valid_ns > BOSCH_SCC_STALE_NS:
+      return None
+    return self.scc_obj_valid
 
   def update(self, can_packets, now_ns: int, v_ego: float, yaw_rate_left=None, vision=(), *, path=(), path_ns=None, path_source_ns=None):
     """Consume (receive_ns, [(address, payload, src), ...]) CAN packets.
@@ -3384,6 +3711,7 @@ class BoschRadarProvider:
     bus = self.bus
     camera = self.camera_extended.camera
     camera_bus = self.camera_bus
+    scc_bus = self.scc_bus
     camera_start_ns = 0
     frames = self._frames
     anchors = self._anchors
@@ -3402,6 +3730,10 @@ class BoschRadarProvider:
             camera.ingest(timestamp_ns, address, bytes(message[1]))
           continue
         if message[2] != bus:
+          # Stock SCC observation only. It never becomes a detection, an object
+          # or an actuator command; it can only withhold an unvalidated one.
+          if message[2] == scc_bus and address in BOSCH_SCC_ADDRESSES and not future:
+            self._ingest_scc(timestamp_ns, address, message[1])
           continue
         if address < 0x601 or address > 0x612:
           continue
@@ -3472,6 +3804,9 @@ class BoschRadarProvider:
       self._debug_objects = ()
       self._debug_timeout = True
       self.p91.update((), now_ns, v_ego, yaw_rate=yaw_rate_left)
+      self.oem_gate.update((), now_ns, v_ego, state=BOSCH_OEM_STATE_NONE)
+      self._debug_gate_suppress = frozenset()
+      self._debug_gate_reasons = {}
       self._perf_raw = self._perf_qualified = 0
       self._last_output_ns = now_ns
       return ()
@@ -3517,6 +3852,10 @@ class BoschRadarProvider:
     processed_word = int.from_bytes(oem.payload[0:4], 'little') if oem else None
     matches = [detection.slot for detection in detections if oem_word == detection.raw_word]
     oem_slot = matches[0] if matches else None
+    word1_active = oem_word is not None and oem_word != BOSCH_INACTIVE_WORD and not oem_word & (1 << 31)
+    word0_active = (processed_word is not None and processed_word != BOSCH_INACTIVE_WORD and
+                    not processed_word & (1 << 31))
+    oem_state = _BoschOemValidationGate.classify(word0_active, word1_active)
     objects = self.tracker.update(availability_ns, detections, yaw_rate=yaw_rate_left,
                                   v_ego=v_ego, oem_slot=oem_slot, vision=vision)
     self.last_scan_timestamp_ns = availability_ns
@@ -3540,8 +3879,24 @@ class BoschRadarProvider:
                  if self.qualifier is not None else objects)
     processed_pids = _bosch_match_processed_target_word(qualified, processed_word)
     self._debug_processed_pids = processed_pids
+    scc_valid = self._scc_validity(availability_ns)
+    self._debug_word0_active = word0_active
+    self._debug_word1_active = word1_active
+    self._debug_oem_state = oem_state
+    gate_start_ns = time.perf_counter_ns()
+    self.oem_gate.update(qualified, availability_ns, v_ego, state=oem_state,
+                         word0_pids=processed_pids, oem_valid=scc_valid)
+    gate_ns = time.perf_counter_ns() - gate_start_ns
+    self._debug_gate_suppress = self.oem_gate.would_withhold
+    self._debug_gate_reasons = self.oem_gate.reasons
+    self._debug_oem_intent = self.oem_gate.intent.median(availability_ns)
+    self._perf_gate_sum += gate_ns
+    self._perf_gate_max = max(self._perf_gate_max, gate_ns)
+    # word0 alone no longer counts as P91 support. Only a word0 record that the
+    # OEM also validated in the same scan can clear a clone suspicion.
+    p91_word0 = processed_pids if oem_state == BOSCH_OEM_STATE_VALIDATED and scc_valid is not False else frozenset()
     p91_start_ns = time.perf_counter_ns()
-    self.p91.update(qualified, availability_ns, v_ego, word0_pids=processed_pids, yaw_rate=yaw_rate_left)
+    self.p91.update(qualified, availability_ns, v_ego, word0_pids=p91_word0, yaw_rate=yaw_rate_left)
     p91_ns = time.perf_counter_ns() - p91_start_ns
     self._debug_p91_ns = p91_ns
     self._perf_p91_sum += p91_ns
@@ -3614,7 +3969,10 @@ class RadarInterface(RadarInterfaceBase):
     if self.radar_tracks and CP.extFlags & HyundaiExtFlags.BOSCH_RADAR:
       CAN = CanBus(CP)
       bus = CAN.ACAN if CP.extFlags & HyundaiExtFlags.BOSCH_RADAR_BUS1 else CAN.CAM
-      self.bosch = BoschRadarProvider(bus, camera_bus=CAN.ACAN,
+      # Same bus the stock SCC parser uses, so the gate reads the factory
+      # module rather than openpilot's own SCC11/SCC12 transmissions.
+      scc_bus = CAN.CAM if CP.flags & HyundaiFlags.CAMERA_SCC else CAN.ECAN
+      self.bosch = BoschRadarProvider(bus, camera_bus=CAN.ACAN, scc_bus=scc_bus,
                                       camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE)
       self._bosch_make_points = bosch_make_points
     self.corner_object_tracks = bool(CP.extFlags & HyundaiExtFlags.CORNER_RADAR_OBJECTS_235.value) and self.params.get_int("EnableCornerRadar") > 0
