@@ -13,6 +13,10 @@ from opendbc.car.hyundai.radar_interface import (
   BOSCH_CAMERA_EXTENDED_OFF,
   BOSCH_CAMERA_EXTENDED_SHADOW,
   BOSCH_CAMERA_HEADER,
+  BOSCH_OEM_STATE_NONE,
+  BOSCH_OEM_STATE_SELECTED,
+  BOSCH_OEM_STATE_TENTATIVE,
+  BOSCH_OEM_STATE_VALIDATED,
   BOSCH_TRUCK_A0_RECOVERY_HOLD_SCANS,
   BOSCH_TRUCK_P2_CONFIRMATIONS,
   BoschCameraCycleCache,
@@ -1054,3 +1058,138 @@ class TestBoschLargeVehicleA0Recovery:
     self.configure(grouping, ns, {})
     grouping.update(ns, (), 10.)
     assert grouping.truck_pair_histories == {}
+
+
+class TestBoschCompanionDeferral:
+  """OEM-anchored longitudinal companion deferral.
+
+  Two published contacts the camera assigns to one episode, inside the rigid
+  pair window, with the OEM's own word1 target on the nearer one: the farther
+  surface must not stay in the published set competing for the longitudinal
+  lead, and the nearer one must always survive.
+  """
+  EPISODE = 7
+  NEAR, FAR = 1_000_001, 1_000_002
+
+  @staticmethod
+  def camera(width_m=2.5, episode=EPISODE):
+    return BoschCameraObject(obj_id=3, episode=episode, long_m=20., width_m=width_m, class_code=6)
+
+  @classmethod
+  def configure(cls, provider, mapping=None, width_m=2.5, episode=EPISODE):
+    ext = provider.camera_extended
+    mapping = mapping if mapping is not None else {
+      pid: (BOSCH_CAMERA_ASSOC_ASSIGNED, cls.EPISODE, 6) for pid in (cls.NEAR, cls.FAR)}
+    ext._associate = lambda obj, *_: mapping.get(obj.physical_track_id,
+                                                 (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1))
+    camera = cls.camera(width_m, episode)
+    ext.camera.snapshot = lambda ns: ([camera], 1, 0, ns)
+
+  @classmethod
+  def objects(cls, ns, near_d=12.5, far_d=18.75, oem='near', y_rel=0.):
+    near = physical(cls.NEAR, near_d, y_rel=y_rel, ns=ns)
+    far = physical(cls.FAR, far_d, y_rel=y_rel, ns=ns)
+    if oem == 'near':
+      near = replace(near, oem_selected=True)
+    elif oem == 'far':
+      far = replace(far, oem_selected=True)
+    return (near, far)
+
+  @classmethod
+  def scan(cls, provider, ns, objects=None, state=BOSCH_OEM_STATE_VALIDATED, **kwargs):
+    objects = cls.objects(ns, **kwargs) if objects is None else objects
+    provider.last_oem_state = state
+    provider.camera_extended.update(ns, objects, 25.)
+    return objects, provider.publication_view(objects)
+
+  @classmethod
+  def provider(cls, width_m=2.5):
+    provider = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)
+    cls.configure(provider, width_m=width_m)
+    return provider
+
+  def test_defers_the_farther_surface_and_keeps_the_oem_anchor(self):
+    provider = self.provider()
+    objects, view = self.scan(provider, 1_000_000_000)
+    assert [obj.physical_track_id for obj in view] == [self.NEAR]
+    assert provider.last_companion_deferred == (self.FAR,)
+    assert provider.companion_deferred_points == 1
+
+  def test_repeated_publication_view_for_one_scan_is_stable(self):
+    provider = self.provider()
+    objects, view = self.scan(provider, 1_000_000_000)
+    assert [o.physical_track_id for o in provider.publication_view(objects)] == [self.NEAR]
+
+  @pytest.mark.parametrize(('kwargs', 'reason'), (
+    ({'oem': 'far'}, 'word1 on the farther surface'),
+    ({'oem': 'none'}, 'no OEM anchor at all'),
+    ({'near_d': 12.5, 'far_d': 15.0}, 'separation below the 3 m window'),
+    ({'near_d': 12.5, 'far_d': 25.0}, 'separation beyond the 12 m window'),
+    ({'y_rel': 3.0}, 'pair outside the lead corridor'),
+  ))
+  def test_publishes_both_when_the_evidence_is_incomplete(self, kwargs, reason):
+    provider = self.provider()
+    objects, view = self.scan(provider, 1_000_000_000, **kwargs)
+    assert view is objects, reason
+
+  def test_requires_oem_validation(self):
+    provider = self.provider()
+    for state in (BOSCH_OEM_STATE_NONE, BOSCH_OEM_STATE_TENTATIVE, BOSCH_OEM_STATE_SELECTED):
+      objects, view = self.scan(provider, 1_000_000_000, state=state)
+      assert view is objects
+
+  def test_narrow_camera_object_caps_the_separation(self):
+    # A 1.9 m wide object cannot own two returns 6 m apart; a wide one can.
+    for width, deferred in ((1.9, False), (2.5, True)):
+      provider = self.provider(width)
+      _, view = self.scan(provider, 1_000_000_000)
+      assert (len(view) == 1) is deferred, width
+
+  def test_a_lost_anchor_republishes_within_the_hold(self):
+    provider = self.provider()
+    ns = 1_000_000_000
+    _, view = self.scan(provider, ns)
+    assert len(view) == 1
+    # word1 moves away: the pair coasts on the hold, then reopens.
+    ns += 100_000_000
+    _, view = self.scan(provider, ns, oem='none')
+    assert len(view) == 1
+    ns += 300_000_000
+    provider.camera_extended.histories = {}
+    _, view = self.scan(provider, ns, oem='none')
+    assert len(view) == 2
+
+  def test_a_stale_camera_reopens_publication(self):
+    provider = self.provider()
+    _, view = self.scan(provider, 1_000_000_000)
+    assert len(view) == 1
+    ext = provider.camera_extended
+    camera = self.camera()
+    ext.camera.snapshot = lambda ns: ([camera], 1, 0, ns - 300_000_000)
+    objects, view = self.scan(provider, 1_100_000_000)
+    assert view is objects
+    assert provider.companion_pairs == {}
+
+  def test_never_removes_the_last_contact_of_a_vehicle(self):
+    provider = self.provider()
+    ns = 1_000_000_000
+    objects, view = self.scan(provider, ns)
+    assert len(view) == 1
+    # the nearer surface is gone from the published set: the farther one stays
+    ns += 100_000_000
+    objects = self.objects(ns)
+    provider.last_oem_state = BOSCH_OEM_STATE_VALIDATED
+    provider.camera_extended.update(ns, objects, 25.)
+    only_far = (objects[1],)
+    assert provider.publication_view(only_far) is only_far
+
+  def test_off_mode_is_exact_identity(self):
+    provider = self.provider()
+    import opendbc.car.hyundai.radar_interface as module
+    original = module.BOSCH_COMPANION_DEFER_MODE
+    module.BOSCH_COMPANION_DEFER_MODE = module.BOSCH_COMPANION_DEFER_OFF
+    try:
+      objects, view = self.scan(provider, 1_000_000_000)
+      assert view is objects
+    finally:
+      module.BOSCH_COMPANION_DEFER_MODE = original

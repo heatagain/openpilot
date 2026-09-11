@@ -404,6 +404,26 @@ BOSCH_TRUCK_P2_DV_MAX_MPS = 0.50
 BOSCH_TRUCK_A0_RECOVERY_HOLD_SCANS = 2
 BOSCH_TRUCK_A0_RECOVERY_BEARING_EXCESS_RAD = 0.010
 BOSCH_TRUCK_A0_RECOVERY_COST_MARGIN = 0.15
+# 같은 LDWS camera episode에 배정된 두 발행 contact가 rigid pair 창 안에 있으면
+# 한 차량의 두 표면이다. downstream은 moving lead를 model의 시각 거리와의 일치도로
+# 고르고 stationary lead는 track age로 유지하므로, 긴 차량에서는 후면보다 몇 m 뒤에
+# 있는 표면에 leadOne을 앉히고 정작 후면을 별도의 cut-in으로 보고할 수 있다.
+# OEM이 더 가까운 contact를 자기 제어 대상(0x601 word1)으로 고르고 0x601이
+# VALIDATED인 동안에만 더 먼 표면을 발행에서 미룬다. 더 먼 쪽만, 그리고 가까운 쪽이
+# 실제로 발행되는 동안에만 숨기므로 그 차량의 contact가 사라지는 일은 없다.
+BOSCH_COMPANION_DEFER_OFF = 0
+BOSCH_COMPANION_DEFER_ACTIVE = 1
+BOSCH_COMPANION_DEFER_MODE = BOSCH_COMPANION_DEFER_ACTIVE
+BOSCH_COMPANION_DEFER_CONFIRMATIONS = 1
+BOSCH_COMPANION_DEFER_HOLD_NS = 200_000_000
+BOSCH_COMPANION_DEFER_STATE_MAX = 16
+BOSCH_COMPANION_DEFER_DD_MIN_M = 3.0
+BOSCH_COMPANION_DEFER_DD_MAX_M = 12.0
+BOSCH_COMPANION_DEFER_DY_MAX_M = 1.5
+BOSCH_COMPANION_DEFER_DV_MAX_MPS = 1.0
+BOSCH_COMPANION_DEFER_Y_MAX_M = 2.5
+# 좁은 camera object는 여러 m 떨어진 두 return을 가질 수 없다.
+BOSCH_COMPANION_DEFER_WIDTH_DD_M = ((2.00, 5.0), (2.30, 7.0))
 
 
 def _bosch_camera_signed(value, bits):
@@ -683,6 +703,9 @@ class BoschCameraExtendedGrouping:
     self.last_truck_edge_count = 0
     self.max_truck_pair_state = 0
     self.last_truck_recovery_count = 0
+    self.last_camera_by_episode = {}
+    self.last_v_ego = math.nan
+    self.last_yaw_rate = None
 
   @staticmethod
   def _geometry(a, b, v_ego, yaw_rate):
@@ -1026,6 +1049,11 @@ class BoschCameraExtendedGrouping:
         associations[pid] = self._associate(by_pid[pid], camera_objects, camera_count)
     self.last_association_count = len(associations)
     self.last_associations = associations
+    # publication_view의 companion deferral이 같은 scan의 A0 판정과 pair gate를
+    # 다시 계산하지 않고 그대로 쓰도록 보관한다.
+    self.last_camera_by_episode = camera_by_episode
+    self.last_v_ego = v_ego
+    self.last_yaw_rate = yaw_rate
     now = time.perf_counter_ns()
     self._record_perf('association', now - assoc_start)
 
@@ -3545,7 +3573,102 @@ class BoschRadarProvider:
     self.test_publications = self.test_suppressed_points = self.test_active_groups = 0
     self.test_last_suppressed = ()
     self.test_last_active_groups = 0
+    self.last_oem_state = BOSCH_OEM_STATE_NONE
+    self.companion_pairs = {}
+    self.companion_deferred_points = 0
+    self.companion_defer_scans = 0
+    self.last_companion_deferred = ()
+    self._companion_ns = None
+    self._companion_prev_ns = None
+    self._companion_hidden = {}
     self._reset_perf()
+
+  def _companion_pairs_update(self, objects):
+    """같은 scan에 대해 한 번만 돌며 (먼 PID -> 가까운 PID) 지연 대상 쌍을 만든다."""
+    ext = self.camera_extended
+    timestamp_ns = ext.last_ns
+    if (self._companion_prev_ns is not None and
+        timestamp_ns - self._companion_prev_ns > BOSCH_CAMERA_OBSERVATION_GAP_NS):
+      self.companion_pairs = {}
+    self._companion_prev_ns = timestamp_ns
+    if (ext.last_camera_ns is None or
+        not 0 <= timestamp_ns - ext.last_camera_ns <= BOSCH_CAMERA_OBSERVATION_GAP_NS):
+      # camera가 낡으면 identity 근거가 없다. fail-open으로 상태를 버린다.
+      self.companion_pairs = {}
+      return {}
+    by_pid = {obj.physical_track_id: obj for obj in objects if obj.timestamp_ns == timestamp_ns}
+    episodes = {}
+    for pid, verdict in ext.last_associations.items():
+      if verdict[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and verdict[1] >= 0 and pid in by_pid:
+        episodes.setdefault(verdict[1], []).append(pid)
+    validated = self.last_oem_state == BOSCH_OEM_STATE_VALIDATED
+    v_ego = ext.last_v_ego
+    yaw = ext.last_yaw_rate if ext.last_yaw_rate is not None and math.isfinite(ext.last_yaw_rate) else 0.0
+    next_pairs = {}
+    hidden = {}
+    for episode, pids in sorted(episodes.items()):
+      if len(pids) < 2:
+        continue
+      camera = ext.last_camera_by_episode.get(episode)
+      if camera is None:
+        continue
+      limit = BOSCH_COMPANION_DEFER_DD_MAX_M
+      for width, bound in BOSCH_COMPANION_DEFER_WIDTH_DD_M:
+        if camera.width_m < width:
+          limit = min(limit, bound)
+          break
+      members = sorted(pids, key=lambda pid: (by_pid[pid].d_rel, pid))
+      for index in range(len(members) - 1):
+        near, far = by_pid[members[index]], by_pid[members[index + 1]]
+        key = (episode, members[index], members[index + 1])
+        confirmations, last_ns = self.companion_pairs.get(key, (0, 0))
+        conflict = False
+        if math.isfinite(v_ego):
+          world_near = abs(near.v_rel + v_ego - yaw * near.y_rel)
+          world_far = abs(far.v_rel + v_ego - yaw * far.y_rel)
+          conflict = min(world_near, world_far) <= 0.6 and max(world_near, world_far) >= 1.4
+        okay = (validated and near.oem_selected and not far.oem_selected and not conflict and
+                BOSCH_COMPANION_DEFER_DD_MIN_M < far.d_rel - near.d_rel <= limit and
+                abs(far.y_rel - near.y_rel) <= BOSCH_COMPANION_DEFER_DY_MAX_M and
+                abs(far.v_rel - near.v_rel) <= BOSCH_COMPANION_DEFER_DV_MAX_MPS and
+                abs(near.y_rel) <= BOSCH_COMPANION_DEFER_Y_MAX_M and
+                abs(far.y_rel) <= BOSCH_COMPANION_DEFER_Y_MAX_M)
+        if okay:
+          confirmations, last_ns = confirmations + 1, timestamp_ns
+        elif not (confirmations >= BOSCH_COMPANION_DEFER_CONFIRMATIONS and
+                  0 <= timestamp_ns - last_ns <= BOSCH_COMPANION_DEFER_HOLD_NS):
+          # 근거가 끊기면 즉시 발행을 되돌린다. hold는 확인된 쌍에만 준다.
+          confirmations = 0
+        if len(next_pairs) < BOSCH_COMPANION_DEFER_STATE_MAX:
+          next_pairs[key] = (confirmations, last_ns)
+        if confirmations >= BOSCH_COMPANION_DEFER_CONFIRMATIONS:
+          hidden[members[index + 1]] = members[index]
+    self.companion_pairs = next_pairs
+    return hidden
+
+  def _companion_view(self, objects):
+    """OEM anchor가 확인한 same-vehicle pair에서 더 먼 표면을 발행에서 미룬다."""
+    ext = self.camera_extended
+    if (BOSCH_COMPANION_DEFER_MODE != BOSCH_COMPANION_DEFER_ACTIVE or
+        ext.mode == BOSCH_CAMERA_EXTENDED_OFF or ext.last_ns is None or not objects):
+      self.last_companion_deferred = ()
+      return objects
+    if ext.last_ns != self._companion_ns:
+      self._companion_ns = ext.last_ns
+      self._companion_hidden = self._companion_pairs_update(objects)
+    hidden = self._companion_hidden
+    if not hidden:
+      self.last_companion_deferred = ()
+      return objects
+    present = {obj.physical_track_id for obj in objects}
+    # 가까운 쪽이 실제로 발행될 때만 먼 쪽을 숨긴다. 마지막 contact는 지우지 않는다.
+    deferred = frozenset(far for far, near in hidden.items() if far in present and near in present)
+    self.last_companion_deferred = tuple(sorted(deferred))
+    if not deferred:
+      return objects
+    self.companion_deferred_points += len(deferred)
+    self.companion_defer_scans += 1
+    return tuple(obj for obj in objects if obj.physical_track_id not in deferred)
 
   def publication_view(self, objects, timestamp_ns=None):
     # Candidate P91 ACTIVE is the Bosch research-branch production path. The
@@ -3568,13 +3691,13 @@ class BoschRadarProvider:
       objects = tuple(obj for obj in objects if obj.physical_track_id not in withheld)
     ext = self.camera_extended
     if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
-      return objects
+      return self._companion_view(objects)
     if timestamp_ns is not None:
       self.test_publications += 1
     if not ext.mature_groups or not objects:
       self.test_last_suppressed = ()
       self.test_last_active_groups = 0
-      return objects
+      return self._companion_view(objects)
     # 다른 scan의 tuple 또는 qualification에서 대표가 빠진 그룹은 baseline으로 연다.
     by_pid = {obj.physical_track_id: obj for obj in objects}
     suppressed = set()
@@ -3605,7 +3728,8 @@ class BoschRadarProvider:
                     f'suppressed_pids={",".join(str(p) for p in members if p != rep.representative_pid)} '
                     f'suppressed_count={len(members) - 1} camera_id={camera_id} episode={state.cam_key} '
                     f'camera_ns={ext.last_camera_ns} members_pid_alias_d_y_v={detail}')
-    return tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects
+    return self._companion_view(
+      tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects)
 
   def _reset_perf(self):
     self._perf_scans = 0
@@ -3929,6 +4053,7 @@ class BoschRadarProvider:
     self._debug_word0_active = word0_active
     self._debug_word1_active = word1_active
     self._debug_oem_state = oem_state
+    self.last_oem_state = oem_state
     gate_start_ns = time.perf_counter_ns()
     self.oem_gate.update(qualified, availability_ns, v_ego, state=oem_state,
                          word0_pids=processed_pids, oem_valid=scc_valid)
