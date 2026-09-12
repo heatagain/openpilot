@@ -13,6 +13,10 @@ from opendbc.car.hyundai.radar_interface import (
   BOSCH_CAMERA_EXTENDED_OFF,
   BOSCH_CAMERA_EXTENDED_SHADOW,
   BOSCH_CAMERA_HEADER,
+  BOSCH_CAMERA_LAT_MAX_M,
+  BOSCH_CAMERA_LONG_MAX_M,
+  BOSCH_CAMERA_RANGE_LSB,
+  BOSCH_CAMERA_WIDTH_REF_M,
   BOSCH_OEM_STATE_NONE,
   BOSCH_OEM_STATE_SELECTED,
   BOSCH_OEM_STATE_TENTATIVE,
@@ -33,6 +37,8 @@ from opendbc.car.hyundai.radar_interface import (
   bosch_append_points,
   bosch_fill_point,
   bosch_published_surface,
+  _bosch_camera_long_window,
+  _bosch_camera_range_span,
 )
 from opendbc.car import structs
 
@@ -45,9 +51,9 @@ def camera_frames(counter, objects):
   frames = [(BOSCH_CAMERA_HEADER, len(objects) | (counter << 52))]
   for slot, obj in enumerate(objects):
     obj_id, long_m, lat_m, vrel_mps, width_m, cls, ext, right, left = obj
-    a = (obj_id | (round(long_m / .0625) << 8) |
-         (signed(round(lat_m / .0625), 12) << 20) |
-         (signed(round(vrel_mps / .0625), 12) << 40) | (counter << 52))
+    a = (obj_id | (round(long_m / BOSCH_CAMERA_RANGE_LSB) << 8) |
+         (signed(round(lat_m / BOSCH_CAMERA_RANGE_LSB), 12) << 20) |
+         (signed(round(vrel_mps / BOSCH_CAMERA_RANGE_LSB), 12) << 40) | (counter << 52))
     b = round(width_m / .05) | (cls << 48) | (ext << 50) | (counter << 52)
     c = (signed(round(right * 4496.3), 13) << 18) | (signed(round(left * 4496.3), 13) << 31) | (counter << 52)
     frames.extend(((0x739 + 3 * slot, a), (0x73a + 3 * slot, b), (0x73b + 3 * slot, c)))
@@ -124,15 +130,80 @@ class TestBoschCameraCycleCache:
 
 
 class TestBoschCameraAssociationAndGeometry:
-  def test_frozen_a0_many_to_one_and_ambiguous(self):
-    a, b = physical(1_000_001, 15.), physical(1_000_002, 19.)
+  def test_a0_many_to_one_and_ambiguous(self):
+    # cam 20 m, 폭 1.70 m. 창은 양쪽 모두 1.75 + 0.12*d_rel 이고, 더 이상
+    # "카메라가 더 멀 때만" 허용하지 않는다.
     cam = BoschCameraObject(7, 11, 20., 0., 0., 1.7, 1, .1, -.1)
-    assert BoschCameraExtendedGrouping._associate(a, [cam], 1) == (BOSCH_CAMERA_ASSOC_ASSIGNED, 11, 1)
-    assert BoschCameraExtendedGrouping._associate(b, [cam], 1) == (BOSCH_CAMERA_ASSOC_ASSIGNED, 11, 1)
+    nearer = physical(1_000_001, 17.5)    # d_long +2.5, 창 3.85
+    farther = physical(1_000_002, 23.5)   # d_long -3.5, 창 4.57  (구 gate는 기각했다)
+    assert BoschCameraExtendedGrouping._associate(nearer, [cam], 1) == (BOSCH_CAMERA_ASSOC_ASSIGNED, 11, 1)
+    assert BoschCameraExtendedGrouping._associate(farther, [cam], 1) == (BOSCH_CAMERA_ASSOC_ASSIGNED, 11, 1)
     twin = BoschCameraObject(8, 12, 20., 0., 0., 1.7, 1, .1, -.1)
-    assert BoschCameraExtendedGrouping._associate(a, [cam, twin], 2)[0] == BOSCH_CAMERA_ASSOC_AMBIGUOUS
-    far = physical(1_000_003, 25.1)
-    assert BoschCameraExtendedGrouping._associate(far, [cam], 1)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+    assert BoschCameraExtendedGrouping._associate(nearer, [cam, twin], 2)[0] == BOSCH_CAMERA_ASSOC_AMBIGUOUS
+    # 양쪽 바깥은 여전히 기각된다
+    assert BoschCameraExtendedGrouping._associate(physical(1_000_003, 15.),
+                                                  [cam], 1)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+    assert BoschCameraExtendedGrouping._associate(physical(1_000_004, 26.),
+                                                  [cam], 1)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_range_proportional_window_and_width_asymmetry(self):
+    # 단안 거리 오차는 비례하므로 창도 비례한다
+    assert _bosch_camera_range_span(0.) == pytest.approx(1.75)
+    assert _bosch_camera_range_span(20.) == pytest.approx(4.15)
+    assert _bosch_camera_range_span(100.) == pytest.approx(13.75)
+    # 승용차 폭에서는 대칭이다
+    assert _bosch_camera_long_window(_bosch_camera_range_span(20.), 1.70) == \
+        pytest.approx((4.15, 4.15))
+    assert _bosch_camera_long_window(_bosch_camera_range_span(20.), 1.55) == \
+        pytest.approx((4.15, 4.15))
+    # 대형차는 가까운 쪽이 훨씬 넓다: 레이더가 차체 깊은 곳의 return을 유지한다
+    l_pos, l_neg = _bosch_camera_long_window(_bosch_camera_range_span(20.), 2.45)
+    assert (l_pos, l_neg) == pytest.approx((7.15, 16.15))
+    assert l_neg > l_pos
+    # 창에는 상한이 있다
+    assert _bosch_camera_long_window(_bosch_camera_range_span(200.), 3.0) == \
+        pytest.approx((BOSCH_CAMERA_LONG_MAX_M, BOSCH_CAMERA_LONG_MAX_M))
+
+  def test_large_vehicle_return_depth_stays_one_object(self):
+    # 폭 2.45 m 대형차: 후면 20 m, 차체 깊은 return 34 m 까지 같은 객체다
+    cam = BoschCameraObject(7, 11, 20., 0., 0., 2.45, 1, .1, -.1)
+    for d_rel in (14.0, 20.0, 27.0, 34.0):
+      assert BoschCameraExtendedGrouping._associate(physical(1_000_001, d_rel),
+                                                    [cam], 1)[0] == BOSCH_CAMERA_ASSOC_ASSIGNED
+    # 그 바깥은 기각된다. 창은 각 member의 d_rel에서 계산되므로 12.5 m 에서는
+    # l_pos 6.25 < 7.5, 40 m 에서는 l_neg 18.55 < 20.0 이다.
+    assert BoschCameraExtendedGrouping._associate(physical(1_000_002, 12.5),
+                                                  [cam], 1)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+    assert BoschCameraExtendedGrouping._associate(physical(1_000_003, 40.0),
+                                                  [cam], 1)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  @pytest.mark.parametrize(('d_rel', 'assigned'), ((2.0, True), (12.0, True), (80.0, True)))
+  def test_camera_may_read_nearer_than_the_radar_at_every_range(self, d_rel, assigned):
+    # 교정된 스케일에서 참 쌍의 약 1/3은 카메라가 레이더보다 가깝다.
+    # 구 gate(l_neg = 0)는 그것을 전부 기각했다.
+    span = _bosch_camera_range_span(d_rel)
+    cam = BoschCameraObject(7, 11, d_rel - span * 0.5, 0., 0., 1.7, 1, .1, -.1)
+    verdict = BoschCameraExtendedGrouping._associate(physical(1_000_001, d_rel), [cam], 1)
+    assert (verdict[0] == BOSCH_CAMERA_ASSOC_ASSIGNED) is assigned
+
+  def test_lateral_gate_is_one_and_three_quarter_metres(self):
+    cam = BoschCameraObject(7, 11, 20., 0., 0., 1.7, 1, .5, -.5)
+    inside = physical(1_000_001, 20., y_rel=-(BOSCH_CAMERA_LAT_MAX_M - 0.05))
+    outside = physical(1_000_002, 20., y_rel=-(BOSCH_CAMERA_LAT_MAX_M + 0.05))
+    assert BoschCameraExtendedGrouping._associate(inside, [cam], 1)[0] == BOSCH_CAMERA_ASSOC_ASSIGNED
+    assert BoschCameraExtendedGrouping._associate(outside, [cam], 1)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_bearing_gate_and_velocity_are_unchanged(self):
+    # bearing 창(0.020 rad)은 스케일과 무관하며 이번 변경에서 손대지 않았다
+    cam = BoschCameraObject(7, 11, 20., 0., 0., 1.7, 1, .02, .01)
+    inside = physical(1_000_001, 20., y_rel=-20. * 0.0199)
+    outside = physical(1_000_002, 20., y_rel=-20. * 0.0401)
+    assert BoschCameraExtendedGrouping._associate(inside, [cam], 1)[0] == BOSCH_CAMERA_ASSOC_ASSIGNED
+    assert BoschCameraExtendedGrouping._associate(outside, [cam], 1)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+    # 속도에는 hard gate가 없다: 큰 dv도 기각되지 않는다(비용에만 들어간다)
+    fast = BoschCameraObject(9, 13, 20., 0., 12., 1.7, 1, .1, -.1)
+    assert BoschCameraExtendedGrouping._associate(physical(1_000_003, 20.),
+                                                  [fast], 1)[0] == BOSCH_CAMERA_ASSOC_ASSIGNED
 
   @pytest.mark.parametrize(('dd', 'expected'), ((3.0, False), (3.25, True), (12.0, True), (12.01, False)))
   def test_distance_boundaries(self, dd, expected):
@@ -612,7 +683,9 @@ class TestBoschActiveTestPublication:
         p = ri.bosch
         if p.camera_extended.camera is not None:
           # camera 공백으로 split/reappearance를 유발한 뒤 maturity를 다시 시작한다.
-          feed(p.camera_extended.camera, ns, i, [(7, 20., 0., 0., 1.7, 1, 0, -.1, .1)] if i != 5 else [])
+          # 카메라 거리는 교정된 0.05 스케일에서 member 15/19 m 와 정합하는 값이다
+          # (구 0.0625 스케일에서는 같은 장면이 20 m 로 읽혔다).
+          feed(p.camera_extended.camera, ns, i, [(7, 16.5, 0., 0., 1.7, 1, 0, -.1, .1)] if i != 5 else [])
         p.camera_extended.update(ns, objects, 10.)
         p.tracker.group_manager.states = {o.physical_track_id: None for o in objects}
         p.last_scan_timestamp_ns = ri._bosch_now_ns = ns
@@ -1468,3 +1541,121 @@ class TestBoschContinuityAnchorPublicationSplit:
     late = self.SCAN_NS + 10 * self.STEP_NS
     manager.update(late, (self.track(4242, 30, 80.0, 0., 0., late),))
     assert pid not in manager.states
+
+
+class TestBoschCameraScaleCorrection:
+  """0.0625 -> 0.05 스케일 교정과 그에 맞춘 association 창의 회귀 고정."""
+
+  @staticmethod
+  def word(long_raw, lat_raw, vrel_raw, obj_id=7, counter=0):
+    return (obj_id | (long_raw << 8) | (signed(lat_raw, 12) << 20) |
+            (signed(vrel_raw, 12) << 40) | (counter << 52))
+
+  def test_longitudinal_raw_count_is_read_at_five_centimetres(self):
+    cache = BoschCameraCycleCache()
+    cache.ingest(1_000_000_000, BOSCH_CAMERA_HEADER, (1).to_bytes(8, 'little'))
+    cache.ingest(1_000_000_000, 0x739, self.word(400, 0, 0).to_bytes(8, 'little'))
+    cache.ingest(1_000_000_000, 0x73a, (round(1.70 / .05) | (1 << 48)).to_bytes(8, 'little'))
+    cache.ingest(1_000_000_000, 0x73b, (0).to_bytes(8, 'little'))
+    obj = cache.snapshot(1_001_000_000)[0][0]
+    # 400 counts: 0.05 이면 20.00 m, 0.0625 이면 25.00 m
+    assert obj.long_m == pytest.approx(20.0)
+    assert BOSCH_CAMERA_RANGE_LSB == 0.05
+
+  def test_lateral_is_signed_at_five_centimetres_with_inverted_sign(self):
+    cache = BoschCameraCycleCache()
+    cache.ingest(1_000_000_000, BOSCH_CAMERA_HEADER, (1).to_bytes(8, 'little'))
+    cache.ingest(1_000_000_000, 0x739, self.word(400, -70, 0).to_bytes(8, 'little'))
+    cache.ingest(1_000_000_000, 0x73a, (round(1.70 / .05) | (1 << 48)).to_bytes(8, 'little'))
+    cache.ingest(1_000_000_000, 0x73b, (0).to_bytes(8, 'little'))
+    obj = cache.snapshot(1_001_000_000)[0][0]
+    assert obj.lat_m == pytest.approx(-3.50)
+    # 카메라 부호는 Bosch/SCC와 반대다: d_lat 은 더하기로 만든다
+    target = physical(1_000_001, 20., y_rel=3.50)
+    cam = BoschCameraObject(7, 11, 20., obj.lat_m, 0., 1.7, 1, .2, -.2)
+    assert BoschCameraExtendedGrouping._associate(target, [cam], 1)[0] == BOSCH_CAMERA_ASSOC_ASSIGNED
+
+  def test_relative_speed_is_signed_at_five_centimetres(self):
+    cache = BoschCameraCycleCache()
+    cache.ingest(1_000_000_000, BOSCH_CAMERA_HEADER, (1).to_bytes(8, 'little'))
+    cache.ingest(1_000_000_000, 0x739, self.word(400, 0, -50).to_bytes(8, 'little'))
+    cache.ingest(1_000_000_000, 0x73a, (round(1.70 / .05) | (1 << 48)).to_bytes(8, 'little'))
+    cache.ingest(1_000_000_000, 0x73b, (0).to_bytes(8, 'little'))
+    obj = cache.snapshot(1_001_000_000)[0][0]
+    assert obj.vrel_mps == pytest.approx(-2.50)
+
+  @pytest.mark.parametrize('d_rel', (4.0, 25.0, 90.0))
+  def test_same_object_at_every_range_band(self, d_rel):
+    # 실측 중앙값은 +0.15 m 근처이고 p05/p95 는 창 안에 있다
+    for residual in (-0.9, 0.0, +0.9):
+      cam = BoschCameraObject(7, 11, d_rel + residual, 0., 0., 1.7, 1, .1, -.1)
+      verdict = BoschCameraExtendedGrouping._associate(physical(1_000_001, d_rel), [cam], 1)
+      assert verdict[0] == BOSCH_CAMERA_ASSOC_ASSIGNED
+
+  @pytest.mark.parametrize('side', (+1, -1))
+  def test_adjacent_lane_vehicle_is_not_associated(self, side):
+    # 옆차선 차량: 카메라 lat 은 Bosch 부호의 반대이므로 ego-lane 레이더 객체와의
+    # d_lat 은 한 차선 폭이 된다
+    cam = BoschCameraObject(7, 11, 20., -side * 3.5, 0., 1.7, 2, .2, -.2)
+    ego_lane = physical(1_000_001, 20., y_rel=0.)
+    assert BoschCameraExtendedGrouping._associate(ego_lane, [cam], 1)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+    same_lane = physical(1_000_002, 20., y_rel=side * 3.5)
+    assert BoschCameraExtendedGrouping._associate(same_lane, [cam], 1)[0] == BOSCH_CAMERA_ASSOC_ASSIGNED
+
+  def test_oncoming_object_is_separated_by_geometry_not_by_a_new_field(self):
+    # 대향 차량은 옆차선 기하로 분리된다. opposite bit(B bit29)는 이 커밋에서
+    # production gate로 쓰지 않는다: 같은 기하면 여전히 연관된다.
+    oncoming = BoschCameraObject(7, 11, 30., -3.6, -25., 1.7, 2, .2, -.2)
+    ours = physical(1_000_001, 30., y_rel=0., v_rel=-1.)
+    assert BoschCameraExtendedGrouping._associate(ours, [oncoming], 1)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_two_vehicles_in_one_bearing_are_ambiguous_not_arbitrary(self):
+    near = BoschCameraObject(7, 11, 20., 0., 0., 1.7, 2, .1, -.1)
+    far = BoschCameraObject(8, 12, 21., 0., 0., 1.7, 2, .1, -.1)
+    verdict = BoschCameraExtendedGrouping._associate(physical(1_000_001, 20.5), [near, far], 2)
+    assert verdict[0] == BOSCH_CAMERA_ASSOC_AMBIGUOUS
+
+  def test_cut_in_keeps_its_association_across_the_lane_transition(self):
+    # 옆차선에서 자기 차선으로 들어오는 차량. 레이더 y 와 카메라 lat 이 함께
+    # 움직이는 한 연관은 유지된다.
+    for y_rel in (2.4, 1.8, 1.2, 0.6, 0.0):
+      cam = BoschCameraObject(7, 11, 24.6, -y_rel, -1.5, 1.7, 2, .15, -.15)
+      target = physical(1_000_001, 25., y_rel=y_rel, v_rel=-1.5)
+      assert BoschCameraExtendedGrouping._associate(target, [cam], 1) == \
+          (BOSCH_CAMERA_ASSOC_ASSIGNED, 11, 2)
+
+  def test_frozen_policies_this_change_does_not_touch(self):
+    import opendbc.car.hyundai.radar_interface as module
+    # bearing 창 / 비용 가중치 / 모호성 마진 / 폭 기준 / 각도 LSB
+    assert module.BOSCH_CAMERA_WIDTH_REF_M == 1.70
+    assert module.BOSCH_CAMERA_ANGLE_LSB == 1.0 / 4496.3
+    # 이번 변경의 상수들
+    assert (module.BOSCH_CAMERA_LONG_BASE_M, module.BOSCH_CAMERA_LONG_RANGE_K) == (1.75, 0.12)
+    assert (module.BOSCH_CAMERA_LONG_POS_WIDTH_K, module.BOSCH_CAMERA_LONG_NEG_WIDTH_K) == (4.0, 16.0)
+    assert (module.BOSCH_CAMERA_LONG_MAX_M, module.BOSCH_CAMERA_LAT_MAX_M) == (20.0, 1.75)
+    # 기존 ACTIVE 정책 상수는 그대로다
+    assert module.BOSCH_P91_MODE == module.BOSCH_P91_ACTIVE
+    assert module.BOSCH_OEM_GATE_MODE == module.BOSCH_OEM_GATE_ACTIVE
+    assert module.BOSCH_COMPANION_DEFER_MODE == module.BOSCH_COMPANION_DEFER_ACTIVE
+    assert module.BOSCH_CAMERA_EXTENDED_MODE == module.BOSCH_CAMERA_EXTENDED_ACTIVE_TEST
+    assert (module.BOSCH_TRUCK_P2_WIDTH_MIN_M, module.BOSCH_TRUCK_P2_CONFIRMATIONS) == (2.40, 5)
+
+  def test_new_constants_are_read_only_by_the_bosch_camera_path(self):
+    from pathlib import Path
+    import re
+    source = Path(module_path()).read_text(encoding='utf-8')
+    for name in ('BOSCH_CAMERA_RANGE_LSB', 'BOSCH_CAMERA_LONG_BASE_M',
+                 'BOSCH_CAMERA_LONG_RANGE_K', 'BOSCH_CAMERA_LONG_POS_WIDTH_K',
+                 'BOSCH_CAMERA_LONG_NEG_WIDTH_K', 'BOSCH_CAMERA_LONG_MAX_M',
+                 'BOSCH_CAMERA_LAT_MAX_M'):
+      uses = [m.start() for m in re.finditer(name, source)]
+      assert uses, name
+      # 모든 사용처가 Bosch 영역 안에 있다: generic RadarInterface 이후에는
+      # 단 한 번도 나타나지 않는다
+      generic = source.index('class RadarInterface(')
+      assert all(pos < generic for pos in uses), name
+
+
+def module_path():
+  import opendbc.car.hyundai.radar_interface as module
+  return module.__file__

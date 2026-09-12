@@ -1512,3 +1512,184 @@ class TestBoschOemValidationGate:
     gate.update((), self.START_NS + 900_000_000, 30.,
                 state=radar_interface_module.BOSCH_OEM_STATE_NONE)
     assert gate._states == {}
+
+
+class TestBoschRawAssociationLowSpeedInvariants:
+  """What the low-speed raw-association audit measured, locked as behaviour.
+
+  These are not aspirations: every threshold asserted here is the value the
+  audit read off the production source, and every scenario is one the audit
+  found in the nine-route corpus. They exist so a later association change has
+  to state, in a diff, which of these it is choosing to move.
+  """
+  SCAN_NS = 100_000_000
+
+  @staticmethod
+  def detection(slot, d_rel, y_rel, v_rel, timestamp_ns):
+    return BoschRawDetection(timestamp_ns, slot, d_rel, y_rel, v_rel, raw_word=1)
+
+  @classmethod
+  def run(cls, scans, config=None):
+    manager = BoschRawTrackManager(config)
+    outputs = [manager.update(ns, detections) for ns, detections in scans]
+    return manager, outputs
+
+  @staticmethod
+  def ids(scan):
+    return {track.slot: track.raw_track_id for track in scan}
+
+  # --- near-range quantisation --------------------------------------------
+  def test_one_lsb_jitter_at_three_metres_keeps_one_identity(self):
+    """d steps by one 0.25 m LSB and y by one 0.03125 m LSB; still one track."""
+    scans = []
+    for index in range(8):
+      ns = (index + 1) * self.SCAN_NS
+      d = 3.00 + .25 * (index % 2)
+      y = .25 + .03125 * (index % 3)
+      scans.append((ns, (self.detection(4, d, y, 0., ns),)))
+    _, outputs = self.run(scans)
+    assert len({scan[0].raw_track_id for scan in outputs}) == 1
+    assert outputs[-1][0].age_scans == 8
+
+  # --- coast retries -------------------------------------------------------
+  def test_one_scan_miss_recovers_the_same_identity(self):
+    scans = [(self.SCAN_NS, (self.detection(4, 5., 0., 0., self.SCAN_NS),)),
+             (2 * self.SCAN_NS, ()),
+             (3 * self.SCAN_NS, (self.detection(4, 5., 0., 0., 3 * self.SCAN_NS),))]
+    _, outputs = self.run(scans)
+    assert outputs[2][0].raw_track_id == outputs[0][0].raw_track_id
+    assert outputs[2][0].recovered
+
+  def test_the_coast_window_is_exactly_three_nominal_scan_periods(self):
+    """Recovery at a 300 ms gap keeps the identity; 400 ms starts a new one."""
+    for gap_scans, same in ((3, True), (4, False)):
+      first = self.SCAN_NS
+      last = (1 + gap_scans) * self.SCAN_NS
+      scans = [(first, (self.detection(4, 5., 0., 0., first),))]
+      scans += [(index * self.SCAN_NS, ()) for index in range(2, 1 + gap_scans)]
+      scans.append((last, (self.detection(4, 5., 0., 0., last),)))
+      _, outputs = self.run(scans)
+      assert (outputs[-1][0].raw_track_id == outputs[0][0].raw_track_id) is same
+
+  def test_a_cadence_above_100ms_costs_the_third_retry(self):
+    """coast_s is 0.3 s and the scan period is nominally 0.1 s, so the third
+    retry survives or dies on clock drift alone. The audit measured a median
+    cadence of 99.995 ms with p95 101.455 ms, and 80,568 of 156,515 raw-track
+    expiries landing within 20 ms of the limit. Both sides are asserted here.
+    """
+    for period_ns, same in ((99_970_000, True), (100_030_000, False)):
+      scans = [(period_ns, (self.detection(4, 5., 0., 0., period_ns),))]
+      scans += [(index * period_ns, ()) for index in range(2, 4)]
+      last = 4 * period_ns
+      scans.append((last, (self.detection(4, 5., 0., 0., last),)))
+      _, outputs = self.run(scans)
+      assert (outputs[-1][0].raw_track_id == outputs[0][0].raw_track_id) is same
+
+  # --- neighbours and competition -----------------------------------------
+  def test_an_adjacent_near_range_return_is_not_absorbed(self):
+    """Two returns 0.75 m apart laterally at 3 m are about 14 deg apart, outside
+    the 12 deg near gate, so losing one never re-labels the other."""
+    first, second = self.SCAN_NS, 2 * self.SCAN_NS
+    scans = [(first, (self.detection(4, 3., 0., 0., first),
+                      self.detection(5, 3., .75, 0., first))),
+             (second, (self.detection(5, 3., .75, 0., second),))]
+    _, outputs = self.run(scans)
+    assert outputs[1][0].raw_track_id == self.ids(outputs[0])[5]
+
+  def test_a_standstill_queue_never_swaps_identities(self):
+    scans = []
+    for index in range(6):
+      ns = (index + 1) * self.SCAN_NS
+      scans.append((ns, (self.detection(4, 5., 0., 0., ns),
+                         self.detection(9, 8., 0., 0., ns))))
+    _, outputs = self.run(scans)
+    assert all(self.ids(scan) == self.ids(outputs[0]) for scan in outputs)
+
+  def test_one_return_for_two_tracks_goes_to_the_cheaper_one(self):
+    first, second = self.SCAN_NS, 2 * self.SCAN_NS
+    scans = [(first, (self.detection(4, 5., 0., 0., first),
+                      self.detection(9, 7., 0., 0., first))),
+             (second, (self.detection(4, 5.25, 0., 0., second),))]
+    _, outputs = self.run(scans)
+    assert outputs[1][0].raw_track_id == self.ids(outputs[0])[4]
+
+  # --- slot is not identity ------------------------------------------------
+  def test_slot_reuse_by_a_distant_target_starts_a_new_identity(self):
+    first, second = self.SCAN_NS, 2 * self.SCAN_NS
+    scans = [(first, (self.detection(4, 5., 0., 0., first),)),
+             (second, (self.detection(4, 20., 0., 0., second),))]
+    _, outputs = self.run(scans)
+    assert outputs[1][0].raw_track_id != outputs[0][0].raw_track_id
+
+  def test_the_same_slot_bonus_cannot_reach_past_a_hard_gate(self):
+    config = BoschRawTrackingConfig(same_slot_bonus=.1)
+    first, second = self.SCAN_NS, 2 * self.SCAN_NS
+    scans = [(first, (self.detection(4, 5., 0., 0., first),)),
+             (second, (self.detection(4, 9., 0., 0., second),))]
+    _, outputs = self.run(scans, config)
+    assert outputs[1][0].raw_track_id != outputs[0][0].raw_track_id
+
+  # --- opposing motion -----------------------------------------------------
+  def test_an_opposing_return_fails_the_velocity_gate(self):
+    first, second = self.SCAN_NS, 2 * self.SCAN_NS
+    scans = [(first, (self.detection(4, 20., 0., 0., first),)),
+             (second, (self.detection(4, 20., 0., -2.25, second),))]
+    _, outputs = self.run(scans)
+    assert outputs[1][0].raw_track_id != outputs[0][0].raw_track_id
+
+  # --- large vehicles ------------------------------------------------------
+  def test_two_multi_return_vehicles_keep_four_identities(self):
+    scans = []
+    for index in range(6):
+      ns = (index + 1) * self.SCAN_NS
+      scans.append((ns, (self.detection(2, 10., 0., 0., ns),
+                         self.detection(3, 11., .25, 0., ns),
+                         self.detection(8, 20., 0., 0., ns),
+                         self.detection(9, 21., .25, 0., ns))))
+    _, outputs = self.run(scans)
+    assert all(self.ids(scan) == self.ids(outputs[0]) for scan in outputs)
+    assert len(set(self.ids(outputs[-1]).values())) == 4
+
+  # --- the raw layer sees neither camera nor OEM --------------------------
+  def test_raw_association_takes_no_camera_or_oem_input(self):
+    """Camera staleness and OEM word conflicts cannot reach this layer, so no
+    association verdict in the audit can be attributed to them."""
+    import inspect
+    parameters = set(inspect.signature(BoschRawTrackManager.update).parameters)
+    assert parameters == {"self", "timestamp_ns", "detections", "yaw_rate"}
+    assert set(BoschRawTrackingConfig().__dataclass_fields__) == {
+      "distance_gate_m", "speed_gate_mps", "bearing_near_deg", "bearing_mid_deg",
+      "bearing_far_deg", "bearing_distant_deg", "coast_s", "same_slot_bonus",
+      "unmatched_cost"}
+
+  # --- clock discipline ----------------------------------------------------
+  def test_a_timestamp_reset_is_refused_and_leaves_state_untouched(self):
+    manager = BoschRawTrackManager()
+    manager.update(2 * self.SCAN_NS, (self.detection(4, 5., 0., 0., 2 * self.SCAN_NS),))
+    before = dict(manager.stats)
+    with pytest.raises(ValueError):
+      manager.update(self.SCAN_NS, (self.detection(4, 5., 0., 0., self.SCAN_NS),))
+    assert manager.stats == before
+    assert manager.last_timestamp_ns == 2 * self.SCAN_NS
+
+  def test_a_segment_boundary_gap_starts_new_identities(self):
+    first = self.SCAN_NS
+    later = first + 10_000_000_000
+    scans = [(first, (self.detection(4, 5., 0., 0., first),)),
+             (later, (self.detection(4, 5., 0., 0., later),))]
+    _, outputs = self.run(scans)
+    assert outputs[1][0].raw_track_id != outputs[0][0].raw_track_id
+
+  # --- the bearing gate is the only lateral discriminator ------------------
+  def test_the_bearing_gate_is_the_only_lateral_limit(self):
+    config = BoschRawTrackingConfig()
+    assert config.distance_gate_m == 3.5
+    assert config.speed_gate_mps == 2.0
+    assert config.coast_s == .3
+    assert config.same_slot_bonus == .03
+    for distance, degrees in ((14.9, 12.), (15., 5.), (29.9, 5.), (30., 2.5),
+                              (59.9, 2.5), (60., 2.)):
+      assert config.bearing_gate_rad(distance) == pytest.approx(math.radians(degrees))
+    # implied lateral tolerance, which is what actually separates neighbours
+    assert 3. * math.tan(config.bearing_gate_rad(3.)) == pytest.approx(.6376, abs=1e-3)
+    assert 15. * math.tan(config.bearing_gate_rad(15.)) == pytest.approx(1.3123, abs=1e-3)

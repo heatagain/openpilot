@@ -386,6 +386,24 @@ BOSCH_CAMERA_OBSERVATION_GAP_NS = 160_000_000
 BOSCH_CAMERA_E2_HOLD_NS = 250_000_000
 BOSCH_CAMERA_SNAPSHOT_COUNT = 4
 BOSCH_CAMERA_WIDTH_REF_M = 1.70
+# 카메라의 longitudinal / lateral / relative speed LSB는 0.0625가 아니라 0.05다.
+# 독립 근거 6개가 일치하고 반례는 0건이다
+# (analysis/bosch_radar/20260912_ldws_mobileye_verified_decode).
+# 이전 상수는 세 필드를 모두 +25 % 과대 스케일로 읽고 있었다.
+BOSCH_CAMERA_RANGE_LSB = 0.05
+# continuity anchor 대비 association 세로 창. 서로 무관한 두 오차를 흡수해야 하고
+# 둘의 스케일 법칙이 다르다.
+#   * 단안 거리 오차는 거리에 비례한다 -> BASE + RANGE_K * d_rel
+#   * 차량 자신의 return 집합은 수 m 깊고 카메라는 후면을 보고하므로 레이더는
+#     차체 더 깊은 곳의 return을 유지한다 -> 폭 항, 그리고 가까운 쪽이 훨씬 크다
+# 기존의 비대칭 상수 [0.0, 5.0]은 +25 % 과대 스케일을 상쇄하기 위한 경험값이었다.
+# 올바른 스케일에서 그 창은 "카메라가 레이더보다 가깝다"는 참 쌍의 1/3을 전부 기각한다.
+BOSCH_CAMERA_LONG_BASE_M = 1.75
+BOSCH_CAMERA_LONG_RANGE_K = 0.12
+BOSCH_CAMERA_LONG_POS_WIDTH_K = 4.0
+BOSCH_CAMERA_LONG_NEG_WIDTH_K = 16.0
+BOSCH_CAMERA_LONG_MAX_M = 20.0
+BOSCH_CAMERA_LAT_MAX_M = 1.75
 BOSCH_CAMERA_ANGLE_LSB = 1.0 / 4496.3
 BOSCH_CAMERA_ASSOC_UNRESOLVED = 0
 BOSCH_CAMERA_ASSOC_ASSIGNED = 1
@@ -438,6 +456,17 @@ BOSCH_OEM_NEARER_PUBLICATION_MODE = BOSCH_OEM_NEARER_PUBLICATION_ACTIVE
 def _bosch_camera_signed(value, bits):
   sign = 1 << (bits - 1)
   return value - (1 << bits) if value & sign else value
+
+
+def _bosch_camera_range_span(d_rel):
+  """카메라 객체와 무관한, 거리에만 의존하는 창 성분."""
+  return BOSCH_CAMERA_LONG_BASE_M + BOSCH_CAMERA_LONG_RANGE_K * d_rel
+
+
+def _bosch_camera_long_window(span, width_m):
+  extra = max(width_m - BOSCH_CAMERA_WIDTH_REF_M, 0.0)
+  return (min(span + BOSCH_CAMERA_LONG_POS_WIDTH_K * extra, BOSCH_CAMERA_LONG_MAX_M),
+          min(span + BOSCH_CAMERA_LONG_NEG_WIDTH_K * extra, BOSCH_CAMERA_LONG_MAX_M))
 
 
 @dataclass(slots=True)
@@ -579,9 +608,9 @@ class BoschCameraCycleCache:
       obj = objects[slot]
       obj.obj_id = obj_id
       obj.episode = self._episode[obj_id]
-      obj.long_m = ((a >> 8) & 0xfff) * 0.0625
-      obj.lat_m = _bosch_camera_signed((a >> 20) & 0xfff, 12) * 0.0625
-      obj.vrel_mps = _bosch_camera_signed((a >> 40) & 0xfff, 12) * 0.0625
+      obj.long_m = ((a >> 8) & 0xfff) * BOSCH_CAMERA_RANGE_LSB
+      obj.lat_m = _bosch_camera_signed((a >> 20) & 0xfff, 12) * BOSCH_CAMERA_RANGE_LSB
+      obj.vrel_mps = _bosch_camera_signed((a >> 40) & 0xfff, 12) * BOSCH_CAMERA_RANGE_LSB
       obj.width_m = (b & 0x3f) * 0.05
       obj.class_code = int((b >> 48) & 0x3) + 4 * int((b >> 50) & 0x1)
       obj.angle_right = _bosch_camera_signed((c >> 18) & 0x1fff, 13) * BOSCH_CAMERA_ANGLE_LSB
@@ -732,25 +761,26 @@ class BoschCameraExtendedGrouping:
   @staticmethod
   def _associate(obj, camera_objects, count):
     bearing = math.atan2(-obj.y_rel, max(obj.d_rel, 0.5))
+    span = _bosch_camera_range_span(obj.d_rel)
     best = second = math.inf
     best_obj = None
     passed = 0
     for index in range(count):
       cam = camera_objects[index]
-      extra = max(cam.width_m - BOSCH_CAMERA_WIDTH_REF_M, 0.0)
-      l_pos = max(5.0 + 4.0 * extra, 0.5)
-      l_neg = max(8.0 * extra, 0.0)
+      l_pos, l_neg = _bosch_camera_long_window(span, cam.width_m)
       d_long = cam.long_m - obj.d_rel
       d_lat = cam.lat_m + obj.y_rel
       lo, hi = min(cam.angle_left, cam.angle_right), max(cam.angle_left, cam.angle_right)
       bear_out = max(lo - bearing, bearing - hi)
-      if d_long > l_pos or d_long < -l_neg or bear_out > 0.020 or abs(d_lat) > 2.5:
+      if (d_long > l_pos or d_long < -l_neg or bear_out > 0.020 or
+          abs(d_lat) > BOSCH_CAMERA_LAT_MAX_M):
         continue
       passed += 1
       half = (hi - lo) * 0.5
       bear_n = (half + bear_out) / max(half + 0.020, 1e-6)
       cost = (4.0 * bear_n + 2.0 * abs(cam.vrel_mps - obj.v_rel) / 3.0 +
-              abs(d_lat) / 2.5 + 0.5 * abs(d_long) / max(l_pos + l_neg, 1e-6))
+              abs(d_lat) / BOSCH_CAMERA_LAT_MAX_M +
+              0.5 * abs(d_long) / max(l_pos + l_neg, 1e-6))
       if cost < best:
         second, best, best_obj = best, cost, cam
       elif cost < second:
@@ -898,14 +928,13 @@ class BoschCameraExtendedGrouping:
     경쟁 object보다 명확히 작을 때만 truck P2용 보강 evidence로 사용한다.
     """
     bearing = math.atan2(-obj.y_rel, max(obj.d_rel, .5))
+    span = _bosch_camera_range_span(obj.d_rel)
     anchor_cost = math.inf
     other_cost = math.inf
     anchor_gate = False
     for index in range(count):
       camera = camera_objects[index]
-      extra = max(camera.width_m - BOSCH_CAMERA_WIDTH_REF_M, 0.)
-      l_pos = max(5.0 + 4.0 * extra, .5)
-      l_neg = max(8.0 * extra, 0.)
+      l_pos, l_neg = _bosch_camera_long_window(span, camera.width_m)
       d_long = camera.long_m - obj.d_rel
       d_lat = camera.lat_m + obj.y_rel
       lo, hi = min(camera.angle_left, camera.angle_right), max(camera.angle_left, camera.angle_right)
@@ -913,10 +942,11 @@ class BoschCameraExtendedGrouping:
       half = (hi - lo) * .5
       bear_n = (half + bear_out) / max(half + .020, 1e-6)
       cost = (4.0 * bear_n + 2.0 * abs(camera.vrel_mps - obj.v_rel) / 3.0 +
-              abs(d_lat) / 2.5 + .5 * abs(d_long) / max(l_pos + l_neg, 1e-6))
+              abs(d_lat) / BOSCH_CAMERA_LAT_MAX_M +
+              .5 * abs(d_long) / max(l_pos + l_neg, 1e-6))
       if camera.obj_id == anchor.obj_id and camera.episode == anchor.episode:
         anchor_cost = cost
-        anchor_gate = (-l_neg <= d_long <= l_pos and abs(d_lat) <= 2.5 and
+        anchor_gate = (-l_neg <= d_long <= l_pos and abs(d_lat) <= BOSCH_CAMERA_LAT_MAX_M and
                        .020 < bear_out <= .020 + BOSCH_TRUCK_A0_RECOVERY_BEARING_EXCESS_RAD)
       else:
         other_cost = min(other_cost, cost)
