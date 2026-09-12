@@ -408,6 +408,20 @@ BOSCH_CAMERA_ANGLE_LSB = 1.0 / 4496.3
 BOSCH_CAMERA_ASSOC_UNRESOLVED = 0
 BOSCH_CAMERA_ASSOC_ASSIGNED = 1
 BOSCH_CAMERA_ASSOC_AMBIGUOUS = 2
+# Bosch-only causal fallback for a short curve-induced lateral/bearing miss.
+# It never changes a baseline ASSIGNED/AMBIGUOUS verdict and never refreshes
+# itself: only a normal A0 ASSIGNED pair may seed or advance the history.
+BOSCH_CAMERA_CURVE_REACQUIRE_OFF = 0
+BOSCH_CAMERA_CURVE_REACQUIRE_SHADOW = 1
+BOSCH_CAMERA_CURVE_REACQUIRE_ACTIVE = 2
+BOSCH_CAMERA_CURVE_REACQUIRE_MODE = BOSCH_CAMERA_CURVE_REACQUIRE_ACTIVE
+BOSCH_CAMERA_CURVE_REACQUIRE_HOLD_NS = 800_000_000
+BOSCH_CAMERA_CURVE_REACQUIRE_MIN_D_M = 70.0
+BOSCH_CAMERA_CURVE_REACQUIRE_MAX_D_M = 100.0
+BOSCH_CAMERA_CURVE_REACQUIRE_MIN_YAW_RATE = 0.015
+BOSCH_CAMERA_CURVE_REACQUIRE_LAT_MAX_M = 2.35
+BOSCH_CAMERA_CURVE_REACQUIRE_BEAR_MAX_RAD = 0.026
+BOSCH_CAMERA_CURVE_REACQUIRE_STATE_MAX = 64
 # camera class 6은 경험적으로 car-family 상태이지 truck enum이 아니다.
 # 아래의 독립적인 폭/rigid-pair 증거를 모두 만족할 때만 대형차 P2를 보조하며,
 # 기존 class-1 경로는 별도 분기로 그대로 유지한다.
@@ -676,6 +690,13 @@ class _BoschExtendedHistory:
 
 
 @dataclass(slots=True)
+class _BoschCurveReacquireHistory:
+  camera_id: int
+  episode: int
+  last_assigned_ns: int
+
+
+@dataclass(slots=True)
 class _BoschTruckPairHistory:
   members: tuple[int, int]
   camera_id: int
@@ -710,11 +731,17 @@ class BoschCameraExtendedGrouping:
   allocator 이후 실제 publication을 축소한다. 별도 PID의 소실된 운동 이력을
   대표점이 이전하지 못하므로 longitudinal control 사용은 NO-GO다.
   """
-  def __init__(self, mode=BOSCH_CAMERA_EXTENDED_MODE):
+  def __init__(self, mode=BOSCH_CAMERA_EXTENDED_MODE,
+               curve_reacquire_mode=BOSCH_CAMERA_CURVE_REACQUIRE_MODE):
     if mode not in (BOSCH_CAMERA_EXTENDED_OFF, BOSCH_CAMERA_EXTENDED_SHADOW,
                     BOSCH_CAMERA_EXTENDED_ACTIVE, BOSCH_CAMERA_EXTENDED_ACTIVE_TEST):
       raise ValueError('invalid Bosch camera extended-grouping mode')
+    if curve_reacquire_mode not in (BOSCH_CAMERA_CURVE_REACQUIRE_OFF,
+                                    BOSCH_CAMERA_CURVE_REACQUIRE_SHADOW,
+                                    BOSCH_CAMERA_CURVE_REACQUIRE_ACTIVE):
+      raise ValueError('invalid Bosch camera curve-reacquire mode')
     self.mode = mode
+    self.curve_reacquire_mode = curve_reacquire_mode
     self.camera = BoschCameraCycleCache() if mode != BOSCH_CAMERA_EXTENDED_OFF else None
     self.histories: dict[tuple[int, ...], _BoschExtendedHistory] = {}
     self.truck_pair_histories: dict[tuple[int, int], _BoschTruckPairHistory] = {}
@@ -744,6 +771,14 @@ class BoschCameraExtendedGrouping:
     self.last_camera_by_episode = {}
     self.last_v_ego = math.nan
     self.last_yaw_rate = None
+    self.curve_reacquire_histories: dict[int, _BoschCurveReacquireHistory] = {}
+    self.curve_reacquire_state_peak = 0
+    self.curve_reacquire_attempts = 0
+    self.curve_reacquire_successes = 0
+    self.curve_reacquire_rejects = Counter()
+    self.last_baseline_associations = {}
+    self.last_curve_reacquire = ()
+    self.last_curve_reacquire_would = ()
 
   @staticmethod
   def _geometry(a, b, v_ego, yaw_rate):
@@ -790,6 +825,74 @@ class BoschCameraExtendedGrouping:
     if passed >= 2 and second - best < 0.15:
       return BOSCH_CAMERA_ASSOC_AMBIGUOUS, -1, -1
     return BOSCH_CAMERA_ASSOC_ASSIGNED, best_obj.episode, best_obj.class_code
+
+  def _curve_reacquire(self, obj, camera_objects, count, timestamp_ns, yaw_rate):
+    """Return Candidate C's verdict without mutating its A0-only history."""
+    self.curve_reacquire_attempts += 1
+    history = self.curve_reacquire_histories.get(obj.physical_track_id)
+    if history is None or not 0 <= timestamp_ns - history.last_assigned_ns <= BOSCH_CAMERA_CURVE_REACQUIRE_HOLD_NS:
+      self.curve_reacquire_rejects['history'] += 1
+      return BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1
+    if not obj.oem_selected:
+      self.curve_reacquire_rejects['word1'] += 1
+      return BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1
+    if not (BOSCH_CAMERA_CURVE_REACQUIRE_MIN_D_M <= obj.d_rel < BOSCH_CAMERA_CURVE_REACQUIRE_MAX_D_M and
+            yaw_rate is not None and math.isfinite(yaw_rate) and
+            abs(yaw_rate) >= BOSCH_CAMERA_CURVE_REACQUIRE_MIN_YAW_RATE):
+      self.curve_reacquire_rejects['context'] += 1
+      return BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1
+
+    bearing = math.atan2(-obj.y_rel, max(obj.d_rel, 0.5))
+    span = _bosch_camera_range_span(obj.d_rel)
+    matches = []
+    for index in range(count):
+      camera = camera_objects[index]
+      if camera.obj_id != history.camera_id or camera.episode != history.episode:
+        continue
+      l_pos, l_neg = _bosch_camera_long_window(span, camera.width_m)
+      d_long = camera.long_m - obj.d_rel
+      d_lat = camera.lat_m + obj.y_rel
+      lo, hi = min(camera.angle_left, camera.angle_right), max(camera.angle_left, camera.angle_right)
+      bear_out = max(lo - bearing, bearing - hi)
+      if (-l_neg <= d_long <= l_pos and
+          abs(d_lat) <= BOSCH_CAMERA_CURVE_REACQUIRE_LAT_MAX_M and
+          bear_out <= BOSCH_CAMERA_CURVE_REACQUIRE_BEAR_MAX_RAD):
+        matches.append(camera)
+    if len(matches) != 1:
+      self.curve_reacquire_rejects['ambiguous' if len(matches) > 1 else 'geometry'] += 1
+      return BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1
+    camera = matches[0]
+    return BOSCH_CAMERA_ASSOC_ASSIGNED, camera.episode, camera.class_code
+
+  def _curve_history_prepare(self, timestamp_ns, by_pid, camera_objects, camera_count):
+    if self.curve_reacquire_mode == BOSCH_CAMERA_CURVE_REACQUIRE_OFF:
+      self.curve_reacquire_histories = {}
+      return
+    camera_keys = {(camera_objects[index].obj_id, camera_objects[index].episode)
+                   for index in range(camera_count)}
+    self.curve_reacquire_histories = {
+      pid: history for pid, history in self.curve_reacquire_histories.items()
+      if (pid in by_pid and (history.camera_id, history.episode) in camera_keys and
+          0 <= timestamp_ns - history.last_assigned_ns <= BOSCH_CAMERA_CURVE_REACQUIRE_HOLD_NS)
+    }
+
+  def _curve_history_update(self, timestamp_ns, baseline, camera_by_episode):
+    if self.curve_reacquire_mode == BOSCH_CAMERA_CURVE_REACQUIRE_OFF:
+      return
+    for pid, verdict in baseline.items():
+      if verdict[0] == BOSCH_CAMERA_ASSOC_ASSIGNED:
+        camera = camera_by_episode.get(verdict[1])
+        if camera is not None:
+          self.curve_reacquire_histories[pid] = _BoschCurveReacquireHistory(
+            camera.obj_id, camera.episode, timestamp_ns)
+      elif verdict[0] == BOSCH_CAMERA_ASSOC_AMBIGUOUS:
+        self.curve_reacquire_histories.pop(pid, None)
+    if len(self.curve_reacquire_histories) > BOSCH_CAMERA_CURVE_REACQUIRE_STATE_MAX:
+      keep = sorted(self.curve_reacquire_histories.items(),
+                    key=lambda item: (-item[1].last_assigned_ns, item[0]))[:BOSCH_CAMERA_CURVE_REACQUIRE_STATE_MAX]
+      self.curve_reacquire_histories = dict(keep)
+    self.curve_reacquire_state_peak = max(self.curve_reacquire_state_peak,
+                                          len(self.curve_reacquire_histories))
 
   @staticmethod
   def _complete_link(objects, edges, previous):
@@ -1048,10 +1151,14 @@ class BoschCameraExtendedGrouping:
     start = time.perf_counter_ns()
     prior_maturity = self.histories
     self.mature_groups = ()
+    curve_clock_reset = self.last_ns is not None and timestamp_ns <= self.last_ns
     if self.last_ns is not None and timestamp_ns - self.last_ns > BOSCH_CAMERA_OBSERVATION_GAP_NS:
       self.histories = {}
       self.truck_pair_histories = {}
       self.representatives.clear()
+      self.curve_reacquire_histories = {}
+    elif curve_clock_reset:
+      self.curve_reacquire_histories = {}
     self.last_ns = timestamp_ns
     by_pid = {obj.physical_track_id: obj for obj in objects}
     ordered = sorted(objects, key=lambda obj: (obj.d_rel, obj.physical_track_id))
@@ -1081,11 +1188,42 @@ class BoschCameraExtendedGrouping:
     camera_objects = ()
     camera_count = 0
     assoc_start = now
-    if snapshot is not None and candidate_nodes:
+    if snapshot is not None:
       camera_objects, camera_count, _, _ = snapshot
       camera_by_episode = {camera_objects[index].episode: camera_objects[index] for index in range(camera_count)}
-      for pid in candidate_nodes:
-        associations[pid] = self._associate(by_pid[pid], camera_objects, camera_count)
+      self._curve_history_prepare(timestamp_ns, by_pid, camera_objects, camera_count)
+      # The frozen shadow definition runs the normal A0 gate for every live
+      # physical PID. Extra baseline verdicts seed history only; they are not
+      # exposed through last_associations unless C actually reacquires.
+      baseline_nodes = (by_pid if self.curve_reacquire_mode != BOSCH_CAMERA_CURVE_REACQUIRE_OFF
+                        else {pid: by_pid[pid] for pid in candidate_nodes})
+      baseline_associations = {}
+      reacquired = []
+      would_reacquire = []
+      for pid, obj in baseline_nodes.items():
+        baseline = self._associate(obj, camera_objects, camera_count)
+        baseline_associations[pid] = baseline
+        if pid in candidate_nodes:
+          associations[pid] = baseline
+        if baseline[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED and self.curve_reacquire_mode != BOSCH_CAMERA_CURVE_REACQUIRE_OFF:
+          candidate = self._curve_reacquire(obj, camera_objects, camera_count,
+                                            timestamp_ns, yaw_rate)
+          if candidate[0] == BOSCH_CAMERA_ASSOC_ASSIGNED:
+            camera = camera_by_episode[candidate[1]]
+            would_reacquire.append((pid, camera.obj_id, camera.episode))
+            if self.curve_reacquire_mode == BOSCH_CAMERA_CURVE_REACQUIRE_ACTIVE:
+              associations[pid] = candidate
+              reacquired.append((pid, camera.obj_id, camera.episode))
+              self.curve_reacquire_successes += 1
+      self._curve_history_update(timestamp_ns, baseline_associations, camera_by_episode)
+      self.last_baseline_associations = baseline_associations
+      self.last_curve_reacquire = tuple(sorted(reacquired))
+      self.last_curve_reacquire_would = tuple(sorted(would_reacquire))
+    else:
+      self.curve_reacquire_histories = {}
+      self.last_baseline_associations = {}
+      self.last_curve_reacquire = ()
+      self.last_curve_reacquire_would = ()
     self.last_association_count = len(associations)
     self.last_associations = associations
     # publication_view의 companion deferral이 같은 scan의 A0 판정과 pair gate를
@@ -1235,6 +1373,11 @@ class BoschCameraExtendedGrouping:
                f' camera_ext_maturity_resets={self.maturity_resets}'
                f' camera_ext_camera_age_ms={(self.last_ns - self.last_camera_ns) * 1e-6 if self.last_camera_ns is not None else -1:.3f}'
                f' camera_ext_camera_reject={self.camera.rejected_cycles}')
+    fields += (f' camera_curve_reacquire_mode={self.curve_reacquire_mode}'
+               f' camera_curve_reacquire_successes={self.curve_reacquire_successes}'
+               f' camera_curve_reacquire_state={len(self.curve_reacquire_histories)}'
+               f' camera_curve_reacquire_state_peak={self.curve_reacquire_state_peak}'
+               f' camera_curve_reacquire_last={len(self.last_curve_reacquire)}')
     self.perf_sum.clear()
     self.perf_max.clear()
     self.perf_scans = 0
@@ -3613,12 +3756,13 @@ def bosch_make_points(objects, v_ego=math.nan):
 class BoschRadarProvider:
   def __init__(self, bus: int, *, qualification=True, camera_bus=1,
                camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE, p91_mode=BOSCH_P91_MODE,
-               oem_gate_mode=BOSCH_OEM_GATE_MODE, scc_bus=BOSCH_SCC_BUS):
+               oem_gate_mode=BOSCH_OEM_GATE_MODE, scc_bus=BOSCH_SCC_BUS,
+               curve_reacquire_mode=BOSCH_CAMERA_CURVE_REACQUIRE_MODE):
     self.bus = bus
     self.camera_bus = camera_bus
     self.scc_bus = scc_bus
     self.tracker = BoschPhysicalTracker()
-    self.camera_extended = BoschCameraExtendedGrouping(camera_extended_mode)
+    self.camera_extended = BoschCameraExtendedGrouping(camera_extended_mode, curve_reacquire_mode)
     self.publication_aliases = BoschPublicationAliasAllocator()
     self.qualifier = _BoschStaticOffPathFilter() if qualification else None
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
@@ -3961,6 +4105,10 @@ class BoschRadarProvider:
       'oem_word1_active': self._debug_word1_active, 'scc_obj_valid': self._scc_validity(self.last_scan_timestamp_ns or 0),
       'oem_intent_mps2': self._debug_oem_intent, 'oem_gate_mode': self.oem_gate.mode,
       'oem_gate_withhold': sorted(self._debug_gate_suppress), 'oem_gate_reasons': self._debug_gate_reasons,
+      'curve_reacquire_mode': self.camera_extended.curve_reacquire_mode,
+      'curve_reacquire': self.camera_extended.last_curve_reacquire,
+      'curve_reacquire_would': self.camera_extended.last_curve_reacquire_would,
+      'curve_reacquire_state_count': len(self.camera_extended.curve_reacquire_histories),
       'objects': [{'physicalTrackId': obj.physical_track_id,
                    'rawTrackIds': [member.raw_track_id for member in obj.members],
                    'slots': list(obj.member_slots),

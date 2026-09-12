@@ -7,6 +7,10 @@ from opendbc.car.hyundai.radar_interface import (
   BOSCH_CAMERA_ASSOC_AMBIGUOUS,
   BOSCH_CAMERA_ASSOC_ASSIGNED,
   BOSCH_CAMERA_ASSOC_UNRESOLVED,
+  BOSCH_CAMERA_CURVE_REACQUIRE_ACTIVE,
+  BOSCH_CAMERA_CURVE_REACQUIRE_HOLD_NS,
+  BOSCH_CAMERA_CURVE_REACQUIRE_OFF,
+  BOSCH_CAMERA_CURVE_REACQUIRE_SHADOW,
   BOSCH_CAMERA_E2_HOLD_NS,
   BOSCH_CAMERA_EXTENDED_ACTIVE,
   BOSCH_CAMERA_EXTENDED_ACTIVE_TEST,
@@ -39,6 +43,7 @@ from opendbc.car.hyundai.radar_interface import (
   bosch_published_surface,
   _bosch_camera_long_window,
   _bosch_camera_range_span,
+  _BoschCurveReacquireHistory,
 )
 from opendbc.car import structs
 
@@ -223,6 +228,172 @@ class TestBoschCameraAssociationAndGeometry:
     edges = {(1_000_001, 1_000_002): 1., (1_000_002, 1_000_003): 1.}
     groups = BoschCameraExtendedGrouping._complete_link(objects, edges, ())
     assert max(map(len, groups)) == 2
+
+
+class TestBoschCameraCurveReacquire:
+  NS = 1_000_000_000
+  PID = 1_000_001
+  CAMERA_ID = 238
+  EPISODE = 293
+
+  @staticmethod
+  def grouping(mode=BOSCH_CAMERA_CURVE_REACQUIRE_ACTIVE):
+    return BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE, mode)
+
+  def target(self, *, pid=PID, d_rel=85., y_rel=5.7, oem=True, ns=None):
+    return replace(physical(pid, d_rel, y_rel=y_rel, ns=self.NS if ns is None else ns),
+                   oem_selected=oem)
+
+  def camera(self, *, obj_id=CAMERA_ID, episode=EPISODE, long_m=85., lat_m=-7.7,
+             left=-.09, right=-.04, width=1.65, cls=1):
+    return BoschCameraObject(obj_id, episode, long_m, lat_m, 0., width, cls, left, right)
+
+  def seed(self, grouping, *, pid=PID, obj_id=CAMERA_ID, episode=EPISODE, ns=NS):
+    grouping.curve_reacquire_histories[pid] = _BoschCurveReacquireHistory(obj_id, episode, ns)
+
+  def verdict(self, *, target=None, camera=None, yaw=.045, age_ns=100_000_000,
+              grouping=None, cameras=None):
+    grouping = grouping or self.grouping()
+    self.seed(grouping)
+    camera = camera or self.camera()
+    cameras = cameras or [camera]
+    return grouping._curve_reacquire(target or self.target(), cameras, len(cameras),
+                                     self.NS + age_ns, yaw)
+
+  def test_reacquires_the_frozen_long_range_curve_near_miss(self):
+    assert self.verdict() == (BOSCH_CAMERA_ASSOC_ASSIGNED, self.EPISODE, 1)
+
+  def test_no_recent_assigned_history_does_not_reacquire(self):
+    grouping = self.grouping()
+    assert grouping._curve_reacquire(self.target(), [self.camera()], 1,
+                                     self.NS + 100_000_000, .045)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_word1_on_a_different_pid_does_not_reacquire(self):
+    assert self.verdict(target=self.target(oem=False))[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_inactive_word1_does_not_reacquire(self):
+    assert self.verdict(target=self.target(oem=False))[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  @pytest.mark.parametrize(('age_ns', 'assigned'), (
+    (BOSCH_CAMERA_CURVE_REACQUIRE_HOLD_NS, True),
+    (BOSCH_CAMERA_CURVE_REACQUIRE_HOLD_NS + 1, False),
+  ))
+  def test_history_timeout_boundary(self, age_ns, assigned):
+    verdict = self.verdict(age_ns=age_ns)
+    assert (verdict[0] == BOSCH_CAMERA_ASSOC_ASSIGNED) is assigned
+
+  def test_camera_episode_change_does_not_reacquire(self):
+    assert self.verdict(camera=self.camera(episode=self.EPISODE + 1))[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_stable_camera_id_change_does_not_reacquire(self):
+    assert self.verdict(camera=self.camera(obj_id=self.CAMERA_ID + 1))[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_bosch_pid_change_does_not_reacquire(self):
+    assert self.verdict(target=self.target(pid=self.PID + 1))[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  @pytest.mark.parametrize('d_rel', (69.999, 100.0))
+  def test_range_boundaries_fail_open(self, d_rel):
+    target = self.target(d_rel=d_rel)
+    camera = self.camera(long_m=d_rel, lat_m=-(target.y_rel + 2.0))
+    assert self.verdict(target=target, camera=camera)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_weak_curve_does_not_reacquire(self):
+    assert self.verdict(yaw=.014999)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_longitudinal_gate_failure_does_not_reacquire(self):
+    assert self.verdict(camera=self.camera(long_m=110.))[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_lateral_envelope_failure_does_not_reacquire(self):
+    assert self.verdict(camera=self.camera(lat_m=-(5.7 + 2.351)))[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_bearing_envelope_failure_does_not_reacquire(self):
+    camera = self.camera(left=-.03, right=-.02)
+    assert self.verdict(camera=camera)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_competing_exact_camera_records_fail_open(self):
+    camera = self.camera()
+    assert self.verdict(cameras=[camera, replace(camera)])[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_t33_clone_like_distinct_pid_has_no_inherited_history(self):
+    t33 = self.target(pid=1_000_294, y_rel=-12., oem=False)
+    assert self.verdict(target=t33)[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_timestamp_reverse_clears_history(self):
+    grouping = self.grouping()
+    self.seed(grouping)
+    grouping.last_ns = self.NS + 100_000_000
+    grouping.camera.snapshot = lambda ns: ([self.camera()], 1, 0, ns)
+    grouping.update(self.NS, (self.target(ns=self.NS),), 20., .045)
+    assert not grouping.curve_reacquire_histories
+
+  def test_camera_stale_gap_clears_history(self):
+    grouping = self.grouping()
+    self.seed(grouping)
+    grouping.last_ns = self.NS
+    grouping.update(self.NS + 200_000_000, (self.target(ns=self.NS + 200_000_000),), 20., .045)
+    assert not grouping.curve_reacquire_histories
+
+  def test_new_provider_segment_or_replay_reset_starts_empty(self):
+    old = self.grouping()
+    self.seed(old)
+    assert old.curve_reacquire_histories
+    assert not self.grouping().curve_reacquire_histories
+
+  def test_pid_removal_clears_history(self):
+    grouping = self.grouping()
+    self.seed(grouping)
+    grouping._curve_history_prepare(self.NS + 100_000_000, {}, [self.camera()], 1)
+    assert not grouping.curve_reacquire_histories
+
+  def test_word1_switch_releases_immediately(self):
+    assert self.verdict(target=self.target(oem=False))[0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  def test_baseline_cut_in_association_is_unchanged(self):
+    for y_rel in (2.4, 1.8, 1.2, .6, 0.):
+      camera = self.camera(long_m=24.6, lat_m=-y_rel, left=-.15, right=.15, cls=2)
+      target = self.target(d_rel=25., y_rel=y_rel)
+      assert BoschCameraExtendedGrouping._associate(target, [camera], 1) == \
+        (BOSCH_CAMERA_ASSOC_ASSIGNED, self.EPISODE, 2)
+
+  def test_large_vehicle_baseline_association_is_unchanged(self):
+    camera = self.camera(long_m=20., lat_m=0., left=-.1, right=.1, width=2.45)
+    for d_rel in (14., 20., 27., 34.):
+      assert BoschCameraExtendedGrouping._associate(self.target(d_rel=d_rel, y_rel=0.),
+                                                    [camera], 1)[0] == BOSCH_CAMERA_ASSOC_ASSIGNED
+
+  def test_only_baseline_assigned_seeds_and_active_does_not_refresh(self):
+    grouping = self.grouping()
+    baseline_camera = self.camera(lat_m=-5.7)
+    grouping.camera.snapshot = lambda ns: ([baseline_camera], 1, 0, ns)
+    target = self.target(ns=self.NS)
+    partner = self.target(pid=self.PID + 1, d_rel=90., y_rel=5.9, oem=False, ns=self.NS)
+    grouping.update(self.NS, (target, partner), 20., .045)
+    assert grouping.curve_reacquire_histories[self.PID].last_assigned_ns == self.NS
+
+    near_miss = self.camera()
+    grouping.camera.snapshot = lambda ns: ([near_miss], 1, 1, ns)
+    target = self.target(ns=self.NS + 100_000_000)
+    partner = self.target(pid=self.PID + 1, d_rel=90., y_rel=5.9, oem=False,
+                          ns=self.NS + 100_000_000)
+    grouping.update(self.NS + 100_000_000, (target, partner), 20., .045)
+    assert grouping.last_baseline_associations[self.PID][0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+    assert grouping.last_associations[self.PID][0] == BOSCH_CAMERA_ASSOC_ASSIGNED
+    assert grouping.curve_reacquire_histories[self.PID].last_assigned_ns == self.NS
+
+  @pytest.mark.parametrize('mode', (BOSCH_CAMERA_CURVE_REACQUIRE_OFF,
+                                    BOSCH_CAMERA_CURVE_REACQUIRE_SHADOW))
+  def test_off_and_shadow_do_not_change_the_baseline_verdict(self, mode):
+    grouping = self.grouping(mode)
+    self.seed(grouping)
+    camera = self.camera()
+    grouping.camera.snapshot = lambda ns: ([camera], 1, 0, ns)
+    target = self.target(ns=self.NS + 100_000_000)
+    partner = self.target(pid=self.PID + 1, d_rel=90., y_rel=5.9, oem=False,
+                          ns=self.NS + 100_000_000)
+    grouping.update(self.NS + 100_000_000, (target, partner), 20., .045)
+    assert grouping.last_associations[self.PID][0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+    if mode == BOSCH_CAMERA_CURVE_REACQUIRE_SHADOW:
+      assert grouping.last_curve_reacquire_would == ((self.PID, self.CAMERA_ID, self.EPISODE),)
 
 
 class TestBoschCameraE2Overlay:
