@@ -268,14 +268,6 @@ BOSCH_MAX_RAW_TRACK_ID = 2**31 - 1
 BOSCH_TRACK_ADDRESSES = frozenset(range(0x602, 0x612))
 BOSCH_WINDOW_NS = 20_000_000
 # A model path is only a corridor where it still reaches well past the object.
-# modelV2.position is 33 samples on the fixed grid T_IDXS[i] = 10*(i/32)**2
-# seconds, so its reach in metres collapses with speed: about 10*vEgo. Near the
-# end of that reach the samples are a forecast rather than observed road, and
-# they stop being usable to drop a return. Measured over 306,896 consecutive
-# static observations on five routes, the scan-to-scan disagreement of the
-# corridor residual is 0.72 m at p95 with no rule and 0.40 m once this much
-# path is required beyond the query point.
-BOSCH_PATH_TRUST_MARGIN_M = 40.0
 BOSCH_STALE_NS = 300_000_000
 BOSCH_OUTPUT_INTERVAL_NS = 100_000_000
 BOSCH_SAMPLE_HOLD_NS = 150_000_000  # one 10 Hz observation period plus one SCC publication period
@@ -3029,124 +3021,12 @@ class BoschPhysicalTracker:
     return result
 
 
-class _BoschStaticOffPathFilter:
-  """Bosch-only publication subset; raw/physical tracking remains untouched."""
-  _EVIDENCE_NS = 800_000_000
-  _GAP_NS = 160_000_000
-  _ENTER_SPEED_MPS = 0.8
-  _EXIT_SPEED_MPS = 1.0
-  _ENTER_OFFSET_M = 5.5
-  _EXIT_OFFSET_M = 5.0
-  _LONGITUDINAL_RESIDUAL_M = 2.5
-  _LATERAL_STEP_M = 0.375
-  _INWARD_STEP_M = 0.35
-  _MAX_LATERAL_EXCURSION_M = 2.0
-  _MIN_EGO_SPEED_MPS = 3.0
+class _BoschPublicationPassThrough:
+  """Compatibility hook for publication-stage replay instrumentation."""
 
-  def __init__(self):
-    from openpilot.selfdrive.carrot.radar_motion.predictor import model_path_y
-    self._path_y = model_path_y
-    self._checked_path = None
-    self._checked_valid = False
-    # physical PID가 현재 scan에서 사라지면 아래 update의 새 dict에 복사되지
-    # 않는다. 따라서 state는 Bosch의 현재 살아 있는 physical object 수로 제한된다.
-    self._states = {}
-    self.state_peak = 0
-
-  def update(self, objects, timestamp_ns, v_ego, path=(), yaw_rate=None):
-    # Unknown ego speed remains the only whole-scan fail-open: without it the
-    # world residual cannot be formed, so no static state can be established.
-    if not math.isfinite(v_ego):
-      self._states = {}
-      return objects
-    # Provider supplies only causal, fresh paths. An unusable path no longer
-    # retains the whole scan; those objects fall back to a straight corridor.
-    # The same model path is handed to several scans, so validate it once and
-    # keep a reference alongside the verdict rather than rescanning every time.
-    if path is self._checked_path:
-      path_valid = self._checked_valid
-    else:
-      path_valid = (len(path) >= 2
-                    and all(math.isfinite(x) and math.isfinite(y) for x, y in path)
-                    and all(path[i][0] < path[i + 1][0] for i in range(len(path) - 1)))
-      self._checked_path = path
-      self._checked_valid = path_valid
-    # In vehicle coordinates a world-static return moves at -vEgo + yaw*yRel,
-    # so the rotational term must be removed before judging ground speed. A
-    # missing or non-finite yaw degrades to the previous naive residual, which
-    # over-keeps rather than dropping a real object.
-    rotation = yaw_rate if yaw_rate is not None and math.isfinite(yaw_rate) else 0.0
-    kept = []
-    states = {}
-    for obj in objects:
-      # Representative velocity, not member votes.
-      speed = abs(obj.v_rel + v_ego - rotation * obj.y_rel)
-      # OEM/model support is an immediate fail-open veto. Multi-return physical
-      # objects are excluded from temporal escalation, but still pass through
-      # the pre-existing static/off-path qualification below.
-      if obj.oem_selected or obj.vision_supported or not math.isfinite(speed):
-        kept.append(obj)
-        continue
-      offset = obj.y_rel
-      if path_valid and path[0][0] <= obj.d_rel <= path[-1][0]:
-        # Only the part of the path that still has road behind it may overrule
-        # the straight corridor. Past that the path is read only when the
-        # corridor would already have dropped the object, so a terminal
-        # prediction can argue to keep a return but never to remove one.
-        if obj.d_rel <= path[-1][0] - BOSCH_PATH_TRUST_MARGIN_M:
-          offset = obj.y_rel - self._path_y(path, obj.d_rel)
-        elif abs(offset) > 3.0:
-          path_offset = obj.y_rel - self._path_y(path, obj.d_rel)
-          if abs(path_offset) < abs(offset):
-            offset = path_offset
-      if not math.isfinite(offset):
-        kept.append(obj)
-        continue
-
-      previous = self._states.get(obj.physical_track_id) if len(obj.members) == 1 else None
-      established = bool(previous and previous[8])
-      speed_limit = self._EXIT_SPEED_MPS if established else self._ENTER_SPEED_MPS
-      offset_limit = self._EXIT_OFFSET_M if established else self._ENTER_OFFSET_M
-      # Very-low-speed roadside scenes cannot reliably distinguish a parked
-      # vehicle from structure using radar-only static evidence. Likewise, a
-      # cumulative lateral excursion is direct evidence that a far-side object
-      # may be a turning/crossing vehicle even when each individual step is
-      # small. Both cases fail open for the temporal extension while preserving
-      # the pre-existing <=0.6 m/s immediate static/off-path decision below.
-      eligible = (len(obj.members) == 1 and v_ego >= self._MIN_EGO_SPEED_MPS
-                  and speed <= speed_limit and abs(offset) >= offset_limit)
-      if eligible and previous is not None:
-        since_ns, last_ns, member_id, representative_id, d_rel, y_rel, v_rel, old_offset, was_established, anchor_y = previous
-        dt_s = (timestamp_ns - last_ns) * 1e-9
-        eligible = (
-          0.0 < dt_s <= self._GAP_NS * 1e-9
-          and member_id == obj.members[0].raw_track_id
-          and representative_id == obj.representative_raw_track_id
-          and abs(obj.d_rel - (d_rel + v_rel * dt_s)) <= max(self._LONGITUDINAL_RESIDUAL_M, 7.0 * dt_s)
-          and abs(obj.v_rel - v_rel) <= 1.0
-          and abs(obj.y_rel - y_rel) <= self._LATERAL_STEP_M
-          and abs(old_offset) - abs(offset) <= self._INWARD_STEP_M
-          and abs(obj.y_rel - anchor_y) <= self._MAX_LATERAL_EXCURSION_M
-        )
-      if eligible:
-        if previous is None:
-          since_ns = timestamp_ns
-          established = False
-          anchor_y = obj.y_rel
-        elif not established:
-          established = timestamp_ns - since_ns >= self._EVIDENCE_NS
-        states[obj.physical_track_id] = (
-          since_ns, timestamp_ns, obj.members[0].raw_track_id, obj.representative_raw_track_id,
-          obj.d_rel, obj.y_rel, obj.v_rel, offset, established, anchor_y)
-
-      # 기존 <=0.6 static/off-path 동작은 유지한다. 새 상태는 그 관측도
-      # evidence로 사용하되, 0.6 초과 표적만 충분한 이력 뒤 추가 억제한다.
-      baseline_kept = speed > 0.6 or abs(offset) <= 3.0
-      if baseline_kept and not (eligible and established):
-        kept.append(obj)
-    self._states = states
-    self.state_peak = max(self.state_peak, len(states))
-    return objects if len(kept) == len(objects) else tuple(kept)
+  @staticmethod
+  def update(objects, *_args, **_kwargs):
+    return objects
 
 
 @dataclass
@@ -3764,7 +3644,7 @@ class BoschRadarProvider:
     self.tracker = BoschPhysicalTracker()
     self.camera_extended = BoschCameraExtendedGrouping(camera_extended_mode, curve_reacquire_mode)
     self.publication_aliases = BoschPublicationAliasAllocator()
-    self.qualifier = _BoschStaticOffPathFilter() if qualification else None
+    self.qualifier = _BoschPublicationPassThrough() if qualification else None
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
     self.oem_gate = _BoschOemValidationGate(oem_gate_mode)
     self.scc_obj_valid = None

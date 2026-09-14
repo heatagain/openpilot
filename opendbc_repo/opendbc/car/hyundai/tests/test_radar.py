@@ -538,7 +538,7 @@ class TestCornerRadar430CandidateFilter:
     assert all(str(point.radarSource) != "corner430" for point in points.values())
 
 
-class TestBoschStaticOffPathTemporal:
+class TestBoschOffPathPublication:
   PID = 1_000_900
   START_NS = 1_000_000_000
 
@@ -553,181 +553,136 @@ class TestBoschStaticOffPathTemporal:
 
   @staticmethod
   def filter():
-    return radar_interface_module._BoschStaticOffPathFilter()
+    return radar_interface_module._BoschPublicationPassThrough()
 
   @classmethod
   def wall(cls, index, **kwargs):
     kwargs.setdefault('d', 80. - 9.35 * index * .1)
     return cls.obj(index, **kwargs)
 
-  def test_single_boundary_scan_is_fail_open_keep(self):
+  @pytest.mark.parametrize(('y_rel', 'v_rel'), (
+    (.25, -10.),    # in-path stationary target
+    (3.01, -10.),   # immediately outside the removed corridor boundary
+    (-7., -10.),    # stationary roadside structure
+    (4., -8.),      # adjacent-lane moving vehicle
+    (8., 10.),      # opposite-direction vehicle
+  ))
+  def test_path_relevance_and_stationary_status_do_not_change_publication(self, y_rel, v_rel):
     qualifier = self.filter()
-    obj = self.wall(0, v=-9.35)  # compensated residual 0.65 m/s
-    assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
-    assert not qualifier._states[self.PID][8]
-    assert qualifier.update((obj,), obj.timestamp_ns + 1, math.nan) == (obj,)
-    assert not qualifier._states
+    obj = self.obj(y=y_rel, v=v_rel)
+    objects = (obj,)
+    assert qualifier.update(objects, obj.timestamp_ns, 10.) is objects
 
-  def test_long_lived_far_offpath_static_drops_after_evidence(self):
+  def test_removed_boundaries_cannot_cause_publish_unpublish_chatter(self):
     qualifier = self.filter()
-    # Existing <=0.6 behavior drops immediately but also establishes causal
-    # evidence. The first boundary sample after 800 ms is then suppressed.
-    for index in range(8):
+    for index, y_rel in enumerate((2.99, 3.01, 5.49, 5.51, 4.99, 3.0, -3.01, -5.51)):
+      obj = self.wall(index, y=y_rel, v=-10.)
+      objects = (obj,)
+      assert qualifier.update(objects, obj.timestamp_ns, 10.) is objects
+
+  @pytest.mark.parametrize('path', (
+    (), ((0., 0.),), ((0., 0.), (50., math.nan)), ((50., 0.), (0., 0.)),
+    ((0., 0.), (50., 4.), (100., 8.)),
+  ))
+  @pytest.mark.parametrize(('v_ego', 'yaw_rate'), ((0., 0.), (10., None), (math.nan, math.nan)))
+  def test_path_availability_speed_and_yaw_do_not_gate_publication(self, path, v_ego, yaw_rate):
+    qualifier = self.filter()
+    obj = self.wall(0, y=-9., v=-10.)
+    objects = (obj,)
+    assert qualifier.update(objects, obj.timestamp_ns, v_ego, path, yaw_rate=yaw_rate) is objects
+
+  def test_publication_hook_has_no_pid_member_or_temporal_state(self):
+    qualifier = self.filter()
+    first = self.wall(0)
+    changed = self.wall(20, raw_id=901, y=9., v=-10.)
+    for objects in ((first,), (), (changed,)):
+      assert qualifier.update(objects, self.START_NS, 10.) is objects
+    assert vars(qualifier) == {}
+
+  def test_long_lived_far_offpath_static_is_always_published(self):
+    qualifier = self.filter()
+    for index in range(20):
       obj = self.wall(index, v=-9.5)
-      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == ()
-    obj = self.wall(8, v=-9.35)
-    assert qualifier.update((obj,), obj.timestamp_ns, 10.) == ()
-    assert qualifier._states[self.PID][8]
+      objects = (obj,)
+      assert qualifier.update(objects, obj.timestamp_ns, 10.) is objects
 
   @pytest.mark.parametrize(('field', 'value'), (('vision', True), ('oem', True)))
-  def test_supported_object_is_immediate_fail_open_keep(self, field, value):
+  def test_support_status_does_not_change_pass_through(self, field, value):
     qualifier = self.filter()
-    for index in range(9):
-      obj = self.wall(index)
-      qualifier.update((obj,), obj.timestamp_ns, 10.)
-    kwargs = {field: value}
-    obj = self.wall(9, **kwargs)
-    assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
-    assert self.PID not in qualifier._states
+    obj = self.wall(0, **{field: value})
+    objects = (obj,)
+    assert qualifier.update(objects, obj.timestamp_ns, 10.) is objects
 
-  def test_in_path_real_stationary_target_is_kept(self):
+  def test_in_path_real_stationary_target_is_published(self):
     qualifier = self.filter()
     for index in range(20):
       obj = self.obj(index, d=30. - index, y=.25, v=-10.)
-      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
-    assert self.PID not in qualifier._states
+      objects = (obj,)
+      assert qualifier.update(objects, obj.timestamp_ns, 10.) is objects
 
-  def test_slow_moving_vehicle_is_kept(self):
+  def test_adjacent_slow_moving_vehicle_is_published(self):
     qualifier = self.filter()
     for index in range(20):
       obj = self.obj(index, d=50. - .88 * index, y=-7., v=-8.8)
-      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
-    assert self.PID not in qualifier._states
+      objects = (obj,)
+      assert qualifier.update(objects, obj.timestamp_ns, 10.) is objects
 
-  def test_crossing_vehicle_lateral_motion_resets_and_keeps(self):
+  @pytest.mark.parametrize('side', (-1., 1.))
+  def test_crossing_and_turning_lateral_motion_is_published(self, side):
     qualifier = self.filter()
-    for index in range(12):
-      obj = self.obj(index, d=70. - .935 * index, y=-10. + .5 * index, v=-9.35)
-      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
-    assert not qualifier._states
+    for index in range(16):
+      obj = self.wall(index, y=side * (10. + .3 * index))
+      objects = (obj,)
+      assert qualifier.update(objects, obj.timestamp_ns, 10.) is objects
 
-  def test_opposite_direction_vehicle_is_kept(self):
+  def test_member_change_gap_and_segment_reset_need_no_qualifier_history(self):
     qualifier = self.filter()
-    for index in range(12):
-      obj = self.obj(index, d=90. - 2. * index, y=8., v=10.)
-      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
+    sequence = (
+      self.wall(0),
+      self.wall(8, raw_id=901),
+      self.obj(20, d=70.65, y=-7., v=-9.35),
+    )
+    for obj in sequence:
+      objects = (obj,)
+      assert qualifier.update(objects, obj.timestamp_ns, 10.) is objects
+    assert vars(qualifier) == {}
 
-  def test_cut_in_resets_established_static_confidence(self):
-    qualifier = self.filter()
-    for index in range(9):
-      obj = self.wall(index)
-      qualifier.update((obj,), obj.timestamp_ns, 10.)
-    assert qualifier._states[self.PID][8]
-    obj = self.wall(9, y=-6.5)
-    assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
-    assert self.PID not in qualifier._states
-
-  def test_member_identity_change_resets_history(self):
-    qualifier = self.filter()
-    for index in range(8):
-      obj = self.wall(index)
-      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
-    changed = self.wall(8, raw_id=901)
-    assert qualifier.update((changed,), changed.timestamp_ns, 10.) == (changed,)
-    assert self.PID not in qualifier._states
-
-  def test_observation_gap_resets_history(self):
-    qualifier = self.filter()
-    for index in range(8):
-      obj = self.wall(index)
-      qualifier.update((obj,), obj.timestamp_ns, 10.)
-    gap = self.obj(10, d=70.65, y=-7., v=-9.35)
-    assert qualifier.update((gap,), gap.timestamp_ns, 10.) == (gap,)
-    assert self.PID not in qualifier._states
-
-  def test_state_is_bounded_and_disappearing_pid_is_retired(self):
-    qualifier = self.filter()
-    objects = tuple(self.obj(0, pid=self.PID + i, raw_id=1_000 + i, d=40. + i) for i in range(32))
-    qualifier.update(objects, self.START_NS, 10.)
-    assert len(qualifier._states) == qualifier.state_peak == 32
-    qualifier.update((), self.START_NS + 100_000_000, 10.)
-    assert qualifier._states == {}
-
-  def test_phantom_wall_sequence_uses_speed_hysteresis(self):
-    qualifier = self.filter()
-    for index in range(9):
-      qualifier.update((self.wall(index),), self.wall(index).timestamp_ns, 10.)
-    hysteresis = self.wall(9, v=-9.1)  # residual 0.9: above enter, below exit
-    assert qualifier.update((hysteresis,), hysteresis.timestamp_ns, 10.) == ()
-    moving = self.wall(10, v=-8.75)
-    assert qualifier.update((moving,), moving.timestamp_ns, 10.) == (moving,)
-    assert self.PID not in qualifier._states
-
-  def test_curve_yaw_in_path_real_vehicle_is_kept(self):
+  def test_curve_path_and_yaw_do_not_gate_publication(self):
     qualifier = self.filter()
     path = ((0., 0.), (50., 4.), (100., 8.))
     for index in range(12):
-      d = 80. - .855 * index
-      y = d * .08 + .4
-      obj = self.obj(index, d=d, y=y, v=-8.55)
-      assert qualifier.update((obj,), obj.timestamp_ns, 10., path, yaw_rate=.1) == (obj,)
+      d_rel = 80. - .855 * index
+      obj = self.obj(index, d=d_rel, y=d_rel * .08 + .4, v=-8.55)
+      objects = (obj,)
+      assert qualifier.update(objects, obj.timestamp_ns, 10., path, yaw_rate=.1) is objects
 
-  @pytest.mark.parametrize('side', (-1., 1.))
-  def test_side_lead_turning_vehicle_cumulative_lateral_motion_is_kept(self, side):
+  def test_low_speed_parked_roadside_and_structure_are_published(self):
     qualifier = self.filter()
-    # PID1019926형 좌/우 side-role 차량: scan 간 이동은 continuity gate 안이지만
-    # 누적 2 m를 넘으면 실제 turning/crossing evidence로 fail-open한다.
-    for index in range(16):
-      obj = self.wall(index, y=side * (10. + .3 * index))
-      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
-    assert self.PID not in qualifier._states
+    for index, v_rel in enumerate((-1.35, -1.5)):
+      obj = self.obj(index, d=40. - index, y=-9., v=v_rel)
+      objects = (obj,)
+      assert qualifier.update(objects, obj.timestamp_ns, 2.) is objects
 
-  def test_low_speed_parked_roadside_vehicle_is_kept(self):
+  def test_multi_member_object_is_published_without_temporal_extension(self):
     qualifier = self.filter()
-    for index in range(16):
-      obj = self.obj(index, d=40. - .135 * index, y=-9., v=-1.35)
-      assert qualifier.update((obj,), obj.timestamp_ns, 2.) == (obj,)
-    assert self.PID not in qualifier._states
+    obj = self.wall(0)
+    detection = BoschRawDetection(obj.timestamp_ns, 6, obj.d_rel + .5, obj.y_rel, obj.v_rel, 1)
+    member = BoschRawTrack(901, detection, 1, False)
+    multi = BoschPhysicalObject(obj.physical_track_id, obj.timestamp_ns, obj.members + (member,),
+                                obj.representative_raw_track_id, obj.d_rel, obj.y_rel, obj.v_rel,
+                                obj.oem_selected, obj.vision_supported, obj.age_scans,
+                                'temporal_complete_link')
+    objects = (multi,)
+    assert qualifier.update(objects, multi.timestamp_ns, 10.) is objects
+    assert vars(qualifier) == {}
 
-  def test_low_speed_veto_preserves_existing_immediate_static_drop(self):
-    qualifier = self.filter()
-    obj = self.obj(0, d=40., y=-9., v=-1.5)
-    assert qualifier.update((obj,), obj.timestamp_ns, 2.) == ()
-    assert self.PID not in qualifier._states
-
-  def test_guardrail_near_supported_real_vehicle_is_kept(self):
-    qualifier = self.filter()
-    for index in range(16):
-      obj = self.wall(index, y=-6., vision=True)
-      assert qualifier.update((obj,), obj.timestamp_ns, 10.) == (obj,)
-    assert self.PID not in qualifier._states
-
-  def test_multi_member_object_never_uses_temporal_extension(self):
-    qualifier = self.filter()
-    for index in range(16):
-      obj = self.wall(index)
-      second_detection = BoschRawDetection(obj.timestamp_ns, 6, obj.d_rel + .5, obj.y_rel, obj.v_rel, 1)
-      second_member = BoschRawTrack(901, second_detection, index + 1, False)
-      multi = BoschPhysicalObject(obj.physical_track_id, obj.timestamp_ns, obj.members + (second_member,),
-                                  obj.representative_raw_track_id, obj.d_rel, obj.y_rel, obj.v_rel,
-                                  obj.oem_selected, obj.vision_supported, obj.age_scans,
-                                  'temporal_complete_link')
-      assert qualifier.update((multi,), multi.timestamp_ns, 10.) == (multi,)
-    assert self.PID not in qualifier._states
-
-  def test_camera_mode_contract_does_not_change_qualifier(self):
-    results = []
+  def test_camera_mode_contract_does_not_change_publication(self):
     for mode in (0, 1, 3):  # OFF, SHADOW, ACTIVE_TEST
       provider = BoschRadarProvider(1, camera_extended_mode=mode)
-      sequence = []
-      for index in range(10):
-        obj = self.wall(index)
-        objects = (obj,)
-        assert provider.camera_extended.update(obj.timestamp_ns, objects, 10., 0.) is objects
-        sequence.append(tuple(x.physical_track_id for x in provider.qualifier.update(
-          objects, obj.timestamp_ns, 10.)))
-      results.append(sequence)
-    assert results[0] == results[1] == results[2]
+      obj = self.wall(0, y=-9., v=-10.)
+      objects = (obj,)
+      assert provider.camera_extended.update(obj.timestamp_ns, objects, 10., 0.) is objects
+      assert provider.qualifier.update(objects, obj.timestamp_ns, 10.) is objects
 
 
 class TestBoschP91PersistentSpatialClone:
@@ -992,7 +947,7 @@ class TestBoschPublicationAlias:
       assert 'alias_peak=1' in message
       assert 'alias_denial=0' in message
 
-  def test_qualified_publication_and_stale_cleanup_preserve_scc(self, monkeypatch):
+  def test_offpath_publication_and_stale_cleanup_preserve_scc(self, monkeypatch):
     provider = BoschRadarProvider(1)
     interface = RadarInterface.__new__(RadarInterface)
     interface.bosch, interface.v_ego = provider, 0.
@@ -1008,10 +963,10 @@ class TestBoschPublicationAlias:
       provider.last_scan_timestamp_ns = interface._bosch_now_ns = now
       data = interface.update_carrot(0., 0., now * 1e-9, [])
       assert data.points[0].to_dict() == base_update().points[0].to_dict()
-      assert len(data.points) == index + 1
-      if index:
-        assert data.points[1].trackId == 32
-        assert provider.publication_aliases.alias_to_physical[32] == objects[0].physical_track_id
+      assert len(data.points) == 2
+      alias = 32 + index
+      assert data.points[1].trackId == alias
+      assert provider.publication_aliases.alias_to_physical[alias] == objects[0].physical_track_id
     # Empty/stale publications still age bindings, including a stalled provider
     # whose group state has not been advanced by another CAN scan.
     interface._bosch_now_ns += 600_000_000
