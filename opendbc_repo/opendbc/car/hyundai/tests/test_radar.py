@@ -15,6 +15,7 @@ from opendbc.car.hyundai.radar_interface import (
   RADAR_REQUIRED_MSG_COUNT,
   RADAR_START_ADDR_CANFD3,
   BoschObjectGroupManager,
+  BoschGroupingConfig,
   BoschPhysicalObject,
   BoschPhysicalTracker,
   BoschPublicationAliasAllocator,
@@ -1122,6 +1123,160 @@ class TestBoschPhysicalIdContinuityTrace:
           assert decision.residual_y_m is not None
           assert decision.residual_v_mps is not None
           assert decision.dt_s > 0.0
+
+
+class TestBoschProvisionalBirthBundle:
+  SCAN_NS = 100_000_000
+
+  @staticmethod
+  def track(raw_id, slot, d_rel, y_rel, v_rel, ns, age):
+    detection = BoschRawDetection(ns, slot, d_rel, y_rel, v_rel, raw_word=raw_id)
+    return BoschRawTrack(raw_id, detection, age, False)
+
+  @classmethod
+  def pair(cls, index, *, d=(79.75, 78.25), y=(-1.4375, -1.21875),
+           v=(-13., -13.), ages=None):
+    ns = (index + 1) * cls.SCAN_NS
+    ages = ages or (index + 1, index + 1)
+    return ns, (cls.track(499, 17, d[0], y[0], v[0], ns, ages[0]),
+                cls.track(500, 18, d[1], y[1], v[1], ns, ages[1]))
+
+  @staticmethod
+  def public(manager, objects, **kwargs):
+    return manager.provisional_publication_view(objects, **kwargs)
+
+  def test_bosch_provisional_bundle_same_scan_duplicate(self):
+    manager = BoschObjectGroupManager()
+    ns, tracks = self.pair(0)
+    objects = manager.update(ns, tracks, v_ego=30., yaw_rate=.008169143)
+    public = self.public(manager, objects)
+
+    assert len(objects) == 2 and len(manager.states) == 2
+    assert {m.raw_track_id for obj in objects for m in obj.members} == {499, 500}
+    assert len(public) == 1
+    decision = manager.last_provisional_decisions[-1]
+    assert decision.action == 'CREATE'
+    assert decision.raw_track_ids == (499, 500)
+    assert decision.delta_d_m == 1.5
+    assert decision.delta_y_m == .21875
+    assert decision.delta_bearing_deg == pytest.approx(.140335, abs=1e-6)
+    assert decision.delta_vrel_mps == 0.
+    assert decision.delta_world_speed_mps == pytest.approx(.001787, abs=1e-6)
+
+  def test_bosch_provisional_bundle_second_scan_coherent(self):
+    manager = BoschObjectGroupManager()
+    first_ns, first = self.pair(0)
+    self.public(manager, manager.update(first_ns, first, v_ego=30.))
+    second_ns, second = self.pair(1, d=(78.75, 77.75), y=(-1.40625, -1.25))
+    objects = manager.update(second_ns, second, v_ego=30.)
+
+    assert len(self.public(manager, objects)) == 1
+    assert manager.last_provisional_decisions[-1].action == 'COHERENT'
+    assert manager.last_provisional_decisions[-1].representative_raw_track_id == 499
+    assert {obj.age_scans for obj in objects} == {2}
+
+  def test_bosch_provisional_bundle_split_fail_open(self):
+    manager = BoschObjectGroupManager()
+    ns, tracks = self.pair(0)
+    self.public(manager, manager.update(ns, tracks, v_ego=30.))
+    ns, tracks = self.pair(1, y=(-1.5, -.75))
+    objects = manager.update(ns, tracks, v_ego=30.)
+
+    assert self.public(manager, objects) == objects
+    assert not manager.provisional_bundles
+    assert manager.last_provisional_decisions[-1].release_reason == 'criteria_diverged'
+
+  def test_bosch_provisional_bundle_camera_supported_fail_open(self):
+    manager = BoschObjectGroupManager()
+    ns, tracks = self.pair(0)
+    objects = manager.update(ns, tracks, v_ego=30.)
+    pids = tuple(obj.physical_track_id for obj in objects)
+
+    assert self.public(manager, objects, strict_associations={pids[0]: 7}) == objects
+    assert not manager.provisional_bundles
+    assert manager.last_provisional_decisions[-1].release_reason == 'strict_camera_identity'
+
+  def test_bosch_provisional_bundle_oem_supported_fail_open(self):
+    manager = BoschObjectGroupManager()
+    ns, tracks = self.pair(0)
+    objects = manager.update(ns, tracks, v_ego=30., oem_slot=17)
+    assert self.public(manager, objects) == objects
+    assert not manager.provisional_bundles
+
+    manager = BoschObjectGroupManager()
+    objects = manager.update(ns, tracks, v_ego=30.)
+    assert self.public(manager, objects, oem_pids=(objects[1].physical_track_id,)) == objects
+    assert manager.last_provisional_decisions[-1].release_reason == 'oem_identity'
+
+  def test_bosch_provisional_bundle_two_real_objects_not_merged(self):
+    manager = BoschObjectGroupManager()
+    ns, tracks = self.pair(0, y=(-1.5, -1.2))
+    objects = manager.update(ns, tracks, v_ego=30.)
+    assert self.public(manager, objects) == objects
+    assert not manager.provisional_bundles
+
+  def test_bosch_provisional_bundle_normal_group_handoff(self):
+    manager = BoschObjectGroupManager()
+    for index in range(3):
+      ns, tracks = self.pair(index, d=(79.75-index, 78.25-index))
+      objects = manager.update(ns, tracks, v_ego=30.)
+      public = self.public(manager, objects)
+    assert len(objects) == len(public) == 1
+    assert tuple(m.raw_track_id for m in objects[0].members) == (499, 500)
+    assert objects[0].representative_raw_track_id == 499
+    assert objects[0].grouping_evidence == 'temporal_complete_link'
+    assert not manager.provisional_bundles
+    assert manager.last_provisional_decisions[-1].release_reason == 'normal_group_handoff'
+
+  def test_bosch_provisional_bundle_state_reset(self):
+    manager = BoschObjectGroupManager()
+    ns, tracks = self.pair(0)
+    self.public(manager, manager.update(ns, tracks, v_ego=30.))
+    objects = manager.update(2 * self.SCAN_NS, (), v_ego=30.)
+    assert objects == () and not manager.provisional_bundles
+    assert manager.last_provisional_decisions[-1].release_reason == 'member_missing'
+
+    manager = BoschObjectGroupManager()
+    ns, tracks = self.pair(0)
+    self.public(manager, manager.update(ns, tracks, v_ego=30.))
+    ns, tracks = self.pair(1, ages=(1, 1))
+    objects = manager.update(ns, tracks, v_ego=30.)
+    assert self.public(manager, objects) == objects
+    assert manager.last_provisional_decisions[-1].release_reason == 'age_rollback'
+
+  def test_bosch_s37_not_matched_by_s32_bundle_rule(self):
+    manager = BoschObjectGroupManager()
+    ns = self.SCAN_NS
+    tracks = (
+      self.track(129, 4, 59.75, -3.34375, -5., ns, 209),
+      self.track(338, 18, 68.5, -1.40625, -5., ns, 1),
+    )
+    objects = manager.update(ns, tracks, v_ego=29.5)
+    assert self.public(manager, objects) == objects
+    assert not manager.provisional_bundles
+
+  def test_bosch_provisional_bundle_alias_and_representative_continuity(self):
+    manager = BoschObjectGroupManager()
+    allocator = BoschPublicationAliasAllocator()
+    representative_alias = None
+    for index in range(3):
+      ns, tracks = self.pair(index, d=(79.75-index, 78.25-index))
+      objects = manager.update(ns, tracks, v_ego=30.)
+      aliases = allocator.update(ns, (obj.physical_track_id for obj in objects), manager.states)
+      public = self.public(manager, objects)
+      if index == 0:
+        rep_pid = public[0].physical_track_id
+        representative_alias = aliases[rep_pid]
+        assert manager.last_provisional_decisions[0].representative_raw_track_id == 499
+      assert aliases[public[0].physical_track_id] == representative_alias
+    assert allocator.denial_count == 0
+
+  def test_bosch_provisional_bundle_can_be_disabled_for_baseline_replay(self):
+    manager = BoschObjectGroupManager(BoschGroupingConfig(provisional_enabled=False))
+    ns, tracks = self.pair(0)
+    objects = manager.update(ns, tracks, v_ego=30.)
+    assert self.public(manager, objects) == objects
+    assert manager.last_provisional_decisions == ()
 
 
 class TestBoschRawAssociationTrace:

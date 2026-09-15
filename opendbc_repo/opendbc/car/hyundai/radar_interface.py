@@ -2253,9 +2253,22 @@ class BoschGroupingConfig:
   max_members: int = 8
   coast_s: float = .3
   first_physical_id: int = 1_000_000
+  provisional_enabled: bool = True
+  provisional_min_distance_m: float = 1.0
+  provisional_max_distance_m: float = 2.0
+  provisional_max_lateral_m: float = .25
+  provisional_max_bearing_deg: float = .20
+  provisional_max_velocity_mps: float = .25
+  provisional_max_world_speed_mps: float = .05
+  provisional_min_range_m: float = 40.
+  provisional_min_world_speed_mps: float = 4.
 
   def __post_init__(self):
     for name, value in vars(self).items():
+      if name == 'provisional_enabled':
+        if not isinstance(value, bool):
+          raise ValueError('provisional_enabled must be boolean')
+        continue
       if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
         raise ValueError(f'{name} must be positive and finite')
     if self.min_pair_observations < 2 or int(self.min_pair_observations) != self.min_pair_observations:
@@ -2268,6 +2281,10 @@ class BoschGroupingConfig:
       raise ValueError('evidence window must contain the minimum pair span')
     if not isinstance(self.first_physical_id, int) or self.first_physical_id >= 2**31:
       raise ValueError('physical IDs must fit positive downstream Int32')
+    if self.provisional_min_distance_m >= self.provisional_max_distance_m:
+      raise ValueError('provisional distance band must be nonempty')
+    if self.provisional_max_distance_m > self.distance_diameter_m:
+      raise ValueError('provisional pairs must remain inside normal grouping geometry')
 
 
 @dataclass(frozen=True)
@@ -2382,6 +2399,59 @@ class _BoschPhysicalState:
   observation: BoschPhysicalObject
   # Includes temporarily missing raw members, for internal coasting only.
   member_last_seen: dict[int, int]
+
+
+@dataclass
+class _BoschProvisionalBundleState:
+  raw_track_ids: tuple[int, int]
+  timestamp_ns: int
+  last_ages: tuple[int, int]
+  representative_raw_track_id: int
+  d_rel: float
+  y_rel: float
+  v_rel: float
+
+
+@dataclass(frozen=True)
+class BoschProvisionalBundleDecision:
+  timestamp_ns: int
+  action: str
+  release_reason: str
+  raw_track_ids: tuple[int, int]
+  physical_track_ids: tuple[int, ...]
+  representative_raw_track_id: int | None
+  representative_physical_track_id: int | None
+  delta_d_m: float | None
+  delta_y_m: float | None
+  delta_bearing_deg: float | None
+  delta_vrel_mps: float | None
+  delta_world_speed_mps: float | None
+
+
+def _bosch_group_representative(candidates, raw_index, vision_supported, oem_slot, *,
+                                prior=None, predicted_xy=None):
+  """Select one whole raw surface using the physical group's existing cost."""
+  if len(candidates) == 1:
+    return candidates[0]
+  if prior is not None:
+    px, py = predicted_xy
+
+    def cost(member):
+      continuity = (abs(member.d_rel-px) + .5*abs(member.y_rel-py) +
+                    .5*abs(member.v_rel-prior.v_rel))
+      return (continuity, member.raw_track_id != prior.representative_raw_track_id,
+              not vision_supported[raw_index[member.raw_track_id]], member.slot != oem_slot,
+              -member.age_scans, member.raw_track_id)
+  else:
+    ordered = sorted(member.d_rel for member in candidates)
+    middle = len(ordered)//2
+    median = ordered[middle] if len(ordered) % 2 else (ordered[middle-1]+ordered[middle])/2
+
+    def cost(member):
+      return (abs(member.d_rel-median), False,
+              not vision_supported[raw_index[member.raw_track_id]], member.slot != oem_slot,
+              -member.age_scans, member.raw_track_id)
+  return min(candidates, key=cost)
 
 
 def _bosch_physical_component(rows, columns, row_edges, column_edges, margin):
@@ -2505,6 +2575,12 @@ class BoschObjectGroupManager:
     self.stats = Counter()
     self.last_pair_possible = self.last_pair_candidates = 0
     self.last_conflicts = self.last_direct_carries = self.last_multi_count = 0
+    self.provisional_bundles: dict[tuple[int, int], _BoschProvisionalBundleState] = {}
+    self.provisional_hidden: dict[int, int] = {}
+    self.provisional_pid_pairs: dict[tuple[int, int], tuple[int, int]] = {}
+    self.last_provisional_decisions: tuple[BoschProvisionalBundleDecision, ...] = ()
+    self.provisional_created = self.provisional_coherent = 0
+    self.provisional_handoffs = self.provisional_releases = 0
     # Shadow diagnostic switch. Off leaves the scan path byte-for-byte as it
     # was; on only fills last_decisions. Neither setting gates an assignment.
     self.trace_decisions = False
@@ -2619,6 +2695,8 @@ class BoschObjectGroupManager:
     distance_order = sorted(range(n), key=distances.__getitem__)
     ground_speeds = [abs(v+v_ego) for v in velocities] if math.isfinite(v_ego) else None
     pair_candidates = lateral_rejections = velocity_rejections = motion_rejections = 0
+    provisional_matches = {}
+    provisional_handoffs = set()
     for position, a in enumerate(distance_order):
       for following in range(position+1, n):
         b = distance_order[following]
@@ -2629,6 +2707,33 @@ class BoschObjectGroupManager:
         key = (ids[i], ids[j])
         delta_d, delta_y = distances[i]-distances[j], lateral[i]-lateral[j]
         delta_v = abs(velocities[i]-velocities[j])
+        if c.provisional_enabled and math.isfinite(v_ego):
+          prior_bundle = self.provisional_bundles.get(key)
+          fresh_pair = raw_tracks[i].age_scans == raw_tracks[j].age_scans == 1
+          if fresh_pair or prior_bundle is not None:
+            yaw = yaw_rate or 0.
+            world_i = velocities[i] + v_ego - yaw*lateral[i]
+            world_j = velocities[j] + v_ego - yaw*lateral[j]
+            bearing_i = math.degrees(math.atan2(lateral[i], max(distances[i], .5)))
+            bearing_j = math.degrees(math.atan2(lateral[j], max(distances[j], .5)))
+            metrics = (abs(delta_d), abs(delta_y), abs(bearing_i-bearing_j), delta_v,
+                       abs(world_i-world_j))
+            gap_ok = (prior_bundle is None or
+                      timestamp_ns-prior_bundle.timestamp_ns <= c.pair_max_gap_s*1e9)
+            ages_ok = (prior_bundle is None or
+                       (raw_tracks[i].age_scans > prior_bundle.last_ages[0] and
+                        raw_tracks[j].age_scans > prior_bundle.last_ages[1]))
+            supported = oem_slot is not None and oem_slot in (raw_tracks[i].slot, raw_tracks[j].slot)
+            if (gap_ok and ages_ok and not supported and
+                c.provisional_min_distance_m <= metrics[0] <= c.provisional_max_distance_m and
+                metrics[1] <= c.provisional_max_lateral_m and
+                metrics[2] <= c.provisional_max_bearing_deg and
+                metrics[3] <= c.provisional_max_velocity_mps and
+                metrics[4] <= c.provisional_max_world_speed_mps and
+                min(distances[i], distances[j]) >= c.provisional_min_range_m and
+                min(abs(world_i), abs(world_j)) >= c.provisional_min_world_speed_mps and
+                abs(raw_tracks[i].slot-raw_tracks[j].slot) == 1):
+              provisional_matches[key] = (i, j, metrics)
         if abs(delta_y) > c.lateral_diameter_m:
           lateral_rejections += 1
           self.pairs.pop(key, None)
@@ -2660,6 +2765,9 @@ class BoschObjectGroupManager:
         mature = (len(samples) >= c.min_pair_observations and
                   (timestamp_ns-samples[0][0])/1e9 + 1e-6 >= c.min_pair_span_s)
         if stable and mature:
+          if key in self.provisional_bundles:
+            provisional_matches.pop(key, None)
+            provisional_handoffs.add(key)
           compatible[i] |= 1 << j
           compatible[j] |= 1 << i
           cost = abs_delta_d/c.distance_diameter_m + abs_delta_y/c.lateral_diameter_m + delta_v/c.velocity_diameter_mps
@@ -2859,28 +2967,15 @@ class BoschObjectGroupManager:
         px = dx*ca-prior.y_rel*sa
         py = dx*sa+prior.y_rel*ca
         predicted = (dt, px, py)
-      elif not prior and size > 1:
-        # Same order statistic np.median returns, without entering NumPy for a
-        # handful of floats: the even case averages the two middle values in
-        # float64 exactly as np.mean of that pair does.
-        ordered = sorted(m.d_rel for m in candidates)
-        middle = size//2
-        median = ordered[middle] if size % 2 else (ordered[middle-1]+ordered[middle])/2
       if size == 1:
         rep = candidates[0]
         oem_selected = rep.detection.slot == oem_slot
         supported = vision_supported[cluster[0]]
         evidence = 'single_return'
       else:
-        def representative_cost(m):
-          if prior:
-            continuity = abs(m.d_rel-px) + .5*abs(m.y_rel-py) + .5*abs(m.v_rel-prior.v_rel)
-            # Observed state wins over OEM changes; these are only ties.
-            return (continuity, m.raw_track_id != prior.representative_raw_track_id,
-                not vision_supported[raw_index[m.raw_track_id]], m.slot != oem_slot, -m.age_scans, m.raw_track_id)
-          # Initially prefer a robust actual member near the group median.
-          return (abs(m.d_rel-median), False, not vision_supported[raw_index[m.raw_track_id]], m.slot != oem_slot, -m.age_scans, m.raw_track_id)
-        rep = min(candidates, key=representative_cost)
+        rep = _bosch_group_representative(
+          candidates, raw_index, vision_supported, oem_slot, prior=prior,
+          predicted_xy=(px, py) if prior else None)
         oem_selected = any(m.slot == oem_slot for m in candidates)
         supported = any(vision_supported[k] for k in cluster)
         evidence = 'temporal_complete_link'
@@ -2935,6 +3030,108 @@ class BoschObjectGroupManager:
     if largest_group != stats['max_group_size']:
       stats['max_group_size'] = largest_group
 
+    # Provisional bundles never alter clusters, physical IDs, raw histories or
+    # alias ownership.  They only describe which one of two independently
+    # tracked singleton objects the final publication view should expose while
+    # normal temporal pair evidence matures.
+    provisional_decisions = []
+    next_bundles = {}
+    provisional_hidden = {}
+    provisional_pid_pairs = {}
+    raw_to_object = {member.raw_track_id: obj for obj in result for member in obj.members}
+    candidate_degree = Counter(rid for key in provisional_matches for rid in key)
+    ambiguous_raw = {rid for rid, count in candidate_degree.items() if count > 1}
+    handled = set()
+    for key, prior_bundle in sorted(self.provisional_bundles.items()):
+      if key in provisional_matches and not ambiguous_raw.intersection(key):
+        continue
+      handled.add(key)
+      if key in provisional_handoffs:
+        reason = 'normal_group_handoff'
+        self.provisional_handoffs += 1
+      elif ambiguous_raw.intersection(key):
+        reason = 'ambiguous_candidate'
+        self.provisional_releases += 1
+      elif not all(rid in raw_index for rid in key):
+        reason = 'member_missing'
+        self.provisional_releases += 1
+      elif timestamp_ns-prior_bundle.timestamp_ns > c.pair_max_gap_s*1e9:
+        reason = 'scan_gap'
+        self.provisional_releases += 1
+      elif any(raw_tracks[raw_index[rid]].age_scans <= age for rid, age in zip(key, prior_bundle.last_ages)):
+        reason = 'age_rollback'
+        self.provisional_releases += 1
+      elif oem_slot is not None and any(raw_tracks[raw_index[rid]].slot == oem_slot for rid in key):
+        reason = 'oem_member_support'
+        self.provisional_releases += 1
+      else:
+        reason = 'criteria_diverged'
+        self.provisional_releases += 1
+      pids = tuple(sorted({raw_to_object[rid].physical_track_id for rid in key if rid in raw_to_object}))
+      provisional_decisions.append(BoschProvisionalBundleDecision(
+        timestamp_ns, 'HANDOFF' if reason == 'normal_group_handoff' else 'RELEASE', reason,
+        key, pids, prior_bundle.representative_raw_track_id,
+        raw_to_object[prior_bundle.representative_raw_track_id].physical_track_id
+          if prior_bundle.representative_raw_track_id in raw_to_object else None,
+        None, None, None, None, None))
+
+    for key, (i, j, metrics) in sorted(provisional_matches.items()):
+      if key in handled:
+        continue
+      if ambiguous_raw.intersection(key):
+        provisional_decisions.append(BoschProvisionalBundleDecision(
+          timestamp_ns, 'REJECT', 'ambiguous_candidate', key, (), None, None, *metrics))
+        continue
+      first, second = raw_to_object.get(key[0]), raw_to_object.get(key[1])
+      if first is None or second is None or first is second:
+        # A normal mature group owns the pair; publication already has one
+        # physical object and no provisional suppression is necessary.
+        pids = () if first is None and second is None else tuple(sorted({obj.physical_track_id for obj in (first, second) if obj}))
+        provisional_decisions.append(BoschProvisionalBundleDecision(
+          timestamp_ns, 'HANDOFF', 'normal_group_handoff', key, pids, None, None, *metrics))
+        self.provisional_handoffs += 1
+        continue
+      if len(first.members) != 1 or len(second.members) != 1:
+        provisional_decisions.append(BoschProvisionalBundleDecision(
+          timestamp_ns, 'REJECT', 'existing_group_continuity', key,
+          tuple(sorted((first.physical_track_id, second.physical_track_id))), None, None, *metrics))
+        if key in self.provisional_bundles:
+          self.provisional_releases += 1
+        continue
+      candidates = (raw_tracks[i], raw_tracks[j])
+      prior_bundle = self.provisional_bundles.get(key)
+      predicted_xy = None
+      if prior_bundle is not None:
+        dt = (timestamp_ns-prior_bundle.timestamp_ns)/1e9
+        angle = -(yaw_rate or 0.)*dt
+        dx = prior_bundle.d_rel + prior_bundle.v_rel*dt
+        ca, sa = math.cos(angle), math.sin(angle)
+        predicted_xy = (dx*ca-prior_bundle.y_rel*sa, dx*sa+prior_bundle.y_rel*ca)
+      rep = _bosch_group_representative(
+        candidates, raw_index, vision_supported, oem_slot,
+        prior=prior_bundle, predicted_xy=predicted_xy)
+      rep_obj = raw_to_object[rep.raw_track_id]
+      other_obj = second if rep_obj is first else first
+      next_bundles[key] = _BoschProvisionalBundleState(
+        key, timestamp_ns, (raw_tracks[i].age_scans, raw_tracks[j].age_scans),
+        rep.raw_track_id, rep.d_rel, rep.y_rel, rep.v_rel)
+      provisional_hidden[other_obj.physical_track_id] = rep_obj.physical_track_id
+      provisional_pid_pairs[key] = (rep_obj.physical_track_id, other_obj.physical_track_id)
+      action = 'CREATE' if prior_bundle is None else 'COHERENT'
+      if prior_bundle is None:
+        self.provisional_created += 1
+      else:
+        self.provisional_coherent += 1
+      provisional_decisions.append(BoschProvisionalBundleDecision(
+        timestamp_ns, action, '', key,
+        tuple(sorted((first.physical_track_id, second.physical_track_id))), rep.raw_track_id,
+        rep_obj.physical_track_id, *metrics))
+
+    self.provisional_bundles = next_bundles
+    self.provisional_hidden = provisional_hidden
+    self.provisional_pid_pairs = provisional_pid_pairs
+    self.last_provisional_decisions = tuple(provisional_decisions)
+
     # Retire absorbed physical IDs immediately, retaining only missing members
     # for genuine coasting. Prevent two IDs from owning the same raw member.
     live_owners = {m.raw_track_id: obj.physical_track_id for obj in result for m in obj.members}
@@ -2957,6 +3154,59 @@ class BoschObjectGroupManager:
     self.last_multi_count = multi
     self.last_decisions = tuple(decisions)
     return tuple(sorted(result, key=lambda obj: obj.physical_track_id))
+
+  def provisional_publication_view(self, objects, *, strict_associations=None, oem_pids=()):
+    """Expose one surface per active bundle, or fail open on identity support."""
+    if not self.provisional_hidden or not objects:
+      return objects
+    strict_associations = strict_associations or {}
+    present = {obj.physical_track_id: obj for obj in objects}
+    oem_pids = set(oem_pids)
+    hidden = dict(self.provisional_hidden)
+    decisions = list(self.last_provisional_decisions)
+    for raw_key, (representative_pid, hidden_pid) in tuple(self.provisional_pid_pairs.items()):
+      pair_pids = (representative_pid, hidden_pid)
+      assigned = [(pid, strict_associations[pid]) for pid in pair_pids if pid in strict_associations]
+      independent_camera = (len(assigned) == 1 or
+                            (len(assigned) == 2 and assigned[0][1] != assigned[1][1]))
+      oem_supported = any(pid in oem_pids or (pid in present and present[pid].oem_selected) for pid in pair_pids)
+      if not all(pid in present for pid in pair_pids):
+        reason = 'publication_member_missing'
+      elif independent_camera:
+        reason = 'strict_camera_identity'
+      elif oem_supported:
+        reason = 'oem_identity'
+      else:
+        continue
+      state = self.provisional_bundles.pop(raw_key, None)
+      self.provisional_pid_pairs.pop(raw_key, None)
+      hidden.pop(hidden_pid, None)
+      self.provisional_releases += 1
+      decisions.append(BoschProvisionalBundleDecision(
+        objects[0].timestamp_ns, 'RELEASE', reason, raw_key, tuple(sorted(pair_pids)),
+        state.representative_raw_track_id if state else None, representative_pid,
+        None, None, None, None, None))
+    self.provisional_hidden = hidden
+    self.last_provisional_decisions = tuple(decisions)
+    if not hidden:
+      return objects
+    return tuple(obj for obj in objects if obj.physical_track_id not in hidden)
+
+  def reset_provisional(self, timestamp_ns, reason):
+    if not self.provisional_bundles:
+      self.provisional_hidden = {}
+      self.provisional_pid_pairs = {}
+      return
+    self.last_provisional_decisions = tuple(
+      BoschProvisionalBundleDecision(
+        timestamp_ns, 'RELEASE', reason, key, tuple(sorted(self.provisional_pid_pairs.get(key, ()))),
+        state.representative_raw_track_id, self.provisional_pid_pairs.get(key, (None,))[0],
+        None, None, None, None, None)
+      for key, state in sorted(self.provisional_bundles.items()))
+    self.provisional_releases += len(self.provisional_bundles)
+    self.provisional_bundles = {}
+    self.provisional_hidden = {}
+    self.provisional_pid_pairs = {}
 
   def _decision(self, obj, old, prior, carry_mode, predicted, solver_scores, cluster_index, previous):
     """Build one shadow record. Called only while trace_decisions is set."""
@@ -3637,11 +3887,12 @@ class BoschRadarProvider:
   def __init__(self, bus: int, *, qualification=True, camera_bus=1,
                camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE, p91_mode=BOSCH_P91_MODE,
                oem_gate_mode=BOSCH_OEM_GATE_MODE, scc_bus=BOSCH_SCC_BUS,
-               curve_reacquire_mode=BOSCH_CAMERA_CURVE_REACQUIRE_MODE):
+               curve_reacquire_mode=BOSCH_CAMERA_CURVE_REACQUIRE_MODE,
+               provisional_bundle=True):
     self.bus = bus
     self.camera_bus = camera_bus
     self.scc_bus = scc_bus
-    self.tracker = BoschPhysicalTracker()
+    self.tracker = BoschPhysicalTracker(group_config=BoschGroupingConfig(provisional_enabled=provisional_bundle))
     self.camera_extended = BoschCameraExtendedGrouping(camera_extended_mode, curve_reacquire_mode)
     self.publication_aliases = BoschPublicationAliasAllocator()
     self.qualifier = _BoschPublicationPassThrough() if qualification else None
@@ -3825,6 +4076,21 @@ class BoschRadarProvider:
     self.companion_defer_scans += 1
     return tuple(obj for obj in objects if obj.physical_track_id not in deferred)
 
+  def _provisional_birth_view(self, objects):
+    manager = self.tracker.group_manager
+    if not objects or not manager.provisional_hidden:
+      return objects
+    scan_ns = objects[0].timestamp_ns
+    ext = self.camera_extended
+    strict = {}
+    if ext.last_ns == scan_ns:
+      strict = {pid: verdict[1] for pid, verdict in ext.last_associations.items()
+                if verdict[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and verdict[1] >= 0}
+    oem_pids = set(self._debug_processed_pids)
+    oem_pids.update(obj.physical_track_id for obj in objects if obj.oem_selected)
+    return manager.provisional_publication_view(
+      objects, strict_associations=strict, oem_pids=oem_pids)
+
   def publication_view(self, objects, timestamp_ns=None):
     # Candidate P91 ACTIVE is the Bosch research-branch production path. The
     # independent camera-extended ACTIVE_TEST path below remains experimental.
@@ -3833,6 +4099,7 @@ class BoschRadarProvider:
     P91 ACTIVE is enabled for this Bosch research branch. Camera-extended
     ACTIVE_TEST remains supervised-test-only and independently gated.
     """
+    objects = self._provisional_birth_view(objects)
     p91_suppressed = (self.p91.would_suppress if self.p91.mode == BOSCH_P91_ACTIVE and
                       objects and all(obj.timestamp_ns == self.p91.last_ns for obj in objects) else frozenset())
     if p91_suppressed:
@@ -3952,6 +4219,11 @@ class BoschRadarProvider:
       f' p91_states={len(self.p91._states)}/{self.p91.state_peak}'
       f' p91_would_suppress={len(self.p91.would_suppress)} p91_publication_suppressed={self.p91.publication_suppressed}'
       f' p91_ms_avg={self._perf_p91_sum * scale:.3f} p91_ms_max={self._perf_p91_max * 1e-6:.3f}'
+      f' provisional_active={len(physical.provisional_bundles)}'
+      f' provisional_created={physical.provisional_created}'
+      f' provisional_coherent={physical.provisional_coherent}'
+      f' provisional_handoffs={physical.provisional_handoffs}'
+      f' provisional_releases={physical.provisional_releases}'
     )
     self._reset_perf()
     return message
@@ -3989,6 +4261,8 @@ class BoschRadarProvider:
       'curve_reacquire': self.camera_extended.last_curve_reacquire,
       'curve_reacquire_would': self.camera_extended.last_curve_reacquire_would,
       'curve_reacquire_state_count': len(self.camera_extended.curve_reacquire_histories),
+      'provisional_hidden': dict(self.tracker.group_manager.provisional_hidden),
+      'provisional_decisions': [vars(decision) for decision in self.tracker.group_manager.last_provisional_decisions],
       'objects': [{'physicalTrackId': obj.physical_track_id,
                    'rawTrackIds': [member.raw_track_id for member in obj.members],
                    'slots': list(obj.member_slots),
@@ -4132,6 +4406,7 @@ class BoschRadarProvider:
       self.can_error = True
       self._debug_objects = ()
       self._debug_timeout = True
+      self.tracker.group_manager.reset_provisional(now_ns, 'provider_timeout')
       self.p91.update((), now_ns, v_ego, yaw_rate=yaw_rate_left)
       self.oem_gate.update((), now_ns, v_ego, state=BOSCH_OEM_STATE_NONE)
       self._debug_gate_suppress = frozenset()
