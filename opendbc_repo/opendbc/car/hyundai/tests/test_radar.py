@@ -1279,6 +1279,173 @@ class TestBoschProvisionalBirthBundle:
     assert manager.last_provisional_decisions == ()
 
 
+class TestBoschFamilyCompanionB1:
+  SCAN_NS = 100_000_000
+  ANCHOR_PID = 1_000_145
+  NEWBORN_PID = 1_000_369
+  ANCHOR_RAW = 129
+  NEWBORN_RAW = 338
+
+  @staticmethod
+  def obj(pid, raw_id, slot, ns, age, d_rel, y_rel, v_rel, *, vision=False, oem=False,
+          extra_members=()):
+    tracks = [BoschRawTrack(raw_id, BoschRawDetection(ns, slot, d_rel, y_rel, v_rel, raw_word=raw_id), age, False)]
+    for extra_raw, extra_slot in extra_members:
+      tracks.append(BoschRawTrack(extra_raw, BoschRawDetection(ns, extra_slot, d_rel+.25, y_rel, v_rel,
+                                                               raw_word=extra_raw), age, False))
+    return BoschPhysicalObject(pid, ns, tuple(tracks), raw_id, d_rel, y_rel, v_rel, oem, vision,
+                               age, 'single_return' if len(tracks) == 1 else 'temporal_complete_link')
+
+  @classmethod
+  def scan(cls, index, *, anchor=True, newborn=True, newborn_v=-5., newborn_y=-1.40625,
+           newborn_d=None, anchor_members=(), newborn_members=()):
+    ns = (index + 1) * cls.SCAN_NS
+    result = []
+    if anchor:
+      result.append(cls.obj(cls.ANCHOR_PID, cls.ANCHOR_RAW, 4, ns, 30 + index,
+                            59.75-.5*index, -3.34375, -5., extra_members=anchor_members))
+    if newborn:
+      result.append(cls.obj(cls.NEWBORN_PID, cls.NEWBORN_RAW, 18, ns, 1 + index,
+                            (68.5-.5*index) if newborn_d is None else newborn_d,
+                            newborn_y, newborn_v, extra_members=newborn_members))
+    return ns, tuple(result)
+
+  @staticmethod
+  def filter(mode=None):
+    mode = radar_interface_module.BOSCH_FAMILY_COMPANION_ACTIVE if mode is None else mode
+    return radar_interface_module._BoschFamilyCompanionFilter(mode)
+
+  @classmethod
+  def activate(cls, gate=None):
+    gate = gate or cls.filter()
+    ns, objects = cls.scan(0)
+    assert gate.update(objects, ns, 29.5) == frozenset()
+    ns, objects = cls.scan(1)
+    assert gate.update(objects, ns, 29.5) == frozenset({cls.NEWBORN_PID})
+    return gate, ns, objects
+
+  def test_bosch_family_companion_first_scan_not_held(self):
+    gate = self.filter()
+    ns, objects = self.scan(0)
+    assert gate.update(objects, ns, 29.5) == frozenset()
+    assert gate.publication_view(objects) == objects
+    assert gate._states[self.NEWBORN_PID].active is False
+
+  def test_bosch_family_companion_two_scan_hold(self):
+    gate, _, objects = self.activate()
+    assert [obj.physical_track_id for obj in gate.publication_view(objects)] == [self.ANCHOR_PID]
+    decision = gate.last_decisions[-1]
+    assert decision.action == 'HOLD'
+    assert decision.delta_d_scan1_m == pytest.approx(8.75)
+    assert decision.delta_d_scan2_m == pytest.approx(8.75)
+    assert decision.public_suppressed
+
+  def test_bosch_family_companion_strict_camera_release(self):
+    gate, _, _ = self.activate()
+    ns, objects = self.scan(2)
+    assert gate.update(objects, ns, 29.5, strict_associations={self.NEWBORN_PID: 7}) == frozenset()
+    assert gate.last_decisions[-1].release_reason == 'STRICT_CAMERA'
+    assert gate.publication_view(objects) == objects
+
+  def test_bosch_family_companion_shared_strict_camera_is_not_independent(self):
+    gate = self.filter()
+    ns, objects = self.scan(0)
+    strict = {self.NEWBORN_PID: 7, self.ANCHOR_PID: 7}
+    gate.update(objects, ns, 29.5, strict_associations=strict)
+    ns, objects = self.scan(1)
+    assert gate.update(objects, ns, 29.5, strict_associations=strict) == frozenset({self.NEWBORN_PID})
+
+  def test_bosch_family_companion_oem_release(self):
+    gate, _, _ = self.activate()
+    ns, objects = self.scan(2)
+    assert gate.update(objects, ns, 29.5, oem_pids=(self.NEWBORN_PID,)) == frozenset()
+    assert gate.last_decisions[-1].release_reason == 'OEM_IDENTITY'
+
+  def test_bosch_family_companion_speed_divergence_release(self):
+    gate, _, _ = self.activate()
+    ns, objects = self.scan(2, newborn_v=-4.)
+    assert gate.update(objects, ns, 29.5) == frozenset()
+    assert gate.last_decisions[-1].release_reason == 'SPEED_DIVERGENCE'
+
+  def test_bosch_family_companion_geometry_divergence_release(self):
+    gate, _, _ = self.activate()
+    ns, objects = self.scan(2, newborn_y=.25)
+    assert gate.update(objects, ns, 29.5) == frozenset()
+    assert gate.last_decisions[-1].release_reason == 'GEOMETRY_DIVERGENCE'
+
+  def test_bosch_family_companion_anchor_loss_release(self):
+    gate, _, _ = self.activate()
+    ns, objects = self.scan(2, anchor=False)
+    assert gate.update(objects, ns, 29.5) == frozenset()
+    assert gate.last_decisions[-1].release_reason == 'ANCHOR_LOST'
+
+  def test_bosch_family_companion_scan_gap_reset(self):
+    gate, _, _ = self.activate()
+    ns, objects = self.scan(3)
+    assert gate.update(objects, ns, 29.5) == frozenset()
+    assert gate.last_decisions[-1].release_reason == 'SCAN_GAP'
+    assert gate._states == {}
+
+  def test_bosch_family_companion_internal_history_preserved(self):
+    gate, _, objects = self.activate()
+    before = tuple((obj.physical_track_id, obj.age_scans,
+                    tuple(member.raw_track_id for member in obj.members)) for obj in objects)
+    gate.publication_view(objects)
+    after = tuple((obj.physical_track_id, obj.age_scans,
+                   tuple(member.raw_track_id for member in obj.members)) for obj in objects)
+    assert before == after
+    assert before[-1] == (self.NEWBORN_PID, 2, (self.NEWBORN_RAW,))
+
+  def test_bosch_family_companion_anchor_public_preserved(self):
+    gate, _, objects = self.activate()
+    public = gate.publication_view(objects)
+    assert len(public) == 1 and public[0] is objects[0]
+    assert public[0].physical_track_id == self.ANCHOR_PID
+
+  def test_bosch_family_companion_normal_group_handoff(self):
+    gate, _, _ = self.activate()
+    ns, objects = self.scan(2, newborn=False, anchor_members=((self.NEWBORN_RAW, 18),))
+    assert gate.update(objects, ns, 29.5) == frozenset()
+    assert gate.last_decisions[-1].action == 'HANDOFF'
+    assert gate.last_decisions[-1].release_reason == 'NORMAL_HANDOFF'
+
+  def test_bosch_family_companion_release_keeps_alias_binding(self):
+    gate, ns, objects = self.activate()
+    allocator = BoschPublicationAliasAllocator()
+    aliases = allocator.update(ns, (obj.physical_track_id for obj in objects), {
+      obj.physical_track_id: radar_interface_module._BoschPhysicalState(obj, {
+        member.raw_track_id: ns for member in obj.members}) for obj in objects})
+    newborn_alias = aliases[self.NEWBORN_PID]
+    ns, objects = self.scan(2)
+    gate.update(objects, ns, 29.5, strict_associations={self.NEWBORN_PID: 9})
+    aliases = allocator.update(ns, (obj.physical_track_id for obj in objects), {
+      obj.physical_track_id: radar_interface_module._BoschPhysicalState(obj, {
+        member.raw_track_id: ns for member in obj.members}) for obj in objects})
+    assert aliases[self.NEWBORN_PID] == newborn_alias
+
+  def test_bosch_family_companion_inward_motion_release(self):
+    gate, _, _ = self.activate()
+    # Three consecutive inward steps at more than the established 0.90 m/s.
+    for index, y in enumerate((-1.30, -1.10, -.90), start=2):
+      ns, objects = self.scan(index, newborn_y=y)
+      gate.update(objects, ns, 29.5)
+    assert gate.last_decisions[-1].release_reason == 'INWARD_MOTION'
+
+  def test_bosch_s32_bundle_unchanged_by_family_filter(self):
+    manager = BoschObjectGroupManager()
+    family = self.filter()
+    helper = TestBoschProvisionalBirthBundle
+    actions = []
+    for index in range(3):
+      ns, tracks = helper.pair(index, d=(79.75-index, 78.25-index))
+      objects = manager.update(ns, tracks, v_ego=30.)
+      actions.append(manager.last_provisional_decisions[-1].action)
+      s32_pids = {pid for pair in manager.provisional_pid_pairs.values() for pid in pair}
+      family.update(objects, ns, 30., excluded_pids=s32_pids)
+      assert family.would_suppress == frozenset()
+    assert actions == ['CREATE', 'COHERENT', 'HANDOFF']
+
+
 class TestBoschRawAssociationTrace:
   """Raw returns are matched globally, and a coasted track outbids a new one.
 

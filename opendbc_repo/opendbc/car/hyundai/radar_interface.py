@@ -282,6 +282,30 @@ BOSCH_P91_ACTIVE_TEST = BOSCH_P91_ACTIVE  # compatibility name for existing synt
 BOSCH_P91_MODE = BOSCH_P91_ACTIVE
 BOSCH_P91_SUPPORT_HOLD_NS = 500_000_000
 
+# S37 B1: two completed Bosch scans may establish that a singleton newborn is
+# another surface of a mature physical object.  This state is deliberately
+# separate from the S32 close-birth bundle above: it never changes raw/physical
+# tracking and only withholds the newborn from the final public view.
+BOSCH_FAMILY_COMPANION_OFF = 0
+BOSCH_FAMILY_COMPANION_SHADOW = 1
+BOSCH_FAMILY_COMPANION_ACTIVE = 2
+BOSCH_FAMILY_COMPANION_MODE = BOSCH_FAMILY_COMPANION_ACTIVE
+BOSCH_FAMILY_MIN_ANCHOR_AGE_SCANS = 25
+BOSCH_FAMILY_MIN_D_M = 3.0
+BOSCH_FAMILY_MAX_D_M = 12.0
+BOSCH_FAMILY_MAX_Y_M = 2.5
+BOSCH_FAMILY_MAX_DV_MPS = .75
+BOSCH_FAMILY_MAX_WORLD_SPEED_MPS = .35
+BOSCH_FAMILY_MAX_D_STEP_M = 1.5
+BOSCH_FAMILY_MAX_Y_STEP_M = .75
+BOSCH_FAMILY_MIN_WORLD_SPEED_MPS = 4.0
+BOSCH_FAMILY_MAX_GAP_NS = 160_000_000
+# Reuse the established Bosch provider cut-in evidence (three monotone scans,
+# 0.90 m/s inward); keep literal values here because the OEM constants below
+# are declared later in this module.
+BOSCH_FAMILY_INWARD_SCANS = 3
+BOSCH_FAMILY_INWARD_MPS = .90
+
 # Behavioural naming for the two 0x601 records. No proprietary signal name is
 # claimed. word1 (bytes 4..7) is bit-identical to exactly one raw record in
 # 63,819 of 63,822 active scans across 146 segments, and its activity equals
@@ -3280,6 +3304,315 @@ class _BoschPublicationPassThrough:
 
 
 @dataclass
+class _BoschFamilyCompanionState:
+  newborn_pid: int
+  anchor_pid: int
+  newborn_raw_id: int
+  anchor_raw_ids: tuple[int, ...]
+  anchor_representative_raw_id: int
+  first_ns: int
+  last_ns: int
+  newborn_age: int
+  anchor_age: int
+  delta_d_m: float
+  delta_y_m: float
+  delta_bearing_deg: float
+  delta_vrel_mps: float
+  delta_world_speed_mps: float
+  d_path_m: float
+  inward_scans: int
+  inward_from_abs_path_m: float
+  inward_since_ns: int
+  active: bool
+
+
+@dataclass(frozen=True)
+class BoschFamilyCompanionDecision:
+  timestamp_ns: int
+  action: str
+  release_reason: str
+  newborn_pid: int
+  newborn_raw_id: int
+  anchor_pid: int
+  anchor_raw_ids: tuple[int, ...]
+  delta_d_scan1_m: float | None
+  delta_d_scan2_m: float | None
+  delta_y_scan1_m: float | None
+  delta_y_scan2_m: float | None
+  delta_vrel_mps: float | None
+  delta_world_speed_mps: float | None
+  delta_bearing_deg: float | None
+  newborn_age: int | None
+  anchor_age: int | None
+  anchor_member_count: int | None
+  camera_coarse: bool
+  camera_strict: bool
+  oem_identity: bool
+  d_path_m: float | None
+  public_suppressed: bool
+
+
+class _BoschFamilyCompanionFilter:
+  """S37 B1 two-scan mature-family proof and publication-only hold.
+
+  The fixed bounds are copied from the offline B1 study.  Scan one records a
+  singleton birth and a deterministic mature anchor.  Scan two activates the
+  hold only when both physical identities, their raw membership, and their
+  relative geometry remain continuous.  There is no timeout: the relation is
+  kept only while the same evidence continues and is released immediately on
+  independent identity, motion divergence, anchor loss, or reset.
+  """
+
+  def __init__(self, mode=BOSCH_FAMILY_COMPANION_MODE):
+    if mode not in (BOSCH_FAMILY_COMPANION_OFF, BOSCH_FAMILY_COMPANION_SHADOW,
+                    BOSCH_FAMILY_COMPANION_ACTIVE):
+      raise ValueError('invalid Bosch family companion mode')
+    self.mode = mode
+    self._states: dict[int, _BoschFamilyCompanionState] = {}
+    self.last_ns = None
+    self.would_suppress = frozenset()
+    self.last_decisions: tuple[BoschFamilyCompanionDecision, ...] = ()
+    self.pair_evaluations_last = self.pair_evaluations_total = self.pair_evaluations_peak = 0
+    self.holds = self.releases = self.handoffs = self.publication_suppressed = 0
+    self.state_peak = 0
+
+  @staticmethod
+  def _bearing(obj):
+    return math.degrees(math.atan2(obj.y_rel, max(obj.d_rel, .5)))
+
+  @staticmethod
+  def _path_offset(obj, path):
+    if not path:
+      return obj.y_rel
+    before = None
+    for x, y in path:
+      if not math.isfinite(x) or not math.isfinite(y):
+        continue
+      if x >= obj.d_rel:
+        if before is None or x == before[0]:
+          path_y = y
+        else:
+          ratio = (obj.d_rel-before[0])/(x-before[0])
+          path_y = before[1] + ratio*(y-before[1])
+        return obj.y_rel + path_y  # model y is right-positive; radar y is left-positive
+      before = (x, y)
+    return obj.y_rel + before[1] if before is not None else obj.y_rel
+
+  @staticmethod
+  def _strict_independent(newborn_pid, anchor_pid, strict):
+    if newborn_pid not in strict:
+      return False
+    return anchor_pid not in strict or strict[newborn_pid] != strict[anchor_pid]
+
+  @staticmethod
+  def _world_speed(obj, v_ego, yaw):
+    return obj.v_rel + v_ego - yaw*obj.y_rel
+
+  def _metrics(self, newborn, anchor, v_ego, yaw):
+    return (abs(newborn.d_rel-anchor.d_rel), abs(newborn.y_rel-anchor.y_rel),
+            abs(self._bearing(newborn)-self._bearing(anchor)),
+            abs(newborn.v_rel-anchor.v_rel),
+            abs(self._world_speed(newborn, v_ego, yaw)-self._world_speed(anchor, v_ego, yaw)))
+
+  @staticmethod
+  def _geometry_ok(metrics, newborn_world_speed):
+    dd, dy, _db, dv, dw = metrics
+    return (BOSCH_FAMILY_MIN_D_M < dd <= BOSCH_FAMILY_MAX_D_M and
+            dy <= BOSCH_FAMILY_MAX_Y_M and dv <= BOSCH_FAMILY_MAX_DV_MPS and
+            dw <= BOSCH_FAMILY_MAX_WORLD_SPEED_MPS and
+            abs(newborn_world_speed) >= BOSCH_FAMILY_MIN_WORLD_SPEED_MPS)
+
+  def _decision(self, timestamp_ns, action, reason, state, newborn=None, anchor=None,
+                metrics=None, strict=(), oem=(), d_path=None, suppressed=False):
+    strict_map = strict if isinstance(strict, dict) else {}
+    strict_identity = self._strict_independent(state.newborn_pid, state.anchor_pid, strict_map)
+    oem_identity = state.newborn_pid in oem
+    return BoschFamilyCompanionDecision(
+      timestamp_ns, action, reason, state.newborn_pid, state.newborn_raw_id,
+      state.anchor_pid, state.anchor_raw_ids, state.delta_d_m,
+      metrics[0] if metrics is not None else None, state.delta_y_m,
+      metrics[1] if metrics is not None else None,
+      metrics[3] if metrics is not None else None,
+      metrics[4] if metrics is not None else None,
+      metrics[2] if metrics is not None else None,
+      newborn.age_scans if newborn is not None else None,
+      anchor.age_scans if anchor is not None else None,
+      len(anchor.members) if anchor is not None else None,
+      bool(newborn and newborn.vision_supported), strict_identity, oem_identity,
+      d_path, suppressed)
+
+  def reset(self, timestamp_ns, reason='STATE_RESET'):
+    decisions = []
+    for state in self._states.values():
+      if state.active:
+        decisions.append(self._decision(timestamp_ns, 'RELEASE', reason, state))
+        self.releases += 1
+    self._states = {}
+    self.would_suppress = frozenset()
+    self.last_decisions = tuple(decisions)
+    self.last_ns = timestamp_ns
+
+  def update(self, objects, timestamp_ns, v_ego, *, yaw_rate=None,
+             strict_associations=None, oem_pids=(), excluded_pids=(), path=()):
+    self.would_suppress = frozenset()
+    self.last_decisions = ()
+    self.pair_evaluations_last = 0
+    if self.mode == BOSCH_FAMILY_COMPANION_OFF:
+      self._states = {}
+      self.last_ns = timestamp_ns
+      return self.would_suppress
+    if (self.last_ns is not None and
+        (timestamp_ns <= self.last_ns or timestamp_ns-self.last_ns > BOSCH_FAMILY_MAX_GAP_NS)):
+      self.reset(timestamp_ns, 'STATE_RESET' if timestamp_ns <= self.last_ns else 'SCAN_GAP')
+      # A gap/reset scan cannot be the first half of a proof.
+      return self.would_suppress
+    self.last_ns = timestamp_ns
+    strict = strict_associations or {}
+    oem = set(oem_pids)
+    excluded = set(excluded_pids)
+    oem.update(obj.physical_track_id for obj in objects if obj.oem_selected)
+    yaw = yaw_rate if yaw_rate is not None and math.isfinite(yaw_rate) else 0.
+    if not math.isfinite(v_ego):
+      self.reset(timestamp_ns, 'SPEED_DIVERGENCE')
+      return self.would_suppress
+
+    present = {obj.physical_track_id: obj for obj in objects}
+    next_states = {}
+    suppress = set()
+    decisions = list(self.last_decisions)
+    handled = set()
+    for pid, prior in self._states.items():
+      handled.add(pid)
+      newborn, anchor = present.get(pid), present.get(prior.anchor_pid)
+      if pid in excluded:
+        reason = 'CONTINUITY_LOSS'
+      elif newborn is None:
+        anchor_members = {member.raw_track_id for member in anchor.members} if anchor is not None else set()
+        reason = ('NORMAL_HANDOFF' if prior.newborn_raw_id in anchor_members else
+                  ('ANCHOR_LOST' if anchor is None else 'CONTINUITY_LOSS'))
+      elif anchor is None:
+        reason = 'ANCHOR_LOST'
+      elif (newborn.age_scans <= prior.newborn_age or anchor.age_scans <= prior.anchor_age):
+        reason = 'STATE_RESET'
+      elif not prior.active and (prior.newborn_age != 1 or newborn.age_scans != 2):
+        reason = 'STATE_RESET'
+      elif (len(newborn.members) != 1 or newborn.members[0].raw_track_id != prior.newborn_raw_id or
+            tuple(member.raw_track_id for member in anchor.members) != prior.anchor_raw_ids or
+            anchor.representative_raw_track_id != prior.anchor_representative_raw_id):
+        reason = 'CONTINUITY_LOSS'
+      elif self._strict_independent(pid, prior.anchor_pid, strict):
+        reason = 'STRICT_CAMERA'
+      elif pid in oem:
+        reason = 'OEM_IDENTITY'
+      else:
+        metrics = self._metrics(newborn, anchor, v_ego, yaw)
+        newborn_world = self._world_speed(newborn, v_ego, yaw)
+        if (metrics[3] > BOSCH_FAMILY_MAX_DV_MPS or
+            metrics[4] > BOSCH_FAMILY_MAX_WORLD_SPEED_MPS or
+            abs(newborn_world) < BOSCH_FAMILY_MIN_WORLD_SPEED_MPS):
+          reason = 'SPEED_DIVERGENCE'
+        elif (not self._geometry_ok(metrics, newborn_world) or
+              abs(metrics[0]-prior.delta_d_m) > BOSCH_FAMILY_MAX_D_STEP_M or
+              abs(metrics[1]-prior.delta_y_m) > BOSCH_FAMILY_MAX_Y_STEP_M):
+          reason = 'GEOMETRY_DIVERGENCE'
+        else:
+          d_path = self._path_offset(newborn, path)
+          abs_path = abs(d_path)
+          if abs_path < abs(prior.d_path_m):
+            inward_scans = prior.inward_scans + 1
+            inward_from = prior.inward_from_abs_path_m if prior.inward_scans else abs(prior.d_path_m)
+            inward_since = prior.inward_since_ns if prior.inward_scans else prior.last_ns
+          else:
+            inward_scans, inward_from, inward_since = 0, abs_path, timestamp_ns
+          inward_rate = ((inward_from-abs_path) / max(1e-3, (timestamp_ns-inward_since)*1e-9)
+                         if inward_scans >= BOSCH_FAMILY_INWARD_SCANS else 0.)
+          if inward_rate >= BOSCH_FAMILY_INWARD_MPS:
+            reason = 'INWARD_MOTION'
+          else:
+            active = prior.active or newborn.age_scans == 2
+            state = _BoschFamilyCompanionState(
+              pid, prior.anchor_pid, prior.newborn_raw_id, prior.anchor_raw_ids,
+              prior.anchor_representative_raw_id, prior.first_ns, timestamp_ns,
+              newborn.age_scans, anchor.age_scans, metrics[0], metrics[1], metrics[2],
+              metrics[3], metrics[4], d_path, inward_scans, inward_from, inward_since, active)
+            next_states[pid] = state
+            if active:
+              suppress.add(pid)
+            if active and not prior.active:
+              self.holds += 1
+              decisions.append(self._decision(timestamp_ns, 'HOLD', '', prior, newborn, anchor,
+                                                metrics, strict, oem, d_path, True))
+            continue
+      if prior.active:
+        action = 'HANDOFF' if reason == 'NORMAL_HANDOFF' else 'RELEASE'
+        decisions.append(self._decision(timestamp_ns, action, reason, prior, newborn, anchor,
+                                          strict=strict, oem=oem,
+                                          d_path=self._path_offset(newborn, path) if newborn else None))
+        if action == 'HANDOFF':
+          self.handoffs += 1
+        else:
+          self.releases += 1
+
+    # New scan-one singleton births.  Distance ordering bounds the search to
+    # the fixed 12 m B1 window instead of adding an all-object pair pass.
+    anchors = sorted((obj for obj in objects
+                      if obj.age_scans >= BOSCH_FAMILY_MIN_ANCHOR_AGE_SCANS and
+                      obj.physical_track_id not in excluded),
+                     key=lambda obj: obj.d_rel)
+    for newborn in objects:
+      pid = newborn.physical_track_id
+      if (pid in handled or pid in excluded or newborn.age_scans != 1 or
+          len(newborn.members) != 1 or pid in oem):
+        continue
+      plausible = []
+      for anchor in anchors:
+        if anchor.physical_track_id == pid:
+          continue
+        if anchor.d_rel < newborn.d_rel-BOSCH_FAMILY_MAX_D_M:
+          continue
+        if anchor.d_rel > newborn.d_rel+BOSCH_FAMILY_MAX_D_M:
+          break
+        self.pair_evaluations_last += 1
+        metrics = self._metrics(newborn, anchor, v_ego, yaw)
+        if (not self._strict_independent(pid, anchor.physical_track_id, strict) and
+            self._geometry_ok(metrics, self._world_speed(newborn, v_ego, yaw))):
+          plausible.append((anchor, metrics))
+      if not plausible:
+        continue
+      # B1 is existential: a stable mature family anchor completes the proof.
+      # Prefer the most mature qualifying anchor, then the closest fixed-band
+      # geometry, so scan-one candidate ordering cannot change the result.
+      anchor, metrics = min(plausible, key=lambda item: (
+        -item[0].age_scans, item[1][0], item[1][1], item[0].physical_track_id))
+      d_path = self._path_offset(newborn, path)
+      next_states[pid] = _BoschFamilyCompanionState(
+        pid, anchor.physical_track_id, newborn.members[0].raw_track_id,
+        tuple(member.raw_track_id for member in anchor.members), anchor.representative_raw_track_id,
+        timestamp_ns, timestamp_ns, newborn.age_scans, anchor.age_scans,
+        metrics[0], metrics[1], metrics[2], metrics[3], metrics[4], d_path,
+        0, abs(d_path), timestamp_ns, False)
+
+    self._states = next_states
+    self.would_suppress = frozenset(suppress)
+    self.last_decisions = tuple(decisions)
+    self.pair_evaluations_total += self.pair_evaluations_last
+    self.pair_evaluations_peak = max(self.pair_evaluations_peak, self.pair_evaluations_last)
+    self.state_peak = max(self.state_peak, len(next_states))
+    return self.would_suppress
+
+  def publication_view(self, objects):
+    if self.mode != BOSCH_FAMILY_COMPANION_ACTIVE or not self.would_suppress or not objects:
+      return objects
+    present = {obj.physical_track_id for obj in objects}
+    suppressed = {pid for pid in self.would_suppress
+                  if pid in present and self._states[pid].anchor_pid in present}
+    if not suppressed:
+      return objects
+    self.publication_suppressed += len(suppressed)
+    return tuple(obj for obj in objects if obj.physical_track_id not in suppressed)
+
+
+@dataclass
 class _BoschP91PairState:
   parent_pid: int
   since_ns: int
@@ -3888,7 +4221,7 @@ class BoschRadarProvider:
                camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE, p91_mode=BOSCH_P91_MODE,
                oem_gate_mode=BOSCH_OEM_GATE_MODE, scc_bus=BOSCH_SCC_BUS,
                curve_reacquire_mode=BOSCH_CAMERA_CURVE_REACQUIRE_MODE,
-               provisional_bundle=True):
+               provisional_bundle=True, family_companion_mode=BOSCH_FAMILY_COMPANION_MODE):
     self.bus = bus
     self.camera_bus = camera_bus
     self.scc_bus = scc_bus
@@ -3896,6 +4229,7 @@ class BoschRadarProvider:
     self.camera_extended = BoschCameraExtendedGrouping(camera_extended_mode, curve_reacquire_mode)
     self.publication_aliases = BoschPublicationAliasAllocator()
     self.qualifier = _BoschPublicationPassThrough() if qualification else None
+    self.family_companion = _BoschFamilyCompanionFilter(family_companion_mode)
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
     self.oem_gate = _BoschOemValidationGate(oem_gate_mode)
     self.scc_obj_valid = None
@@ -4113,13 +4447,13 @@ class BoschRadarProvider:
       objects = tuple(obj for obj in objects if obj.physical_track_id not in withheld)
     ext = self.camera_extended
     if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
-      return self._final_view(objects)
+      return self.family_companion.publication_view(self._final_view(objects))
     if timestamp_ns is not None:
       self.test_publications += 1
     if not ext.mature_groups or not objects:
       self.test_last_suppressed = ()
       self.test_last_active_groups = 0
-      return self._final_view(objects)
+      return self.family_companion.publication_view(self._final_view(objects))
     # 다른 scan의 tuple 또는 qualification에서 대표가 빠진 그룹은 baseline으로 연다.
     by_pid = {obj.physical_track_id: obj for obj in objects}
     suppressed = set()
@@ -4150,8 +4484,8 @@ class BoschRadarProvider:
                     f'suppressed_pids={",".join(str(p) for p in members if p != rep.representative_pid)} '
                     f'suppressed_count={len(members) - 1} camera_id={camera_id} episode={state.cam_key} '
                     f'camera_ns={ext.last_camera_ns} members_pid_alias_d_y_v={detail}')
-    return self._final_view(
-      tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects)
+    return self.family_companion.publication_view(self._final_view(
+      tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects))
 
   def _reset_perf(self):
     self._perf_scans = 0
@@ -4224,6 +4558,14 @@ class BoschRadarProvider:
       f' provisional_coherent={physical.provisional_coherent}'
       f' provisional_handoffs={physical.provisional_handoffs}'
       f' provisional_releases={physical.provisional_releases}'
+      f' family_mode={self.family_companion.mode}'
+      f' family_active={len(self.family_companion.would_suppress)}'
+      f' family_states={len(self.family_companion._states)}/{self.family_companion.state_peak}'
+      f' family_pairs={self.family_companion.pair_evaluations_last}/{self.family_companion.pair_evaluations_peak}'
+      f' family_holds={self.family_companion.holds}'
+      f' family_releases={self.family_companion.releases}'
+      f' family_handoffs={self.family_companion.handoffs}'
+      f' family_publication_suppressed={self.family_companion.publication_suppressed}'
     )
     self._reset_perf()
     return message
@@ -4263,6 +4605,8 @@ class BoschRadarProvider:
       'curve_reacquire_state_count': len(self.camera_extended.curve_reacquire_histories),
       'provisional_hidden': dict(self.tracker.group_manager.provisional_hidden),
       'provisional_decisions': [vars(decision) for decision in self.tracker.group_manager.last_provisional_decisions],
+      'family_companion_suppressed': sorted(self.family_companion.would_suppress),
+      'family_companion_decisions': [vars(decision) for decision in self.family_companion.last_decisions],
       'objects': [{'physicalTrackId': obj.physical_track_id,
                    'rawTrackIds': [member.raw_track_id for member in obj.members],
                    'slots': list(obj.member_slots),
@@ -4407,6 +4751,7 @@ class BoschRadarProvider:
       self._debug_objects = ()
       self._debug_timeout = True
       self.tracker.group_manager.reset_provisional(now_ns, 'provider_timeout')
+      self.family_companion.reset(now_ns, 'STATE_RESET')
       self.p91.update((), now_ns, v_ego, yaw_rate=yaw_rate_left)
       self.oem_gate.update((), now_ns, v_ego, state=BOSCH_OEM_STATE_NONE)
       self._debug_gate_suppress = frozenset()
@@ -4489,6 +4834,28 @@ class BoschRadarProvider:
     self._debug_oem_state = oem_state
     self.last_oem_state = oem_state
     self.last_oem_slot = oem_slot
+    strict = {pid: verdict[1] for pid, verdict in self.camera_extended.last_associations.items()
+              if verdict[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and verdict[1] >= 0}
+    family_oem_pids = set(processed_pids)
+    family_oem_pids.update(obj.physical_track_id for obj in qualified if obj.oem_selected)
+    s32_pids = {pid for pair in self.tracker.group_manager.provisional_pid_pairs.values() for pid in pair}
+    self.family_companion.update(
+      qualified, availability_ns, v_ego, yaw_rate=yaw_rate_left,
+      strict_associations=strict, oem_pids=family_oem_pids, excluded_pids=s32_pids, path=path)
+    for decision in self.family_companion.last_decisions:
+      event = f'B1_COMPANION_{decision.action}'
+      carlog.info(
+        f'{event} ns={decision.timestamp_ns} reason={decision.release_reason or "PROOF_COMPLETE"} '
+        f'newborn_pid={decision.newborn_pid} newborn_raw={decision.newborn_raw_id} '
+        f'anchor_pid={decision.anchor_pid} anchor_raw={",".join(map(str, decision.anchor_raw_ids))} '
+        f'delta_d_scan1={decision.delta_d_scan1_m} delta_d_scan2={decision.delta_d_scan2_m} '
+        f'delta_y_scan1={decision.delta_y_scan1_m} delta_y_scan2={decision.delta_y_scan2_m} '
+        f'delta_vrel={decision.delta_vrel_mps} delta_world_speed={decision.delta_world_speed_mps} '
+        f'delta_bearing={decision.delta_bearing_deg} newborn_age={decision.newborn_age} '
+        f'anchor_age={decision.anchor_age} anchor_members={decision.anchor_member_count} '
+        f'camera_coarse={int(decision.camera_coarse)} camera_strict={int(decision.camera_strict)} '
+        f'oem={int(decision.oem_identity)} dPath={decision.d_path_m} '
+        f'public_suppressed={int(decision.public_suppressed)}')
     gate_start_ns = time.perf_counter_ns()
     self.oem_gate.update(qualified, availability_ns, v_ego, state=oem_state,
                          word0_pids=processed_pids, oem_valid=scc_valid)
