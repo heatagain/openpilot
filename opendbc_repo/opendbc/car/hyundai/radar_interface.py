@@ -306,6 +306,20 @@ BOSCH_FAMILY_MAX_GAP_NS = 160_000_000
 BOSCH_FAMILY_INWARD_SCANS = 3
 BOSCH_FAMILY_INWARD_MPS = .90
 
+# RESEARCH_SHADOW: publication-neutral S36 mirror-family collection. Remove
+# this block and its detector before the final production PR.
+BOSCH_MIRROR_SHADOW_CONFIRMATIONS = 3
+BOSCH_MIRROR_SHADOW_MIN_MATURE_AGE = 10
+BOSCH_MIRROR_SHADOW_MIN_D_M = 3.0
+BOSCH_MIRROR_SHADOW_MAX_D_M = 24.0
+BOSCH_MIRROR_SHADOW_MAX_LATERAL_SUM_M = 2.5
+BOSCH_MIRROR_SHADOW_MAX_DV_MPS = 1.5
+BOSCH_MIRROR_SHADOW_MAX_WORLD_SPEED_MPS = 1.5
+BOSCH_MIRROR_SHADOW_MAX_BEARING_DEG = 6.0
+BOSCH_MIRROR_SHADOW_MAX_D_STEP_M = 3.0
+BOSCH_MIRROR_SHADOW_MAX_LATERAL_SUM_STEP_M = 2.0
+BOSCH_MIRROR_SHADOW_MAX_GAP_NS = 320_000_000
+
 # Behavioural naming for the two 0x601 records. No proprietary signal name is
 # claimed. word1 (bytes 4..7) is bit-identical to exactly one raw record in
 # 63,819 of 63,822 active scans across 146 segments, and its activity equals
@@ -3612,6 +3626,287 @@ class _BoschFamilyCompanionFilter:
     return tuple(obj for obj in objects if obj.physical_track_id not in suppressed)
 
 
+# RESEARCH_SHADOW / TEMP_BOSCH_MIRROR_RESEARCH: none of the state below is
+# consumed by tracking, grouping, qualification, aliasing, or publication.
+@dataclass(frozen=True)
+class BoschMirrorShadowRelation:
+  pid_a: int
+  pid_b: int
+  raw_a: tuple[int, ...]
+  raw_b: tuple[int, ...]
+  representative_a: int
+  representative_b: int
+  first_ns: int
+  last_ns: int
+  confirmations: int
+  active: bool
+  age_a: int
+  age_b: int
+  d_rel_a: float
+  d_rel_b: float
+  y_rel_a: float
+  y_rel_b: float
+  d_path_a: float
+  d_path_b: float
+  v_rel_a: float
+  v_rel_b: float
+  world_speed_a: float
+  world_speed_b: float
+  bearing_a: float
+  bearing_b: float
+  camera_coarse_a: bool
+  camera_coarse_b: bool
+  camera_strict_a: bool
+  camera_strict_b: bool
+  oem_a: bool
+  oem_b: bool
+
+
+@dataclass(frozen=True)
+class BoschMirrorShadowDecision:
+  timestamp_ns: int
+  action: str
+  reason: str
+  relation: BoschMirrorShadowRelation
+
+
+@dataclass(frozen=True)
+class BoschFalseAnchorShadowDecision:
+  timestamp_ns: int
+  action: str
+  reason: str
+  relation: BoschMirrorShadowRelation
+  root_pid: int
+  anchor_pid: int
+  newborn_pid: int
+  newborn_raw: int
+  newborn_age: int
+  newborn_d_rel: float | None
+  newborn_y_rel: float | None
+  newborn_d_path: float | None
+  newborn_v_rel: float | None
+  newborn_world_speed: float | None
+  newborn_bearing: float | None
+
+
+class _BoschMirrorFamilyResearchShadow:
+  """Online-causal mirror ancestry and false-anchor event-edge detector."""
+
+  def __init__(self, enabled=True):
+    self.enabled = bool(enabled)
+    self.relations: dict[tuple[int, int], BoschMirrorShadowRelation] = {}
+    self.chains: dict[int, tuple[tuple[int, int], int]] = {}
+    self.last_ns = None
+    self.last_relation_decisions: tuple[BoschMirrorShadowDecision, ...] = ()
+    self.last_chain_decisions: tuple[BoschFalseAnchorShadowDecision, ...] = ()
+    self.pair_evaluations_last = self.pair_evaluations_total = self.pair_evaluations_peak = 0
+    self.elapsed_ns_last = self.elapsed_ns_total = self.elapsed_ns_max = 0
+
+  @staticmethod
+  def _bearing(obj):
+    return math.degrees(math.atan2(obj.y_rel, max(obj.d_rel, .5)))
+
+  @staticmethod
+  def _world_speed(obj, v_ego, yaw):
+    return obj.v_rel + v_ego - yaw*obj.y_rel
+
+  @staticmethod
+  def _raw_ids(obj):
+    return tuple(member.raw_track_id for member in obj.members)
+
+  def _snapshot(self, first, second, prior, timestamp_ns, v_ego, yaw, path, strict, oem,
+                compute_path=False):
+    # The older surface is A. Stable PID ordering breaks equal-age ties.
+    a, b = sorted((first, second), key=lambda obj: (-obj.age_scans, obj.physical_track_id))
+    key = tuple(sorted((a.physical_track_id, b.physical_track_id)))
+    continuous = bool(
+      prior is not None and prior.pid_a == a.physical_track_id and prior.pid_b == b.physical_track_id and
+      prior.raw_a == self._raw_ids(a) and prior.raw_b == self._raw_ids(b) and
+      prior.representative_a == a.representative_raw_track_id and
+      prior.representative_b == b.representative_raw_track_id and
+      a.age_scans > prior.age_a and b.age_scans > prior.age_b and
+      0 < timestamp_ns-prior.last_ns <= BOSCH_MIRROR_SHADOW_MAX_GAP_NS)
+    confirmations = prior.confirmations + 1 if continuous else 1
+    d_path_a = (_BoschFamilyCompanionFilter._path_offset(a, path) if compute_path else
+                (prior.d_path_a if prior is not None else a.y_rel))
+    d_path_b = (_BoschFamilyCompanionFilter._path_offset(b, path) if compute_path else
+                (prior.d_path_b if prior is not None else b.y_rel))
+    return key, BoschMirrorShadowRelation(
+      a.physical_track_id, b.physical_track_id, self._raw_ids(a), self._raw_ids(b),
+      a.representative_raw_track_id, b.representative_raw_track_id,
+      prior.first_ns if continuous else timestamp_ns, timestamp_ns, confirmations,
+      bool(continuous and prior and prior.active) or confirmations >= BOSCH_MIRROR_SHADOW_CONFIRMATIONS,
+      a.age_scans, b.age_scans, a.d_rel, b.d_rel, a.y_rel, b.y_rel,
+      d_path_a, d_path_b, a.v_rel, b.v_rel,
+      self._world_speed(a, v_ego, yaw), self._world_speed(b, v_ego, yaw),
+      self._bearing(a), self._bearing(b), bool(a.vision_supported), bool(b.vision_supported),
+      a.physical_track_id in strict, b.physical_track_id in strict,
+      a.physical_track_id in oem or a.oem_selected, b.physical_track_id in oem or b.oem_selected)
+
+  @staticmethod
+  def _candidate_ok(state, prior=None):
+    delta_d = abs(state.d_rel_b-state.d_rel_a)
+    lateral_sum = state.y_rel_a+state.y_rel_b
+    if not (max(state.age_a, state.age_b) >= BOSCH_MIRROR_SHADOW_MIN_MATURE_AGE and
+            BOSCH_MIRROR_SHADOW_MIN_D_M <= delta_d <= BOSCH_MIRROR_SHADOW_MAX_D_M and
+            state.y_rel_a*state.y_rel_b <= 0. and
+            abs(lateral_sum) <= BOSCH_MIRROR_SHADOW_MAX_LATERAL_SUM_M and
+            abs(state.v_rel_b-state.v_rel_a) <= BOSCH_MIRROR_SHADOW_MAX_DV_MPS and
+            abs(state.world_speed_b-state.world_speed_a) <= BOSCH_MIRROR_SHADOW_MAX_WORLD_SPEED_MPS and
+            abs(state.bearing_b-state.bearing_a) <= BOSCH_MIRROR_SHADOW_MAX_BEARING_DEG):
+      return False
+    return not prior or (abs(delta_d-abs(prior.d_rel_b-prior.d_rel_a)) <= BOSCH_MIRROR_SHADOW_MAX_D_STEP_M and
+                         abs(lateral_sum-(prior.y_rel_a+prior.y_rel_b)) <= BOSCH_MIRROR_SHADOW_MAX_LATERAL_SUM_STEP_M)
+
+  @staticmethod
+  def _divergence_reason(state, prior):
+    if (state.raw_a != prior.raw_a or state.raw_b != prior.raw_b or
+        state.representative_a != prior.representative_a or
+        state.representative_b != prior.representative_b or
+        state.age_a <= prior.age_a or state.age_b <= prior.age_b):
+      return 'IDENTITY_DISCONTINUITY'
+    if (abs(state.v_rel_b-state.v_rel_a) > BOSCH_MIRROR_SHADOW_MAX_DV_MPS or
+        abs(state.world_speed_b-state.world_speed_a) > BOSCH_MIRROR_SHADOW_MAX_WORLD_SPEED_MPS):
+      return 'SPEED_DIVERGENCE'
+    return 'GEOMETRY_DIVERGENCE'
+
+  def reset(self, timestamp_ns, reason='STATE_RESET'):
+    self.last_relation_decisions = tuple(
+      BoschMirrorShadowDecision(timestamp_ns, 'EXIT', reason, state)
+      for state in self.relations.values() if state.active)
+    self.relations = {}
+    self.last_ns = timestamp_ns
+
+  def update(self, objects, timestamp_ns, v_ego, *, yaw_rate=None, path=(),
+             strict_associations=None, oem_pids=()):
+    start_ns = time.perf_counter_ns()
+    self.last_relation_decisions = ()
+    self.last_chain_decisions = ()
+    self.pair_evaluations_last = 0
+    if not self.enabled:
+      self.relations = {}
+      self.chains = {}
+      self.last_ns = timestamp_ns
+      return
+    if (self.last_ns is not None and
+        (timestamp_ns <= self.last_ns or timestamp_ns-self.last_ns > BOSCH_MIRROR_SHADOW_MAX_GAP_NS)):
+      self.reset(timestamp_ns, 'STATE_RESET' if timestamp_ns <= self.last_ns else 'SCAN_GAP')
+      return
+    self.last_ns = timestamp_ns
+    if not math.isfinite(v_ego):
+      self.reset(timestamp_ns, 'SPEED_DIVERGENCE')
+      return
+    yaw = yaw_rate if yaw_rate is not None and math.isfinite(yaw_rate) else 0.
+    strict, oem = strict_associations or {}, set(oem_pids)
+    ordered = sorted(objects, key=lambda obj: obj.d_rel)
+    evaluated = set()
+    next_relations = {}
+    decisions = []
+    for i, first in enumerate(ordered):
+      for second in ordered[i+1:]:
+        delta_d = second.d_rel-first.d_rel
+        if delta_d > BOSCH_MIRROR_SHADOW_MAX_D_M:
+          break
+        self.pair_evaluations_last += 1
+        key = tuple(sorted((first.physical_track_id, second.physical_track_id)))
+        prior = self.relations.get(key)
+        if prior is None and not (
+            delta_d >= BOSCH_MIRROR_SHADOW_MIN_D_M and first.y_rel*second.y_rel <= 0. and
+            abs(first.y_rel+second.y_rel) <= BOSCH_MIRROR_SHADOW_MAX_LATERAL_SUM_M and
+            abs(first.v_rel-second.v_rel) <= BOSCH_MIRROR_SHADOW_MAX_DV_MPS and
+            max(first.age_scans, second.age_scans) >= BOSCH_MIRROR_SHADOW_MIN_MATURE_AGE):
+          continue
+        compute_path = prior is not None and not prior.active and prior.confirmations+1 >= BOSCH_MIRROR_SHADOW_CONFIRMATIONS
+        key, state = self._snapshot(
+          first, second, prior, timestamp_ns, v_ego, yaw, path, strict, oem, compute_path=compute_path)
+        evaluated.add(key)
+        if self._candidate_ok(state, prior):
+          next_relations[key] = state
+          if prior and prior.active and not state.active:
+            decisions.append(BoschMirrorShadowDecision(
+              timestamp_ns, 'EXIT', 'IDENTITY_DISCONTINUITY', prior))
+          elif state.active and not (prior and prior.active):
+            decisions.append(BoschMirrorShadowDecision(timestamp_ns, 'ENTER', 'PERSISTENCE_CONFIRMED', state))
+        elif prior and prior.active:
+          decisions.append(BoschMirrorShadowDecision(
+            timestamp_ns, 'EXIT', self._divergence_reason(state, prior), prior))
+    for key, prior in self.relations.items():
+      if key in evaluated:
+        continue
+      if timestamp_ns-prior.last_ns <= BOSCH_MIRROR_SHADOW_MAX_GAP_NS:
+        next_relations[key] = prior
+      elif prior.active:
+        decisions.append(BoschMirrorShadowDecision(timestamp_ns, 'EXIT', 'PID_DISAPPEARANCE', prior))
+    self.relations = next_relations
+    self.last_relation_decisions = tuple(decisions)
+    self.pair_evaluations_total += self.pair_evaluations_last
+    self.pair_evaluations_peak = max(self.pair_evaluations_peak, self.pair_evaluations_last)
+    elapsed = time.perf_counter_ns()-start_ns
+    self.elapsed_ns_last = elapsed
+    self.elapsed_ns_total += elapsed
+    self.elapsed_ns_max = max(self.elapsed_ns_max, elapsed)
+
+  def update_false_anchor_chains(self, family, objects, timestamp_ns, v_ego, *, yaw_rate=None, path=()):
+    if not self.enabled:
+      return
+    yaw = yaw_rate if yaw_rate is not None and math.isfinite(yaw_rate) else 0.
+    present = {obj.physical_track_id: obj for obj in objects}
+    active_relations = {key: state for key, state in self.relations.items() if state.active}
+    exited_relations = {tuple(sorted((decision.relation.pid_a, decision.relation.pid_b))): decision.relation
+                        for decision in self.last_relation_decisions if decision.action == 'EXIT'}
+    b1_states = family._states
+    decisions = []
+    next_chains = {}
+    release_reasons = {decision.newborn_pid: decision.release_reason
+                       for decision in family.last_decisions if decision.action in ('RELEASE', 'HANDOFF')}
+    for newborn_pid, (relation_key, anchor_pid) in self.chains.items():
+      b1 = b1_states.get(newborn_pid)
+      relation = active_relations.get(relation_key)
+      if b1 is None:
+        old = relation or exited_relations.get(relation_key)
+        if old is not None:
+          decisions.append(self._chain_decision(
+            timestamp_ns, 'EXIT', release_reasons.get(newborn_pid, 'B1_RELATION_END'),
+            old, anchor_pid, newborn_pid, present, v_ego, yaw, path))
+      elif relation is None or b1.anchor_pid != anchor_pid:
+        old = exited_relations.get(relation_key)
+        if old is not None:
+          decisions.append(self._chain_decision(
+            timestamp_ns, 'EXIT', 'MIRROR_ANCESTRY_END', old, anchor_pid,
+            newborn_pid, present, v_ego, yaw, path))
+      else:
+        next_chains[newborn_pid] = (relation_key, anchor_pid)
+    for newborn_pid, b1 in b1_states.items():
+      if newborn_pid in next_chains:
+        continue
+      relation_item = next(((key, state) for key, state in active_relations.items()
+                            if b1.anchor_pid in key and state.first_ns < timestamp_ns), None)
+      if relation_item is None:
+        continue
+      key, relation = relation_item
+      next_chains[newborn_pid] = (key, b1.anchor_pid)
+      decisions.append(self._chain_decision(
+        timestamp_ns, 'ENTER', 'UNRESOLVED_MIRROR_ANCESTRY', relation,
+        b1.anchor_pid, newborn_pid, present, v_ego, yaw, path))
+    self.chains = next_chains
+    self.last_chain_decisions = tuple(decisions)
+
+  @staticmethod
+  def _chain_decision(timestamp_ns, action, reason, relation, anchor_pid, newborn_pid,
+                      present, v_ego, yaw, path):
+    root_pid = relation.pid_b if anchor_pid == relation.pid_a else relation.pid_a
+    obj = present.get(newborn_pid)
+    return BoschFalseAnchorShadowDecision(
+      timestamp_ns, action, reason, relation, root_pid, anchor_pid, newborn_pid,
+      obj.members[0].raw_track_id if obj is not None and len(obj.members) == 1 else -1,
+      obj.age_scans if obj is not None else -1,
+      obj.d_rel if obj is not None else None, obj.y_rel if obj is not None else None,
+      _BoschFamilyCompanionFilter._path_offset(obj, path) if obj is not None else None,
+      obj.v_rel if obj is not None else None,
+      obj.v_rel+v_ego-yaw*obj.y_rel if obj is not None else None,
+      _BoschMirrorFamilyResearchShadow._bearing(obj) if obj is not None else None)
+
+
 @dataclass
 class _BoschP91PairState:
   parent_pid: int
@@ -4221,7 +4516,8 @@ class BoschRadarProvider:
                camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE, p91_mode=BOSCH_P91_MODE,
                oem_gate_mode=BOSCH_OEM_GATE_MODE, scc_bus=BOSCH_SCC_BUS,
                curve_reacquire_mode=BOSCH_CAMERA_CURVE_REACQUIRE_MODE,
-               provisional_bundle=True, family_companion_mode=BOSCH_FAMILY_COMPANION_MODE):
+               provisional_bundle=True, family_companion_mode=BOSCH_FAMILY_COMPANION_MODE,
+               mirror_research_shadow=True):
     self.bus = bus
     self.camera_bus = camera_bus
     self.scc_bus = scc_bus
@@ -4230,6 +4526,7 @@ class BoschRadarProvider:
     self.publication_aliases = BoschPublicationAliasAllocator()
     self.qualifier = _BoschPublicationPassThrough() if qualification else None
     self.family_companion = _BoschFamilyCompanionFilter(family_companion_mode)
+    self.mirror_research_shadow = _BoschMirrorFamilyResearchShadow(mirror_research_shadow)
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
     self.oem_gate = _BoschOemValidationGate(oem_gate_mode)
     self.scc_obj_valid = None
@@ -4501,6 +4798,8 @@ class BoschRadarProvider:
     self._perf_ties = 0
     self._perf_camera_decode_count = self._perf_camera_decode_sum = self._perf_camera_decode_max = 0
     self._perf_p91_sum = self._perf_p91_max = 0
+    if hasattr(self, 'mirror_research_shadow'):
+      self.mirror_research_shadow.elapsed_ns_total = self.mirror_research_shadow.elapsed_ns_max = 0
 
   def record_native_time(self, elapsed_ns):
     self._perf_native_count += 1
@@ -4566,6 +4865,12 @@ class BoschRadarProvider:
       f' family_releases={self.family_companion.releases}'
       f' family_handoffs={self.family_companion.handoffs}'
       f' family_publication_suppressed={self.family_companion.publication_suppressed}'
+      f' mirror_shadow={int(self.mirror_research_shadow.enabled)}'
+      f' mirror_shadow_relations={sum(state.active for state in self.mirror_research_shadow.relations.values())}'
+      f' mirror_shadow_chains={len(self.mirror_research_shadow.chains)}'
+      f' mirror_shadow_pairs={self.mirror_research_shadow.pair_evaluations_last}/{self.mirror_research_shadow.pair_evaluations_peak}'
+      f' mirror_shadow_ms_avg={self.mirror_research_shadow.elapsed_ns_total * scale:.3f}'
+      f' mirror_shadow_ms_max={self.mirror_research_shadow.elapsed_ns_max * 1e-6:.3f}'
     )
     self._reset_perf()
     return message
@@ -4752,6 +5057,10 @@ class BoschRadarProvider:
       self._debug_timeout = True
       self.tracker.group_manager.reset_provisional(now_ns, 'provider_timeout')
       self.family_companion.reset(now_ns, 'STATE_RESET')
+      self.mirror_research_shadow.reset(now_ns, 'STATE_RESET')
+      self.mirror_research_shadow.update_false_anchor_chains(
+        self.family_companion, (), now_ns, v_ego, yaw_rate=yaw_rate_left, path=())
+      self._log_research_shadow_events(())
       self.p91.update((), now_ns, v_ego, yaw_rate=yaw_rate_left)
       self.oem_gate.update((), now_ns, v_ego, state=BOSCH_OEM_STATE_NONE)
       self._debug_gate_suppress = frozenset()
@@ -4839,9 +5148,14 @@ class BoschRadarProvider:
     family_oem_pids = set(processed_pids)
     family_oem_pids.update(obj.physical_track_id for obj in qualified if obj.oem_selected)
     s32_pids = {pid for pair in self.tracker.group_manager.provisional_pid_pairs.values() for pid in pair}
+    self.mirror_research_shadow.update(
+      qualified, availability_ns, v_ego, yaw_rate=yaw_rate_left, path=path,
+      strict_associations=strict, oem_pids=family_oem_pids)
     self.family_companion.update(
       qualified, availability_ns, v_ego, yaw_rate=yaw_rate_left,
       strict_associations=strict, oem_pids=family_oem_pids, excluded_pids=s32_pids, path=path)
+    self.mirror_research_shadow.update_false_anchor_chains(
+      self.family_companion, qualified, availability_ns, v_ego, yaw_rate=yaw_rate_left, path=path)
     for decision in self.family_companion.last_decisions:
       event = f'B1_COMPANION_{decision.action}'
       carlog.info(
@@ -4871,6 +5185,7 @@ class BoschRadarProvider:
     p91_start_ns = time.perf_counter_ns()
     self.p91.update(qualified, availability_ns, v_ego, word0_pids=p91_word0, yaw_rate=yaw_rate_left)
     p91_ns = time.perf_counter_ns() - p91_start_ns
+    self._log_research_shadow_events(qualified)
     self._debug_p91_ns = p91_ns
     self._perf_p91_sum += p91_ns
     self._perf_p91_max = max(self._perf_p91_max, p91_ns)
@@ -4897,6 +5212,57 @@ class BoschRadarProvider:
     self._perf_ties += raw.last_tied_components
     self._perf_conflicts += physical.last_conflicts
     return qualified
+
+  def _shadow_publication_state(self, pid, qualified):
+    if pid not in {obj.physical_track_id for obj in qualified}:
+      return 'NOT_QUALIFIED'
+    if pid in self.tracker.group_manager.provisional_hidden:
+      return 'S32_HELD'
+    if pid in self.p91.would_suppress:
+      return 'P91_HELD'
+    if pid in self.oem_gate.would_withhold:
+      return 'OEM_HELD'
+    if pid in self.family_companion.would_suppress:
+      return 'B1_HELD'
+    return 'PUBLICATION_ELIGIBLE'
+
+  def _log_research_shadow_events(self, qualified):
+    shadow = self.mirror_research_shadow
+    if not shadow.enabled:
+      return
+    for decision in shadow.last_relation_decisions:
+      state = decision.relation
+      carlog.info(
+        f'BOSCH_RESEARCH event=MIRROR_FAMILY_{decision.action} ns={decision.timestamp_ns} reason={decision.reason} '
+        f'pidA={state.pid_a} rawA={",".join(map(str, state.raw_a))} repA={state.representative_a} ageA={state.age_a} '
+        f'pidB={state.pid_b} rawB={",".join(map(str, state.raw_b))} repB={state.representative_b} ageB={state.age_b} '
+        f'dRelA={state.d_rel_a} dRelB={state.d_rel_b} yRelA={state.y_rel_a} yRelB={state.y_rel_b} '
+        f'dPathA={state.d_path_a} dPathB={state.d_path_b} vRelA={state.v_rel_a} vRelB={state.v_rel_b} '
+        f'worldA={state.world_speed_a} worldB={state.world_speed_b} bearingA={state.bearing_a} bearingB={state.bearing_b} '
+        f'deltaD={state.d_rel_b-state.d_rel_a} deltaY={state.y_rel_b-state.y_rel_a} ySum={state.y_rel_a+state.y_rel_b} '
+        f'deltaDPath={state.d_path_b-state.d_path_a} deltaVRel={state.v_rel_b-state.v_rel_a} '
+        f'deltaWorld={state.world_speed_b-state.world_speed_a} deltaBearing={state.bearing_b-state.bearing_a} '
+        f'membersA={len(state.raw_a)} membersB={len(state.raw_b)} cameraCoarseA={int(state.camera_coarse_a)} '
+        f'cameraCoarseB={int(state.camera_coarse_b)} cameraStrictA={int(state.camera_strict_a)} '
+        f'cameraStrictB={int(state.camera_strict_b)} oemA={int(state.oem_a)} oemB={int(state.oem_b)} '
+        f'pubA={self._shadow_publication_state(state.pid_a, qualified)} '
+        f'pubB={self._shadow_publication_state(state.pid_b, qualified)}')
+    for decision in shadow.last_chain_decisions:
+      state = decision.relation
+      root_is_a = decision.root_pid == state.pid_a
+      anchor_is_a = decision.anchor_pid == state.pid_a
+      carlog.info(
+        f'BOSCH_RESEARCH event=FALSE_ANCHOR_CHAIN_{decision.action} ns={decision.timestamp_ns} reason={decision.reason} '
+        f'pidA={decision.root_pid} rawA={",".join(map(str, state.raw_a if root_is_a else state.raw_b))} '
+        f'pidB={decision.anchor_pid} rawB={",".join(map(str, state.raw_a if anchor_is_a else state.raw_b))} '
+        f'pidC={decision.newborn_pid} rawC={decision.newborn_raw} '
+        f'ageA={state.age_a if root_is_a else state.age_b} ageB={state.age_a if anchor_is_a else state.age_b} '
+        f'ageC={decision.newborn_age} dRelC={decision.newborn_d_rel} yRelC={decision.newborn_y_rel} '
+        f'dPathC={decision.newborn_d_path} vRelC={decision.newborn_v_rel} '
+        f'worldC={decision.newborn_world_speed} bearingC={decision.newborn_bearing} '
+        f'pubA={self._shadow_publication_state(decision.root_pid, qualified)} '
+        f'pubB={self._shadow_publication_state(decision.anchor_pid, qualified)} '
+        f'pubC={self._shadow_publication_state(decision.newborn_pid, qualified)}')
 
 # End Bosch MRRevo14F passive radar
 

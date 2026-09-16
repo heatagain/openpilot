@@ -1,3 +1,4 @@
+import inspect
 import math
 from dataclasses import replace
 
@@ -1444,6 +1445,105 @@ class TestBoschFamilyCompanionB1:
       family.update(objects, ns, 30., excluded_pids=s32_pids)
       assert family.would_suppress == frozenset()
     assert actions == ['CREATE', 'COHERENT', 'HANDOFF']
+
+
+class TestBoschMirrorFamilyResearchShadow:
+  SCAN_NS = 100_000_000
+  ROOT_PID = 1_000_655
+  ANCHOR_PID = 1_000_671
+  NEWBORN_PID = 1_000_752
+
+  @staticmethod
+  def obj(pid, raw, ns, age, d_rel, y_rel, v_rel=-5.):
+    member = BoschRawTrack(raw, BoschRawDetection(ns, raw % 32, d_rel, y_rel, v_rel, raw_word=raw), age, False)
+    return BoschPhysicalObject(pid, ns, (member,), raw, d_rel, y_rel, v_rel,
+                               False, False, age, 'single_return')
+
+  @classmethod
+  def scan(cls, index, *, newborn=False):
+    ns = (index+1)*cls.SCAN_NS
+    objects = [
+      cls.obj(cls.ROOT_PID, 593, ns, 50+index, 60.-.5*index, -2.),
+      cls.obj(cls.ANCHOR_PID, 609, ns, 30+index, 68.-.5*index, 2.),
+    ]
+    if newborn:
+      objects.append(cls.obj(cls.NEWBORN_PID, 682, ns, index-2, 76.5-.5*index, 1.5))
+    return ns, tuple(objects)
+
+  def test_mirror_enter_precedes_false_anchor_chain_and_b1_hold(self):
+    shadow = radar_interface_module._BoschMirrorFamilyResearchShadow()
+    family = radar_interface_module._BoschFamilyCompanionFilter(
+      radar_interface_module.BOSCH_FAMILY_COMPANION_ACTIVE)
+    mirror_enter_ns = chain_enter_ns = hold_ns = None
+    for index in range(5):
+      ns, objects = self.scan(index, newborn=index >= 3)
+      shadow.update(objects, ns, 30.)
+      family.update(objects, ns, 30.)
+      shadow.update_false_anchor_chains(family, objects, ns, 30.)
+      if shadow.last_relation_decisions:
+        mirror_enter_ns = shadow.last_relation_decisions[-1].timestamp_ns
+      if shadow.last_chain_decisions:
+        chain_enter_ns = shadow.last_chain_decisions[-1].timestamp_ns
+        assert shadow.last_chain_decisions[-1].anchor_pid == self.ANCHOR_PID
+      if family.last_decisions:
+        hold_ns = family.last_decisions[-1].timestamp_ns
+    assert mirror_enter_ns is not None
+    assert mirror_enter_ns < chain_enter_ns < hold_ns
+
+  def test_relation_and_chain_event_edges_expire(self):
+    shadow = radar_interface_module._BoschMirrorFamilyResearchShadow()
+    family = radar_interface_module._BoschFamilyCompanionFilter(
+      radar_interface_module.BOSCH_FAMILY_COMPANION_ACTIVE)
+    for index in range(4):
+      ns, objects = self.scan(index, newborn=index == 3)
+      shadow.update(objects, ns, 30.)
+      family.update(objects, ns, 30.)
+      shadow.update_false_anchor_chains(family, objects, ns, 30.)
+    ns, objects = self.scan(4, newborn=True)
+    shadow.update(objects, ns, 30.)
+    family.update(objects, ns, 30., strict_associations={self.NEWBORN_PID: 9})
+    shadow.update_false_anchor_chains(family, objects, ns, 30.)
+    assert shadow.last_chain_decisions[-1].action == 'EXIT'
+    assert shadow.last_chain_decisions[-1].reason == 'B1_RELATION_END'
+
+    ns += 4*self.SCAN_NS
+    shadow.update((), ns, 30.)
+    assert any(decision.action == 'EXIT' and decision.reason == 'SCAN_GAP'
+               for decision in shadow.last_relation_decisions)
+
+  def test_shadow_is_absent_from_publication_conditions(self):
+    source = inspect.getsource(BoschRadarProvider.publication_view)
+    assert 'mirror_research_shadow' not in source
+    ns, objects = self.scan(0)
+    before = tuple((obj.physical_track_id, obj.representative_raw_track_id, obj.members) for obj in objects)
+    shadow = radar_interface_module._BoschMirrorFamilyResearchShadow()
+    shadow.update(objects, ns, 30.)
+    after = tuple((obj.physical_track_id, obj.representative_raw_track_id, obj.members) for obj in objects)
+    assert after == before
+
+  def test_identity_discontinuity_expires_relation(self):
+    shadow = radar_interface_module._BoschMirrorFamilyResearchShadow()
+    for index in range(3):
+      ns, objects = self.scan(index)
+      shadow.update(objects, ns, 30.)
+    ns, objects = self.scan(3)
+    changed = self.obj(self.ANCHOR_PID, 610, ns, 33, objects[1].d_rel, objects[1].y_rel)
+    shadow.update((objects[0], changed), ns, 30.)
+    assert shadow.last_relation_decisions[-1].action == 'EXIT'
+    assert shadow.last_relation_decisions[-1].reason == 'IDENTITY_DISCONTINUITY'
+
+  def test_event_log_is_fixed_and_edge_only(self, monkeypatch):
+    provider = BoschRadarProvider(1, qualification=False, mirror_research_shadow=True)
+    messages = []
+    monkeypatch.setattr(radar_interface_module.carlog, 'info', messages.append)
+    for index in range(3):
+      ns, objects = self.scan(index)
+      provider.mirror_research_shadow.update(objects, ns, 30.)
+      provider._log_research_shadow_events(objects)
+    assert len(messages) == 1
+    assert messages[0].startswith('BOSCH_RESEARCH event=MIRROR_FAMILY_ENTER ')
+    assert 'pidA=1000655 rawA=593' in messages[0]
+    assert 'pidB=1000671 rawB=609' in messages[0]
 
 
 class TestBoschRawAssociationTrace:
