@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from openpilot.cereal import car, log, messaging
@@ -79,6 +80,13 @@ def _model_measurement_time_s(sm: messaging.SubMaster) -> float:
   return float(timestamp_eof_ns if timestamp_eof_ns > 0 else model_log_ns) * 1e-9
 
 
+def _frequency_hz(window: Any) -> float | None:
+  if int(window.count) <= 0:
+    return None
+  average_s = float(window.get_average())
+  return 1.0 / average_s if average_s > 0.0 else None
+
+
 class DPathRadarD:
   """Own and publish radarState without importing controls.radard."""
 
@@ -101,9 +109,68 @@ class DPathRadarD:
     )
     self.radar_state = log.RadarState.new_message()
     self.radar_state_valid = False
+    self.log_input_health = (
+      CP.brand == "hyundai"
+      and bool(int(CP.extFlags) & int(HyundaiExtFlags.BOSCH_RADAR))
+      and enable_radar_tracks > 0
+    )
+
+  def _log_invalid_input_transition(
+    self,
+    sm: messaging.SubMaster,
+    rr: car.RadarData,
+  ) -> None:
+    now_s = time.monotonic()
+    services: dict[str, dict[str, Any]] = {}
+    for service in sm.services:
+      tracker = sm.freq_tracker[service]
+      seen = bool(sm.seen[service])
+      services[service] = {
+        "alive": bool(sm.alive[service]),
+        "freq_ok": bool(sm.freq_ok[service]),
+        "valid": bool(sm.valid[service]),
+        "seen": seen,
+        "updated": bool(sm.updated[service]),
+        "check_alive": service not in sm.ignore_alive,
+        "check_freq": sm._check_avg_freq(service),
+        "check_valid": service not in sm.ignore_valid,
+        "last_rx_age_ms": round(
+          (now_s - float(sm.recv_time[service])) * 1e3,
+          3,
+        ) if seen else None,
+        "msg_age_ms": round(
+          (now_s - int(sm.logMonoTime[service]) * 1e-9) * 1e3,
+          3,
+        ) if int(sm.logMonoTime[service]) > 0 else None,
+        "recv_frame_age": int(sm.frame - sm.recv_frame[service]) if seen else None,
+        "avg_freq_hz": _frequency_hz(tracker.avg_dt),
+        "recent_freq_hz": _frequency_hz(tracker.recent_avg_dt),
+        "min_freq_hz": float(tracker.min_freq),
+        "max_freq_hz": float(tracker.max_freq),
+      }
+
+    # TEMPORARY DIAGNOSTIC: remove this rlog/tmux event after the invalid
+    # radarState root cause is confirmed and fixed. Warning level intentionally
+    # sends this single structured record to both logMessage and default tmux.
+    cloudlog.warning({
+      "event": "radard_input_health_invalid_transition",
+      "temporary_diagnostic": True,
+      "monotonic_time_s": now_s,
+      "submaster_frame": int(sm.frame),
+      "all_alive": bool(sm.all_alive()),
+      "all_freq_ok": bool(sm.all_freq_ok()),
+      "all_valid": bool(sm.all_valid()),
+      "all_checks": bool(sm.all_checks()),
+      "radar_errors": [str(error) for error in rr.errors],
+      "radar_point_count": len(rr.points),
+      "services": services,
+    })
 
   def update(self, sm: messaging.SubMaster, rr: car.RadarData) -> None:
+    previous_valid = self.radar_state_valid
     self.radar_state_valid = sm.all_checks()
+    if self.log_input_health and previous_valid and not self.radar_state_valid:
+      self._log_invalid_input_transition(sm, rr)
     # Reuse the builder like conventional radard. Reallocating every 20 Hz
     # frame is measurable on device and does not change any published field.
     self.radar_state.mdMonoTime = sm.logMonoTime["modelV2"]
