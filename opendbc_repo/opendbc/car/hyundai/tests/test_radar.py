@@ -1540,10 +1540,46 @@ class TestBoschMirrorFamilyResearchShadow:
       ns, objects = self.scan(index)
       provider.mirror_research_shadow.update(objects, ns, 30.)
       provider._log_research_shadow_events(objects)
-    assert len(messages) == 1
-    assert messages[0].startswith('BOSCH_RESEARCH event=MIRROR_FAMILY_ENTER ')
-    assert 'pidA=1000655 rawA=593' in messages[0]
-    assert 'pidB=1000671 rawB=609' in messages[0]
+    events = [message for message in messages if 'event=MIRROR_FAMILY_' in message]
+    assert len(events) == 1
+    assert events[0].startswith('BOSCH_RESEARCH event=MIRROR_FAMILY_ENTER ')
+    assert 'pidA=1000655 rawA=593' in events[0]
+    assert 'pidB=1000671 rawB=609' in events[0]
+
+  @pytest.mark.parametrize("clone_type,geometry,confirmations", (
+    ('NEAR_COPY', (60., .2, 61., .4), 3),
+    ('LONGITUDINAL_MULTI_RETURN', (60., .2, 68., .7), 25),
+    ('LATERAL_MULTI_IMAGE', (60., -2., 60.5, 2.), 2),
+    ('SIDE_EGO_INTRUSION', (60., .2, 70., 3.), 15),
+  ))
+  def test_clone_taxonomy_uses_one_event_edge(self, monkeypatch, clone_type, geometry, confirmations):
+    provider = BoschRadarProvider(1, qualification=False, mirror_research_shadow=True)
+    messages = []
+    monkeypatch.setattr(radar_interface_module.carlog, 'info', messages.append)
+    for index in range(confirmations+2):
+      ns = (index+1)*self.SCAN_NS
+      d_a, y_a, d_b, y_b = geometry
+      objects = (self.obj(self.ROOT_PID, 593, ns, 20+index, d_a-.25*index, y_a),
+                 self.obj(self.ANCHOR_PID, 609, ns, 15+index, d_b-.25*index, y_b))
+      provider.mirror_research_shadow.update(objects, ns, 30.)
+      provider._log_research_shadow_events(objects)
+    events = [message for message in messages if 'event=BOSCH_CLONE_CANDIDATE_' in message]
+    assert len(events) == 1
+    assert events[0].startswith('BOSCH_RESEARCH event=BOSCH_CLONE_CANDIDATE_ENTER ')
+    assert f'cloneType={clone_type}' in events[0]
+    assert 'FALSE_CLONE' not in events[0]
+
+  def test_baseline_sampling_is_deterministic_and_sparse(self, monkeypatch):
+    provider = BoschRadarProvider(1, qualification=False, mirror_research_shadow=True)
+    messages = []
+    monkeypatch.setattr(radar_interface_module.carlog, 'info', messages.append)
+    for ns in (100_000_000, 200_000_000, 59_900_000_000, 60_100_000_000, 60_200_000_000):
+      objects = (self.obj(self.ROOT_PID, 593, ns, 20, 60., .2),)
+      provider.mirror_research_shadow.update(objects, ns, 30.)
+      provider._log_research_shadow_events(objects)
+    baseline = [message for message in messages if 'event=BOSCH_RESEARCH_BASELINE' in message]
+    assert len(baseline) == 2
+    assert 'objectCount=1 publishedCount=1' in baseline[0]
 
 
 class TestBoschRawAssociationTrace:
