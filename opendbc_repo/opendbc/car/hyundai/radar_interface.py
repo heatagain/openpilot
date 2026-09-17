@@ -13,7 +13,7 @@ import numpy as np
 from opendbc import DBC_PATH
 from opendbc.can import CANParser
 from opendbc.car import Bus, structs
-from opendbc.car.carlog import carlog
+from opendbc.car.carlog import carlog, researchlog
 from opendbc.car.interfaces import RadarInterfaceBase
 from opendbc.car.hyundai.values import DBC, HyundaiFlags, HyundaiExtFlags
 from openpilot.common.params import Params
@@ -5309,7 +5309,7 @@ class BoschRadarProvider:
       state = decision.relation
       event = (f'MIRROR_FAMILY_{decision.action}' if state.clone_type == 'MIRROR' else
                f'BOSCH_CLONE_CANDIDATE_{decision.action}')
-      carlog.info(
+      researchlog.debug(
         f'BOSCH_RESEARCH event={event} cloneType={state.clone_type} ns={decision.timestamp_ns} '
         f'reason={decision.reason} firstNs={state.first_ns} confirmations={state.confirmations} '
         f'pidA={state.pid_a} rawA={",".join(map(str, state.raw_a))} repA={state.representative_a} ageA={state.age_a} '
@@ -5331,7 +5331,7 @@ class BoschRadarProvider:
       state = decision.relation
       root_is_a = decision.root_pid == state.pid_a
       anchor_is_a = decision.anchor_pid == state.pid_a
-      carlog.info(
+      researchlog.debug(
         f'BOSCH_RESEARCH event=FALSE_ANCHOR_CHAIN_{decision.action} ns={decision.timestamp_ns} reason={decision.reason} '
         f'pidA={decision.root_pid} rawA={",".join(map(str, state.raw_a if root_is_a else state.raw_b))} '
         f'pidB={decision.anchor_pid} rawB={",".join(map(str, state.raw_a if anchor_is_a else state.raw_b))} '
@@ -5352,7 +5352,7 @@ class BoschRadarProvider:
         active = tuple(state for state in shadow.relations.values() if state.active)
         published = sum(self._shadow_publication_state(obj.physical_track_id, qualified) == 'PUBLICATION_ELIGIBLE'
                         for obj in qualified)
-        carlog.info(
+        researchlog.debug(
           f'BOSCH_RESEARCH event=BOSCH_RESEARCH_BASELINE ns={shadow.last_ns} '
           f'objectCount={len(qualified)} publishedCount={published} '
           f'b1ActiveCount={len(self.family_companion._states)} '

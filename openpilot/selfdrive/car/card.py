@@ -9,11 +9,11 @@ from openpilot.cereal import car, log
 
 from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process, Priority, Ratekeeper
-from openpilot.common.swaglog import cloudlog, ForwardingHandler
+from openpilot.common.swaglog import cloudlog, ForwardingHandler, ipchandler
 
 from opendbc.car import DT_CTRL, structs
 from opendbc.car.can_definitions import CanData, CanRecvCallable, CanSendCallable
-from opendbc.car.carlog import carlog
+from opendbc.car.carlog import carlog, researchlog
 from opendbc.car.fw_versions import ObdCallback
 from opendbc.car.car_helpers import get_car, interfaces
 from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
@@ -37,6 +37,9 @@ ButtonType = car.CarState.ButtonEvent.Type
 
 # forward
 carlog.addHandler(ForwardingHandler(cloudlog))
+# Research records remain on the logged logMessage IPC path, but intentionally
+# bypass every console/tmux handler.
+researchlog.addHandler(ipchandler)
 
 
 def obd_callback(params: Params) -> ObdCallback:

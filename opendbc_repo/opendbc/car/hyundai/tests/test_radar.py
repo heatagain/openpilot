@@ -1521,6 +1521,10 @@ class TestBoschMirrorFamilyResearchShadow:
     after = tuple((obj.physical_track_id, obj.representative_raw_track_id, obj.members) for obj in objects)
     assert after == before
 
+  def test_research_logger_has_no_console_or_parent_path(self):
+    assert radar_interface_module.researchlog.parent is radar_interface_module.carlog
+    assert not radar_interface_module.researchlog.propagate
+
   def test_identity_discontinuity_expires_relation(self):
     shadow = radar_interface_module._BoschMirrorFamilyResearchShadow()
     for index in range(3):
@@ -1535,7 +1539,9 @@ class TestBoschMirrorFamilyResearchShadow:
   def test_event_log_is_fixed_and_edge_only(self, monkeypatch):
     provider = BoschRadarProvider(1, qualification=False, mirror_research_shadow=True)
     messages = []
-    monkeypatch.setattr(radar_interface_module.carlog, 'info', messages.append)
+    monkeypatch.setattr(radar_interface_module.carlog, 'info',
+                        lambda _message: pytest.fail('BOSCH_RESEARCH reached tmux carlog'))
+    monkeypatch.setattr(radar_interface_module.researchlog, 'debug', messages.append)
     for index in range(3):
       ns, objects = self.scan(index)
       provider.mirror_research_shadow.update(objects, ns, 30.)
@@ -1555,7 +1561,7 @@ class TestBoschMirrorFamilyResearchShadow:
   def test_clone_taxonomy_uses_one_event_edge(self, monkeypatch, clone_type, geometry, confirmations):
     provider = BoschRadarProvider(1, qualification=False, mirror_research_shadow=True)
     messages = []
-    monkeypatch.setattr(radar_interface_module.carlog, 'info', messages.append)
+    monkeypatch.setattr(radar_interface_module.researchlog, 'debug', messages.append)
     for index in range(confirmations+2):
       ns = (index+1)*self.SCAN_NS
       d_a, y_a, d_b, y_b = geometry
@@ -1572,7 +1578,7 @@ class TestBoschMirrorFamilyResearchShadow:
   def test_baseline_sampling_is_deterministic_and_sparse(self, monkeypatch):
     provider = BoschRadarProvider(1, qualification=False, mirror_research_shadow=True)
     messages = []
-    monkeypatch.setattr(radar_interface_module.carlog, 'info', messages.append)
+    monkeypatch.setattr(radar_interface_module.researchlog, 'debug', messages.append)
     for ns in (100_000_000, 200_000_000, 59_900_000_000, 60_100_000_000, 60_200_000_000):
       objects = (self.obj(self.ROOT_PID, 593, ns, 20, 60., .2),)
       provider.mirror_research_shadow.update(objects, ns, 30.)
