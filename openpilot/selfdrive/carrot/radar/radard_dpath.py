@@ -149,7 +149,7 @@ class DPathRadarD:
         "max_freq_hz": float(tracker.max_freq),
       }
 
-    # TEMPORARY DIAGNOSTIC: remove this rlog/tmux event after the invalid
+    # TEMPORARY BOSCH RADARD HEALTH DIAGNOSTIC: remove this rlog/tmux event after the invalid
     # radarState root cause is confirmed and fixed. Warning level intentionally
     # sends this single structured record to both logMessage and default tmux.
     cloudlog.warning({
@@ -161,7 +161,12 @@ class DPathRadarD:
       "all_freq_ok": bool(sm.all_freq_ok()),
       "all_valid": bool(sm.all_valid()),
       "all_checks": bool(sm.all_checks()),
-      "radar_errors": [str(error) for error in rr.errors],
+      "radar_errors": {
+        "can_error": bool(rr.errors.canError),
+        "radar_fault": bool(rr.errors.radarFault),
+        "wrong_config": bool(rr.errors.wrongConfig),
+        "radar_unavailable_temporary": bool(rr.errors.radarUnavailableTemporary),
+      },
       "radar_point_count": len(rr.points),
       "services": services,
     })
@@ -170,7 +175,14 @@ class DPathRadarD:
     previous_valid = self.radar_state_valid
     self.radar_state_valid = sm.all_checks()
     if self.log_input_health and previous_valid and not self.radar_state_valid:
-      self._log_invalid_input_transition(sm, rr)
+      # TEMPORARY BOSCH RADARD HEALTH DIAGNOSTIC: diagnostics must never interrupt radarState publication.
+      try:
+        self._log_invalid_input_transition(sm, rr)
+      except Exception:
+        try:
+          cloudlog.exception("temporary Bosch radard input health diagnostic failed")
+        except Exception:
+          pass
     # Reuse the builder like conventional radard. Reallocating every 20 Hz
     # frame is measurable on device and does not change any published field.
     self.radar_state.mdMonoTime = sm.logMonoTime["modelV2"]
