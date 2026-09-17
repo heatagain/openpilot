@@ -3584,6 +3584,7 @@ class BoschMirrorShadowRelation:
   last_ns: int
   confirmations: int
   active: bool
+  active_since_ns: int | None
   age_a: int
   age_b: int
   d_rel_a: float
@@ -3631,6 +3632,20 @@ class BoschFalseAnchorShadowDecision:
   newborn_v_rel: float | None
   newborn_world_speed: float | None
   newborn_bearing: float | None
+  ancestry_enter_ns: int
+  newborn_birth_ns: int
+  b1_relation_start_ns: int
+
+
+@dataclass(frozen=True)
+class _BoschFalseAnchorChainState:
+  relation_key: tuple[int, int]
+  root_pid: int
+  anchor_pid: int
+  newborn_pid: int
+  ancestry_enter_ns: int
+  newborn_birth_ns: int
+  b1_relation_start_ns: int
 
 
 class _BoschMirrorFamilyResearchShadow:
@@ -3639,7 +3654,7 @@ class _BoschMirrorFamilyResearchShadow:
   def __init__(self, enabled=True):
     self.enabled = bool(enabled)
     self.relations: dict[tuple[int, int], BoschMirrorShadowRelation] = {}
-    self.chains: dict[int, tuple[tuple[int, int], int]] = {}
+    self.chains: dict[int, _BoschFalseAnchorChainState] = {}
     self.last_ns = None
     self.last_relation_decisions: tuple[BoschMirrorShadowDecision, ...] = ()
     self.last_chain_decisions: tuple[BoschFalseAnchorShadowDecision, ...] = ()
@@ -3671,12 +3686,15 @@ class _BoschMirrorFamilyResearchShadow:
       0 < timestamp_ns-prior.last_ns <= BOSCH_MIRROR_SHADOW_MAX_GAP_NS)
     confirmations = prior.confirmations + 1 if continuous and prior.clone_type == clone_type else 1
     required = BOSCH_CLONE_SHADOW_CONFIRMATIONS[clone_type]
+    continued_active = bool(continuous and prior and prior.active and prior.clone_type == clone_type)
+    active = continued_active or confirmations >= required
+    active_since_ns = prior.active_since_ns if continued_active else (timestamp_ns if active else None)
     return key, BoschMirrorShadowRelation(
       clone_type,
       a.physical_track_id, b.physical_track_id, self._raw_ids(a), self._raw_ids(b),
       a.representative_raw_track_id, b.representative_raw_track_id,
       prior.first_ns if continuous else timestamp_ns, timestamp_ns, confirmations,
-      bool(continuous and prior and prior.active and prior.clone_type == clone_type) or confirmations >= required,
+      active, active_since_ns,
       a.age_scans, b.age_scans, a.d_rel, b.d_rel, a.y_rel, b.y_rel,
       dpaths[a.physical_track_id], dpaths[b.physical_track_id], a.v_rel, b.v_rel,
       self._world_speed(a, v_ego, yaw), self._world_speed(b, v_ego, yaw),
@@ -3841,7 +3859,8 @@ class _BoschMirrorFamilyResearchShadow:
     next_chains = {}
     release_reasons = {decision.newborn_pid: decision.release_reason
                        for decision in family.last_decisions if decision.action in ('RELEASE', 'HANDOFF')}
-    for newborn_pid, (relation_key, anchor_pid) in self.chains.items():
+    for newborn_pid, chain in self.chains.items():
+      relation_key, anchor_pid = chain.relation_key, chain.anchor_pid
       b1 = b1_states.get(newborn_pid)
       relation = active_relations.get(relation_key)
       if b1 is None:
@@ -3849,44 +3868,50 @@ class _BoschMirrorFamilyResearchShadow:
         if old is not None:
           decisions.append(self._chain_decision(
             timestamp_ns, 'EXIT', release_reasons.get(newborn_pid, 'B1_RELATION_END'),
-            old, anchor_pid, newborn_pid, present, v_ego, yaw, path))
+            old, chain, present, v_ego, yaw, path))
       elif relation is None or b1.anchor_pid != anchor_pid:
         old = exited_relations.get(relation_key)
         if old is not None:
           decisions.append(self._chain_decision(
-            timestamp_ns, 'EXIT', 'MIRROR_ANCESTRY_END', old, anchor_pid,
-            newborn_pid, present, v_ego, yaw, path))
+            timestamp_ns, 'EXIT', 'MIRROR_ANCESTRY_END', old, chain,
+            present, v_ego, yaw, path))
       else:
-        next_chains[newborn_pid] = (relation_key, anchor_pid)
+        next_chains[newborn_pid] = chain
     for newborn_pid, b1 in b1_states.items():
       if newborn_pid in next_chains:
         continue
       relation_item = next(((key, state) for key, state in active_relations.items()
-                            if b1.anchor_pid in key and state.first_ns < timestamp_ns), None)
+                            if (b1.anchor_pid in key and newborn_pid not in key and
+                                state.active_since_ns is not None and state.active_since_ns < b1.first_ns)), None)
       if relation_item is None:
         continue
       key, relation = relation_item
-      next_chains[newborn_pid] = (key, b1.anchor_pid)
+      root_pid = relation.pid_b if b1.anchor_pid == relation.pid_a else relation.pid_a
+      if len({root_pid, b1.anchor_pid, newborn_pid}) != 3:
+        continue
+      chain = _BoschFalseAnchorChainState(
+        key, root_pid, b1.anchor_pid, newborn_pid, relation.active_since_ns,
+        b1.first_ns, b1.first_ns)
+      next_chains[newborn_pid] = chain
       decisions.append(self._chain_decision(
         timestamp_ns, 'ENTER', 'UNRESOLVED_MIRROR_ANCESTRY', relation,
-        b1.anchor_pid, newborn_pid, present, v_ego, yaw, path))
+        chain, present, v_ego, yaw, path))
     self.chains = next_chains
     self.last_chain_decisions = tuple(decisions)
 
   @staticmethod
-  def _chain_decision(timestamp_ns, action, reason, relation, anchor_pid, newborn_pid,
-                      present, v_ego, yaw, path):
-    root_pid = relation.pid_b if anchor_pid == relation.pid_a else relation.pid_a
-    obj = present.get(newborn_pid)
+  def _chain_decision(timestamp_ns, action, reason, relation, chain, present, v_ego, yaw, path):
+    obj = present.get(chain.newborn_pid)
     return BoschFalseAnchorShadowDecision(
-      timestamp_ns, action, reason, relation, root_pid, anchor_pid, newborn_pid,
+      timestamp_ns, action, reason, relation, chain.root_pid, chain.anchor_pid, chain.newborn_pid,
       obj.members[0].raw_track_id if obj is not None and len(obj.members) == 1 else -1,
       obj.age_scans if obj is not None else -1,
       obj.d_rel if obj is not None else None, obj.y_rel if obj is not None else None,
       _BoschFamilyCompanionFilter._path_offset(obj, path) if obj is not None else None,
       obj.v_rel if obj is not None else None,
       obj.v_rel+v_ego-yaw*obj.y_rel if obj is not None else None,
-      _BoschMirrorFamilyResearchShadow._bearing(obj) if obj is not None else None)
+      _BoschMirrorFamilyResearchShadow._bearing(obj) if obj is not None else None,
+      chain.ancestry_enter_ns, chain.newborn_birth_ns, chain.b1_relation_start_ns)
 
 
 @dataclass
@@ -5074,7 +5099,8 @@ class BoschRadarProvider:
                f'BOSCH_CLONE_CANDIDATE_{decision.action}')
       researchlog.debug(
         f'BOSCH_RESEARCH event={event} cloneType={state.clone_type} ns={decision.timestamp_ns} '
-        f'reason={decision.reason} firstNs={state.first_ns} confirmations={state.confirmations} '
+        f'reason={decision.reason} firstNs={state.first_ns} activeSinceNs={state.active_since_ns} '
+        f'confirmations={state.confirmations} '
         f'pidA={state.pid_a} rawA={",".join(map(str, state.raw_a))} repA={state.representative_a} ageA={state.age_a} '
         f'pidB={state.pid_b} rawB={",".join(map(str, state.raw_b))} repB={state.representative_b} ageB={state.age_b} '
         f'dRelA={state.d_rel_a} dRelB={state.d_rel_b} yRelA={state.y_rel_a} yRelB={state.y_rel_b} '
@@ -5099,6 +5125,8 @@ class BoschRadarProvider:
         f'pidA={decision.root_pid} rawA={",".join(map(str, state.raw_a if root_is_a else state.raw_b))} '
         f'pidB={decision.anchor_pid} rawB={",".join(map(str, state.raw_a if anchor_is_a else state.raw_b))} '
         f'pidC={decision.newborn_pid} rawC={decision.newborn_raw} '
+        f'ancestryEnterNs={decision.ancestry_enter_ns} cBirthNs={decision.newborn_birth_ns} '
+        f'b1RelationStartNs={decision.b1_relation_start_ns} '
         f'ageA={state.age_a if root_is_a else state.age_b} ageB={state.age_a if anchor_is_a else state.age_b} '
         f'ageC={decision.newborn_age} dRelC={decision.newborn_d_rel} yRelC={decision.newborn_y_rel} '
         f'dPathC={decision.newborn_d_path} vRelC={decision.newborn_v_rel} '

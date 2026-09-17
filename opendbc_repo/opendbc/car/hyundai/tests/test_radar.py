@@ -1474,12 +1474,42 @@ class TestBoschMirrorFamilyResearchShadow:
       if shadow.last_relation_decisions:
         mirror_enter_ns = shadow.last_relation_decisions[-1].timestamp_ns
       if shadow.last_chain_decisions:
-        chain_enter_ns = shadow.last_chain_decisions[-1].timestamp_ns
-        assert shadow.last_chain_decisions[-1].anchor_pid == self.ANCHOR_PID
+        decision = shadow.last_chain_decisions[-1]
+        chain_enter_ns = decision.timestamp_ns
+        assert decision.anchor_pid == self.ANCHOR_PID
+        assert len({decision.root_pid, decision.anchor_pid, decision.newborn_pid}) == 3
+        assert decision.ancestry_enter_ns < decision.newborn_birth_ns
+        assert decision.ancestry_enter_ns < decision.b1_relation_start_ns
       if family.last_decisions:
         hold_ns = family.last_decisions[-1].timestamp_ns
     assert mirror_enter_ns is not None
     assert mirror_enter_ns < chain_enter_ns < hold_ns
+
+  def test_false_anchor_rejects_newborn_ancestry_and_post_birth_relation(self):
+    shadow = radar_interface_module._BoschMirrorFamilyResearchShadow()
+    family = radar_interface_module._BoschFamilyCompanionFilter(
+      radar_interface_module.BOSCH_FAMILY_COMPANION_ACTIVE)
+    for index in range(4):
+      ns, objects = self.scan(index, newborn=index == 3)
+      shadow.update(objects, ns, 30.)
+      family.update(objects, ns, 30.)
+    b1 = family._states[self.NEWBORN_PID]
+    ancestry = next(state for state in shadow.relations.values()
+                    if self.ROOT_PID in (state.pid_a, state.pid_b))
+
+    newborn_relation = replace(
+      ancestry, pid_a=self.ANCHOR_PID, pid_b=self.NEWBORN_PID,
+      active=True, active_since_ns=b1.first_ns-self.SCAN_NS)
+    shadow.relations = {(self.ANCHOR_PID, self.NEWBORN_PID): newborn_relation}
+    shadow.update_false_anchor_chains(family, objects, ns, 30.)
+    assert not shadow.chains
+    assert not shadow.last_chain_decisions
+
+    post_birth_relation = replace(ancestry, active=True, active_since_ns=b1.first_ns)
+    shadow.relations = {tuple(sorted((ancestry.pid_a, ancestry.pid_b))): post_birth_relation}
+    shadow.update_false_anchor_chains(family, objects, ns, 30.)
+    assert not shadow.chains
+    assert not shadow.last_chain_decisions
 
   def test_relation_and_chain_event_edges_expire(self):
     shadow = radar_interface_module._BoschMirrorFamilyResearchShadow()
