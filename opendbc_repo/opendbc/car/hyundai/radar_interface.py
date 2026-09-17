@@ -5041,6 +5041,8 @@ class BoschRadarProvider:
         f'{event} ns={decision.timestamp_ns} reason={decision.release_reason or "PROOF_COMPLETE"} '
         f'newborn_pid={decision.newborn_pid} newborn_raw={decision.newborn_raw_id} '
         f'anchor_pid={decision.anchor_pid} anchor_raw={",".join(map(str, decision.anchor_raw_ids))} '
+        f'newborn_last_public_track={self._shadow_last_public_track_id(decision.newborn_pid)} '
+        f'anchor_last_public_track={self._shadow_last_public_track_id(decision.anchor_pid)} '
         f'delta_d_scan1={decision.delta_d_scan1_m} delta_d_scan2={decision.delta_d_scan2_m} '
         f'delta_y_scan1={decision.delta_y_scan1_m} delta_y_scan2={decision.delta_y_scan2_m} '
         f'delta_vrel={decision.delta_vrel_mps} delta_world_speed={decision.delta_world_speed_mps} '
@@ -5074,6 +5076,11 @@ class BoschRadarProvider:
       return 'B1_HELD'
     return 'PUBLICATION_ELIGIBLE'
 
+  def _shadow_last_public_track_id(self, pid):
+    # Diagnostic read only. Alias allocation remains at the native publication
+    # boundary; research logging never creates, releases, or changes a binding.
+    return self.publication_aliases.physical_to_alias.get(pid, -1)
+
   def _shadow_b1_state(self, pid):
     if pid in self.family_companion._states:
       return 'NEWBORN'
@@ -5103,6 +5110,8 @@ class BoschRadarProvider:
         f'confirmations={state.confirmations} '
         f'pidA={state.pid_a} rawA={",".join(map(str, state.raw_a))} repA={state.representative_a} ageA={state.age_a} '
         f'pidB={state.pid_b} rawB={",".join(map(str, state.raw_b))} repB={state.representative_b} ageB={state.age_b} '
+        f'lastPublicTrackA={self._shadow_last_public_track_id(state.pid_a)} '
+        f'lastPublicTrackB={self._shadow_last_public_track_id(state.pid_b)} '
         f'dRelA={state.d_rel_a} dRelB={state.d_rel_b} yRelA={state.y_rel_a} yRelB={state.y_rel_b} '
         f'dPathA={state.d_path_a} dPathB={state.d_path_b} vRelA={state.v_rel_a} vRelB={state.v_rel_b} '
         f'worldA={state.world_speed_a} worldB={state.world_speed_b} bearingA={state.bearing_a} bearingB={state.bearing_b} '
@@ -5125,6 +5134,9 @@ class BoschRadarProvider:
         f'pidA={decision.root_pid} rawA={",".join(map(str, state.raw_a if root_is_a else state.raw_b))} '
         f'pidB={decision.anchor_pid} rawB={",".join(map(str, state.raw_a if anchor_is_a else state.raw_b))} '
         f'pidC={decision.newborn_pid} rawC={decision.newborn_raw} '
+        f'lastPublicTrackA={self._shadow_last_public_track_id(decision.root_pid)} '
+        f'lastPublicTrackB={self._shadow_last_public_track_id(decision.anchor_pid)} '
+        f'lastPublicTrackC={self._shadow_last_public_track_id(decision.newborn_pid)} '
         f'ancestryEnterNs={decision.ancestry_enter_ns} cBirthNs={decision.newborn_birth_ns} '
         f'b1RelationStartNs={decision.b1_relation_start_ns} '
         f'ageA={state.age_a if root_is_a else state.age_b} ageB={state.age_a if anchor_is_a else state.age_b} '
