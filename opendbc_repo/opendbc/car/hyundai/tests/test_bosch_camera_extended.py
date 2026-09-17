@@ -872,11 +872,7 @@ class TestBoschActiveTestPublication:
         assert result.points[0].to_dict() == baseline().points[0].to_dict()
       assert target not in b.free_aliases
     assert visible == [True, True, False, False, False, True, True, True, False]
-    assert messages and all('mode=ACTIVE_TEST' in line and 'rep_pid=' in line for line in messages)
-    assert sum('suppressed_pids=1010690' in line for line in messages) == 4
-    perf = interfaces[1].bosch.perf_message()
-    assert 'camera_ext_test_scans=9' in perf and 'camera_ext_suppressed_points=4' in perf
-    assert 'camera_ext_maturity_resets=1' in perf
+    assert messages == []
 
   def test_route254_original_policy_keeps_24m_lateral_member(self):
     p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)

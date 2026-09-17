@@ -4,7 +4,6 @@ import os
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
-from itertools import combinations
 from numbers import Integral, Real
 from typing import Sequence
 
@@ -798,15 +797,9 @@ class BoschCameraExtendedGrouping:
     self.max_state_count = 0
     self.representative_switches = 0
     self.max_representative_jump = [0.0, 0.0, 0.0]
-    self.perf_sum = Counter()
-    self.perf_max = Counter()
-    self.perf_scans = 0
     self.mature_groups = ()
     self.maturity_resets = 0
     self.last_maturity_resets = 0
-    self.test_scans = self.test_group_scans = self.test_mature_scans = 0
-    self.test_maturity_reached = 0
-    self.test_full_groups = self.test_coast_groups = 0
     self.last_camera_ns = None
     self.last_truck_edge_count = 0
     self.max_truck_pair_state = 0
@@ -1184,14 +1177,9 @@ class BoschCameraExtendedGrouping:
     self.last_truck_recovery_count = recovered
     return strict
 
-  def _record_perf(self, name, elapsed):
-    self.perf_sum[name] += elapsed
-    self.perf_max[name] = max(self.perf_max[name], elapsed)
-
   def update(self, timestamp_ns, objects, v_ego, yaw_rate=None):
     if self.mode == BOSCH_CAMERA_EXTENDED_OFF:
       return objects
-    start = time.perf_counter_ns()
     prior_maturity = self.histories
     self.mature_groups = ()
     curve_clock_reset = self.last_ns is not None and timestamp_ns <= self.last_ns
@@ -1221,8 +1209,6 @@ class BoschCameraExtendedGrouping:
         geometry[key] = (dd, dy, dv)
         candidate_nodes.update(key)
     self.last_candidate_count = len(geometry)
-    now = time.perf_counter_ns()
-    self._record_perf('candidate', now - start)
 
     snapshot = self.camera.snapshot(timestamp_ns)
     self.last_camera_ns = snapshot[3] if snapshot is not None else None
@@ -1230,7 +1216,6 @@ class BoschCameraExtendedGrouping:
     camera_by_episode = {}
     camera_objects = ()
     camera_count = 0
-    assoc_start = now
     if snapshot is not None:
       camera_objects, camera_count, _, _ = snapshot
       camera_by_episode = {camera_objects[index].episode: camera_objects[index] for index in range(camera_count)}
@@ -1274,8 +1259,6 @@ class BoschCameraExtendedGrouping:
     self.last_camera_by_episode = camera_by_episode
     self.last_v_ego = v_ego
     self.last_yaw_rate = yaw_rate
-    now = time.perf_counter_ns()
-    self._record_perf('association', now - assoc_start)
 
     strict = {}
     strict_classes = {}
@@ -1294,7 +1277,6 @@ class BoschCameraExtendedGrouping:
     strict_classes.update((key, BOSCH_TRUCK_P2_CLASS) for key in truck_strict)
     strict_episodes.update((key, self.truck_pair_histories[key].episode) for key in truck_strict)
 
-    e2_start = time.perf_counter_ns()
     edges = dict(strict)
     next_history = {}
     coast_groups = []
@@ -1321,16 +1303,10 @@ class BoschCameraExtendedGrouping:
         coast_groups.append(members)
         next_history[members] = history
     self.last_coast_count = len(coast_groups)
-    now = time.perf_counter_ns()
-    self._record_perf('e2', now - e2_start)
 
-    group_start = now
     previous = [state.members for state in self.representatives]
     groups = self._complete_link(objects, edges, previous)
-    now = time.perf_counter_ns()
-    self._record_perf('group', now - group_start)
 
-    output_start = now
     self._choose_representatives(groups, by_pid, timestamp_ns, yaw_rate)
     mature = []
     for group in groups:
@@ -1353,8 +1329,6 @@ class BoschCameraExtendedGrouping:
             required = BOSCH_CAMERA_MATURITY_WORD1_INTERVALS
           if state.stable_intervals >= required:
             mature.append(members)
-            if prior is None or prior.stable_intervals < required:
-              self.test_maturity_reached += 1
         else:
           next_history[members] = _BoschExtendedHistory(members, episode, class_code, timestamp_ns)
       elif members not in next_history:
@@ -1382,49 +1356,8 @@ class BoschCameraExtendedGrouping:
     self.histories = next_history
     self.max_state_count = max(self.max_state_count, len(self.histories))
     self.last_groups = tuple(sorted(tuple(sorted(group)) for group in groups if len(group) > 1))
-    if self.mode == BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
-      self.test_scans += 1
-      self.test_group_scans += len(self.last_groups)
-      self.test_mature_scans += len(self.mature_groups)
-      self.test_full_groups += len(self.last_groups) - self.last_coast_count
-      self.test_coast_groups += self.last_coast_count
     # qualifier와 allocator 입력은 모든 모드에서 baseline 그대로 보존한다.
-    result = objects
-    done = time.perf_counter_ns()
-    self._record_perf('output', done - output_start)
-    self._record_perf('total', done - start)
-    self.perf_scans += 1
-    return result
-
-  def perf_fields(self):
-    count = max(self.perf_scans, 1)
-    fields = ' '.join(
-      f'camera_ext_{name}_ms_avg={self.perf_sum[name] * 1e-6 / count:.3f} '
-      f'camera_ext_{name}_ms_max={self.perf_max[name] * 1e-6:.3f}'
-      for name in ('candidate', 'association', 'group', 'e2', 'output', 'total'))
-    fields += (f' camera_ext_candidates={self.last_candidate_count} camera_ext_nodes={self.last_association_count}'
-               f' camera_ext_coasts={self.last_coast_count} camera_ext_state_peak={self.max_state_count}'
-               f' camera_ext_truck_edges={self.last_truck_edge_count}'
-               f' camera_ext_truck_a0_recoveries={self.last_truck_recovery_count}'
-               f' camera_ext_truck_state_peak={self.max_truck_pair_state}'
-               f' camera_ext_rep_switches={self.representative_switches}'
-               f' camera_ext_test_scans={self.test_scans}'
-               f' camera_ext_group_scans={self.test_group_scans} camera_ext_mature_group_scans={self.test_mature_scans}'
-               f' camera_ext_maturity_reached={self.test_maturity_reached}'
-               f' camera_ext_full_group_scans={self.test_full_groups} camera_ext_coast_group_scans={self.test_coast_groups}'
-               f' camera_ext_groups={len(self.last_groups)} camera_ext_mature_groups={len(self.mature_groups)}'
-               f' camera_ext_maturity_resets={self.maturity_resets}'
-               f' camera_ext_camera_age_ms={(self.last_ns - self.last_camera_ns) * 1e-6 if self.last_camera_ns is not None else -1:.3f}'
-               f' camera_ext_camera_reject={self.camera.rejected_cycles}')
-    fields += (f' camera_curve_reacquire_mode={self.curve_reacquire_mode}'
-               f' camera_curve_reacquire_successes={self.curve_reacquire_successes}'
-               f' camera_curve_reacquire_state={len(self.curve_reacquire_histories)}'
-               f' camera_curve_reacquire_state_peak={self.curve_reacquire_state_peak}'
-               f' camera_curve_reacquire_last={len(self.last_curve_reacquire)}')
-    self.perf_sum.clear()
-    self.perf_max.clear()
-    self.perf_scans = 0
-    return fields
+    return objects
 
 
 def bosch_numpy_linear_sum_assignment(cost_matrix, *, potentials=False):
@@ -3312,13 +3245,9 @@ class BoschPhysicalTracker:
     self.group_manager.trace_decisions = bool(enabled)
 
   def update(self, timestamp_ns, detections, *, yaw_rate=None, v_ego=math.nan, oem_slot=None, vision=()):
-    start_ns = time.perf_counter_ns()
     raw = self.raw_manager.update(timestamp_ns, detections, yaw_rate=yaw_rate)
-    raw_done_ns = time.perf_counter_ns()
     result = self.group_manager.update(timestamp_ns, raw, yaw_rate=yaw_rate, v_ego=v_ego,
-                                      oem_slot=oem_slot, vision=vision)
-    self.raw_elapsed_ns = raw_done_ns - start_ns
-    self.physical_elapsed_ns = time.perf_counter_ns() - raw_done_ns
+                                       oem_slot=oem_slot, vision=vision)
     return result
 
 
@@ -3715,7 +3644,6 @@ class _BoschMirrorFamilyResearchShadow:
     self.last_relation_decisions: tuple[BoschMirrorShadowDecision, ...] = ()
     self.last_chain_decisions: tuple[BoschFalseAnchorShadowDecision, ...] = ()
     self.pair_evaluations_last = self.pair_evaluations_total = self.pair_evaluations_peak = 0
-    self.elapsed_ns_last = self.elapsed_ns_total = self.elapsed_ns_max = 0
 
   @staticmethod
   def _bearing(obj):
@@ -3827,7 +3755,6 @@ class _BoschMirrorFamilyResearchShadow:
 
   def update(self, objects, timestamp_ns, v_ego, *, yaw_rate=None, path=(),
              strict_associations=None, oem_pids=()):
-    start_ns = time.perf_counter_ns()
     self.last_relation_decisions = ()
     self.last_chain_decisions = ()
     self.pair_evaluations_last = 0
@@ -3898,10 +3825,6 @@ class _BoschMirrorFamilyResearchShadow:
     self.last_relation_decisions = tuple(decisions)
     self.pair_evaluations_total += self.pair_evaluations_last
     self.pair_evaluations_peak = max(self.pair_evaluations_peak, self.pair_evaluations_last)
-    elapsed = time.perf_counter_ns()-start_ns
-    self.elapsed_ns_last = elapsed
-    self.elapsed_ns_total += elapsed
-    self.elapsed_ns_max = max(self.elapsed_ns_max, elapsed)
 
   def update_false_anchor_chains(self, family, objects, timestamp_ns, v_ego, *, yaw_rate=None, path=()):
     if not self.enabled:
@@ -4586,7 +4509,6 @@ class BoschRadarProvider:
     self.qualifier = _BoschPublicationPassThrough() if qualification else None
     self.family_companion = _BoschFamilyCompanionFilter(family_companion_mode)
     self.mirror_research_shadow = _BoschMirrorFamilyResearchShadow(mirror_research_shadow)
-    self._research_baseline_bucket = None
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
     self.oem_gate = _BoschOemValidationGate(oem_gate_mode)
     self.scc_obj_valid = None
@@ -4610,7 +4532,6 @@ class BoschRadarProvider:
     self._debug_gate_suppress = frozenset()
     self._debug_gate_reasons = {}
     self._debug_oem_intent = None
-    self._debug_p91_ns = 0
     self._debug_timeout = False
     self._frames = []
     self._anchors = []
@@ -4620,8 +4541,6 @@ class BoschRadarProvider:
     self._last_closed_anchor_ns = None
     self._last_output_ns = None
     self._pending_error = False
-    self._perf_raw = self._perf_qualified = 0
-    self.test_publications = self.test_suppressed_points = self.test_active_groups = 0
     self.test_last_suppressed = ()
     self.test_last_active_groups = 0
     self.last_oem_state = BOSCH_OEM_STATE_NONE
@@ -4636,7 +4555,6 @@ class BoschRadarProvider:
     self.oem_nearer_corrections = 0
     self.oem_nearer_scans = 0
     self.last_oem_nearer = ()
-    self._reset_perf()
 
   def _companion_pairs_update(self, objects):
     """같은 scan에 대해 한 번만 돌며 (먼 PID -> 가까운 PID) 지연 대상 쌍을 만든다."""
@@ -4805,8 +4723,6 @@ class BoschRadarProvider:
     ext = self.camera_extended
     if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
       return self.family_companion.publication_view(self._final_view(objects))
-    if timestamp_ns is not None:
-      self.test_publications += 1
     if not ext.mature_groups or not objects:
       self.test_last_suppressed = ()
       self.test_last_active_groups = 0
@@ -4814,126 +4730,18 @@ class BoschRadarProvider:
     # 다른 scan의 tuple 또는 qualification에서 대표가 빠진 그룹은 baseline으로 연다.
     by_pid = {obj.physical_track_id: obj for obj in objects}
     suppressed = set()
-    active = []
+    active_groups = 0
     for rep in ext.representatives:
       members = tuple(sorted(rep.members))
       if members not in ext.mature_groups or not all(
           p in by_pid and by_pid[p].timestamp_ns == ext.last_ns for p in members):
         continue
       suppressed.update(p for p in members if p != rep.representative_pid)
-      active.append(rep)
+      active_groups += 1
     self.test_last_suppressed = tuple(sorted(suppressed))
-    self.test_last_active_groups = len(active)
-    if timestamp_ns is not None:
-      self.test_suppressed_points += len(suppressed)
-      self.test_active_groups += len(active)
-      # 기존 carlog/logMessage 경로. 활성 publication만 기록하며 payload는 현재 그룹으로 제한한다.
-      # 각 PID/alias/좌표와 ns를 CAN, liveTracks, radarState와 결합해 재등장 이력을 offline 복원한다.
-      for rep in active:
-        members = tuple(sorted(rep.members))
-        state = ext.histories[members]
-        snapshot = ext.camera.snapshot(ext.last_ns)
-        camera_id = next((c.obj_id for c in snapshot[0][:snapshot[1]] if c.episode == state.cam_key), -1) if snapshot else -1
-        detail = ';'.join(f'{p}:{self.publication_aliases.physical_to_alias.get(p, -1)}:'
-                          f'{by_pid[p].d_rel}:{by_pid[p].y_rel}:{by_pid[p].v_rel}' for p in members)
-        researchlog.debug(f'BoschActiveTest mode=ACTIVE_TEST ns={timestamp_ns} scan_ns={ext.last_ns} '
-                          f'maturity={state.stable_intervals} rep_pid={rep.representative_pid} '
-                          f'suppressed_pids={",".join(str(p) for p in members if p != rep.representative_pid)} '
-                          f'suppressed_count={len(members) - 1} camera_id={camera_id} episode={state.cam_key} '
-                          f'camera_ns={ext.last_camera_ns} members_pid_alias_d_y_v={detail}')
+    self.test_last_active_groups = active_groups
     return self.family_companion.publication_view(self._final_view(
       tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects))
-
-  def _reset_perf(self):
-    self._perf_scans = 0
-    self._perf_raw_sum = self._perf_raw_max = 0
-    self._perf_physical_sum = self._perf_physical_max = 0
-    self._perf_qualify_sum = self._perf_qualify_max = 0
-    self._perf_gate_sum = self._perf_gate_max = 0
-    self._perf_total_sum = self._perf_total_max = 0
-    self._perf_native_count = self._perf_native_sum = self._perf_native_max = 0
-    self._perf_raw_pairs = self._perf_raw_possible = 0
-    self._perf_physical_pairs = self._perf_physical_possible = 0
-    self._perf_components = self._perf_largest_component = self._perf_fallbacks = self._perf_conflicts = 0
-    self._perf_ties = 0
-    self._perf_camera_decode_count = self._perf_camera_decode_sum = self._perf_camera_decode_max = 0
-    self._perf_p91_sum = self._perf_p91_max = 0
-    if hasattr(self, 'mirror_research_shadow'):
-      self.mirror_research_shadow.elapsed_ns_total = self.mirror_research_shadow.elapsed_ns_max = 0
-
-  def record_native_time(self, elapsed_ns):
-    self._perf_native_count += 1
-    self._perf_native_sum += elapsed_ns
-    self._perf_native_max = max(self._perf_native_max, elapsed_ns)
-
-  def perf_message(self):
-    """Format/reset only at the 1 Hz logging boundary, never once per scan.
-
-    total is decode + tracking + qualification per completed scan. Native list
-    append is measured separately at its publication cadence. This excludes
-    other card work, log I/O and modeld; it is not a whole-device CPU estimate.
-    Pair/component/conflict values are interval totals, object counts are last.
-    """
-    scale = 1e-6 / max(self._perf_scans, 1)
-    raw = self.tracker.raw_manager
-    physical = self.tracker.group_manager
-    backend = 'numpy' if bosch_linear_sum_assignment is bosch_numpy_linear_sum_assignment else 'scipy'
-    extended_fields = self.camera_extended.perf_fields() if self.camera_extended.mode != BOSCH_CAMERA_EXTENDED_OFF else ''
-    message = (
-      f'BoschPerf solver={backend} scans={self._perf_scans} raw={self._perf_raw} raw_active={raw.active_count} '
-      f'physical={len(self._debug_objects)} qualified={self._perf_qualified} '
-      f'suppressed={len(self._debug_objects) - self._perf_qualified} '
-      f'multi={physical.last_multi_count} '
-      f'pairs_raw={self._perf_raw_pairs}/{self._perf_raw_possible} '
-      f'pairs_physical={self._perf_physical_pairs}/{self._perf_physical_possible} '
-      f'raw_ms_avg={self._perf_raw_sum * scale:.3f} raw_ms_max={self._perf_raw_max * 1e-6:.3f} '
-      f'physical_ms_avg={self._perf_physical_sum * scale:.3f} physical_ms_max={self._perf_physical_max * 1e-6:.3f} '
-      f'qualify_ms_avg={self._perf_qualify_sum * scale:.3f} qualify_ms_max={self._perf_qualify_max * 1e-6:.3f} '
-      f'oemgate={self.oem_gate.mode} oemstate={self._debug_oem_state} '
-      f'oemgate_withheld={self.oem_gate.publication_withheld} oemgate_state={self.oem_gate.state_peak} '
-      f'oemgate_ms_avg={self._perf_gate_sum * scale:.3f} oemgate_ms_max={self._perf_gate_max * 1e-6:.3f} '
-      f'total_ms_avg={self._perf_total_sum * scale:.3f} total_ms_max={self._perf_total_max * 1e-6:.3f} '
-      f'native_ms_avg={self._perf_native_sum * 1e-6 / max(self._perf_native_count, 1):.3f} '
-      f'native_ms_max={self._perf_native_max * 1e-6:.3f} '
-      f'raw_components={self._perf_components} largest_raw_component={self._perf_largest_component} '
-      f'raw_fallbacks={self._perf_fallbacks} raw_ties={self._perf_ties} '
-      f'physical_conflicts={self._perf_conflicts} '
-      f'alias_usage={self.publication_aliases.current_usage}/{BOSCH_PUBLICATION_ALIAS_COUNT} '
-      f'alias_peak={self.publication_aliases.peak_usage} alias_denial={self.publication_aliases.denial_count} '
-      f'alias_grace_evictions={self.publication_aliases.grace_eviction_count} '
-      f'can_error={int(self.can_error)} '
-      f'camera_decode_ms_avg={self._perf_camera_decode_sum * 1e-6 / max(self._perf_camera_decode_count, 1):.3f} '
-      f'camera_decode_ms_max={self._perf_camera_decode_max * 1e-6:.3f} {extended_fields}'
-      f' camera_ext_mode={self.camera_extended.mode} camera_ext_test_publications={self.test_publications}'
-      f' camera_ext_suppressed_points={self.test_suppressed_points} camera_ext_active_group_publications={self.test_active_groups}'
-      f' camera_ext_active_groups={self.test_last_active_groups} camera_ext_suppressed_pid_count={len(self.test_last_suppressed)}'
-      f' p91_mode={self.p91.mode} p91_parent_pool={self.p91.parent_pool_last}/{self.p91.parent_pool_peak}'
-      f' p91_pairs={self.p91.pair_evaluations_last}/{self.p91.pair_evaluations_peak}'
-      f' p91_states={len(self.p91._states)}/{self.p91.state_peak}'
-      f' p91_would_suppress={len(self.p91.would_suppress)} p91_publication_suppressed={self.p91.publication_suppressed}'
-      f' p91_ms_avg={self._perf_p91_sum * scale:.3f} p91_ms_max={self._perf_p91_max * 1e-6:.3f}'
-      f' provisional_active={len(physical.provisional_bundles)}'
-      f' provisional_created={physical.provisional_created}'
-      f' provisional_coherent={physical.provisional_coherent}'
-      f' provisional_handoffs={physical.provisional_handoffs}'
-      f' provisional_releases={physical.provisional_releases}'
-      f' family_mode={self.family_companion.mode}'
-      f' family_active={len(self.family_companion.would_suppress)}'
-      f' family_states={len(self.family_companion._states)}/{self.family_companion.state_peak}'
-      f' family_pairs={self.family_companion.pair_evaluations_last}/{self.family_companion.pair_evaluations_peak}'
-      f' family_holds={self.family_companion.holds}'
-      f' family_releases={self.family_companion.releases}'
-      f' family_handoffs={self.family_companion.handoffs}'
-      f' family_publication_suppressed={self.family_companion.publication_suppressed}'
-      f' mirror_shadow={int(self.mirror_research_shadow.enabled)}'
-      f' mirror_shadow_relations={sum(state.active for state in self.mirror_research_shadow.relations.values())}'
-      f' mirror_shadow_chains={len(self.mirror_research_shadow.chains)}'
-      f' mirror_shadow_pairs={self.mirror_research_shadow.pair_evaluations_last}/{self.mirror_research_shadow.pair_evaluations_peak}'
-      f' mirror_shadow_ms_avg={self.mirror_research_shadow.elapsed_ns_total * scale:.3f}'
-      f' mirror_shadow_ms_max={self.mirror_research_shadow.elapsed_ns_max * 1e-6:.3f}'
-    )
-    self._reset_perf()
-    return message
 
   @property
   def slot_to_ids(self):
@@ -4942,8 +4750,7 @@ class BoschRadarProvider:
 
   @property
   def debug_snapshot(self):
-    # The production caller logs at 1 Hz; no nested representation is built on
-    # the 10 Hz scan path. Replay can still request the full mapping explicitly.
+    # Replay can request the full mapping explicitly.
     if self._debug_timeout:
       return {'bus': self.bus, 'timeout': True, 'last_scan_timestamp_ns': self.last_scan_timestamp_ns,
               'objects': [], 'slot_to_ids': {}}
@@ -4959,7 +4766,6 @@ class BoschRadarProvider:
       'processed_target_pids': sorted(self._debug_processed_pids),
       'p91_mode': self.p91.mode, 'p91_would_suppress': sorted(self.p91.would_suppress),
       'p91_decisions': self.p91.decisions,
-      'p91_elapsed_ns': self._debug_p91_ns,
       'oem_state': self._debug_oem_state, 'oem_word0_active': self._debug_word0_active,
       'oem_word1_active': self._debug_word1_active, 'scc_obj_valid': self._scc_validity(self.last_scan_timestamp_ns or 0),
       'oem_intent_mps2': self._debug_oem_intent, 'oem_gate_mode': self.oem_gate.mode,
@@ -5024,7 +4830,6 @@ class BoschRadarProvider:
     camera = self.camera_extended.camera
     camera_bus = self.camera_bus
     scc_bus = self.scc_bus
-    camera_start_ns = 0
     frames = self._frames
     anchors = self._anchors
     order = self._order
@@ -5034,8 +4839,6 @@ class BoschRadarProvider:
         address = message[0]
         if (camera is not None and message[2] == camera_bus and
             BOSCH_CAMERA_HEADER <= address <= BOSCH_CAMERA_LAST_FAMILY):
-          if not camera_start_ns:
-            camera_start_ns = time.perf_counter_ns()
           if future:
             camera.fault_ns = timestamp_ns
           else:
@@ -5067,11 +4870,6 @@ class BoschRadarProvider:
           frames.append(_BoschCanFrame(timestamp_ns, address, payload, order))
           order += 1
     self._order = order
-    if camera_start_ns:
-      elapsed = time.perf_counter_ns() - camera_start_ns
-      self._perf_camera_decode_count += 1
-      self._perf_camera_decode_sum += elapsed
-      self._perf_camera_decode_max = max(self._perf_camera_decode_max, elapsed)
     if len(self._anchors) > 1:
       self._anchors.sort()
     output = None
@@ -5125,13 +4923,11 @@ class BoschRadarProvider:
       self.oem_gate.update((), now_ns, v_ego, state=BOSCH_OEM_STATE_NONE)
       self._debug_gate_suppress = frozenset()
       self._debug_gate_reasons = {}
-      self._perf_raw = self._perf_qualified = 0
       self._last_output_ns = now_ns
       return ()
     return output
 
   def _finish_scan(self, phase_ns, tick, frames, v_ego, yaw_rate_left, vision, path=()):
-    start_ns = time.perf_counter_ns()
     bucket = {}
     malformed = self._pending_error or any(len(frame.payload) != 8 for frame in frames)
     self._pending_error = False
@@ -5160,7 +4956,6 @@ class BoschRadarProvider:
       if availability_ns <= previous_ns:
         self.can_error = True
         self._debug_objects = ()
-        self._perf_raw = self._perf_qualified = 0
         return ()
       fresh = [detection for detection in detections if detection.timestamp_ns > previous_ns]
       malformed |= len(fresh) != len(detections)
@@ -5190,7 +4985,6 @@ class BoschRadarProvider:
     self._debug_processed_word = processed_word
     self._debug_timeout = False
     self.camera_extended.update(availability_ns, objects, v_ego, yaw_rate_left)
-    qualify_start_ns = time.perf_counter_ns()
     # 모든 모드에서 qualifier 이력과 alias 할당에는 동일한 physical 집합을 전달한다.
     # P91 ACTIVE veto는 allocator 이후 최종 publication에만 적용한다.
     qualified = (self.qualifier.update(objects, availability_ns, v_ego, path, yaw_rate=yaw_rate_left)
@@ -5230,47 +5024,16 @@ class BoschRadarProvider:
         f'camera_coarse={int(decision.camera_coarse)} camera_strict={int(decision.camera_strict)} '
         f'oem={int(decision.oem_identity)} dPath={decision.d_path_m} '
         f'public_suppressed={int(decision.public_suppressed)}')
-    gate_start_ns = time.perf_counter_ns()
     self.oem_gate.update(qualified, availability_ns, v_ego, state=oem_state,
                          word0_pids=processed_pids, oem_valid=scc_valid)
-    gate_ns = time.perf_counter_ns() - gate_start_ns
     self._debug_gate_suppress = self.oem_gate.would_withhold
     self._debug_gate_reasons = self.oem_gate.reasons
     self._debug_oem_intent = self.oem_gate.intent.median(availability_ns)
-    self._perf_gate_sum += gate_ns
-    self._perf_gate_max = max(self._perf_gate_max, gate_ns)
     # word0 alone no longer counts as P91 support. Only a word0 record that the
     # OEM also validated in the same scan can clear a clone suspicion.
     p91_word0 = processed_pids if oem_state == BOSCH_OEM_STATE_VALIDATED and scc_valid is not False else frozenset()
-    p91_start_ns = time.perf_counter_ns()
     self.p91.update(qualified, availability_ns, v_ego, word0_pids=p91_word0, yaw_rate=yaw_rate_left)
-    p91_ns = time.perf_counter_ns() - p91_start_ns
     self._log_research_shadow_events(qualified)
-    self._debug_p91_ns = p91_ns
-    self._perf_p91_sum += p91_ns
-    self._perf_p91_max = max(self._perf_p91_max, p91_ns)
-    done_ns = time.perf_counter_ns()
-    qualify_ns, total_ns = done_ns - qualify_start_ns, done_ns - start_ns
-    raw, physical = self.tracker.raw_manager, self.tracker.group_manager
-    self._perf_scans += 1
-    self._perf_raw, self._perf_qualified = len(detections), len(qualified)
-    self._perf_raw_sum += self.tracker.raw_elapsed_ns
-    self._perf_raw_max = max(self._perf_raw_max, self.tracker.raw_elapsed_ns)
-    self._perf_physical_sum += self.tracker.physical_elapsed_ns
-    self._perf_physical_max = max(self._perf_physical_max, self.tracker.physical_elapsed_ns)
-    self._perf_qualify_sum += qualify_ns
-    self._perf_qualify_max = max(self._perf_qualify_max, qualify_ns)
-    self._perf_total_sum += total_ns
-    self._perf_total_max = max(self._perf_total_max, total_ns)
-    self._perf_raw_pairs += raw.last_pair_candidates
-    self._perf_raw_possible += raw.last_pair_possible
-    self._perf_physical_pairs += physical.last_pair_candidates
-    self._perf_physical_possible += physical.last_pair_possible
-    self._perf_components += raw.last_component_count
-    self._perf_largest_component = max(self._perf_largest_component, raw.last_largest_component)
-    self._perf_fallbacks += int(raw.last_solver_fallback)
-    self._perf_ties += raw.last_tied_components
-    self._perf_conflicts += physical.last_conflicts
     return qualified
 
   def _shadow_publication_state(self, pid, qualified):
@@ -5343,21 +5106,6 @@ class BoschRadarProvider:
         f'pubA={self._shadow_publication_state(decision.root_pid, qualified)} '
         f'pubB={self._shadow_publication_state(decision.anchor_pid, qualified)} '
         f'pubC={self._shadow_publication_state(decision.newborn_pid, qualified)}')
-    # RESEARCH_SHADOW / TEMP_BOSCH_CLONE_RESEARCH: one deterministic sample per
-    # 60 s monotonic bucket (at most two rows for a segment crossing a bucket edge).
-    if shadow.last_ns is not None:
-      bucket = shadow.last_ns // 60_000_000_000
-      if bucket != self._research_baseline_bucket:
-        self._research_baseline_bucket = bucket
-        active = tuple(state for state in shadow.relations.values() if state.active)
-        published = sum(self._shadow_publication_state(obj.physical_track_id, qualified) == 'PUBLICATION_ELIGIBLE'
-                        for obj in qualified)
-        researchlog.debug(
-          f'BOSCH_RESEARCH event=BOSCH_RESEARCH_BASELINE ns={shadow.last_ns} '
-          f'objectCount={len(qualified)} publishedCount={published} '
-          f'b1ActiveCount={len(self.family_companion._states)} '
-          f'mirrorCandidateCount={sum(state.clone_type == "MIRROR" for state in active)} '
-          f'cloneCandidateCount={sum(state.clone_type != "MIRROR" for state in active)}')
 
 # End Bosch MRRevo14F passive radar
 
@@ -5395,7 +5143,6 @@ class RadarInterface(RadarInterfaceBase):
     self.bosch = None
     self._bosch_objects = ()
     self._bosch_now_ns = 0
-    self._bosch_debug_ns = 0
     self._bosch_context = None
     self._bosch_path_ns = None
     self._bosch_path_source_ns = 0
@@ -5538,12 +5285,10 @@ class RadarInterface(RadarInterfaceBase):
       scan_ns = self.bosch.last_scan_timestamp_ns
       objects = (self._bosch_objects if scan_ns is not None and 0 <= self._bosch_now_ns - scan_ns <= BOSCH_SAMPLE_HOLD_NS
                  else ())
-      start_ns = time.perf_counter_ns()
       alias = self.bosch.publication_aliases.update(
         self._bosch_now_ns, (obj.physical_track_id for obj in objects), self.bosch.tracker.group_manager.states)
       objects = self.bosch.publication_view(objects, self._bosch_now_ns)
       bosch_append_points(ret, objects, self.v_ego, self._bosch_now_ns, alias)
-      self.bosch.record_native_time(time.perf_counter_ns() - start_ns)
     return ret
 
   def update(self, can_strings):
@@ -5567,9 +5312,6 @@ class RadarInterface(RadarInterfaceBase):
       if objects is not None:
         self._bosch_objects = objects
         track_ready = True
-        if now_ns - self._bosch_debug_ns >= 1_000_000_000:
-          researchlog.debug(self.bosch.perf_message())
-          self._bosch_debug_ns = now_ns
     if self.radar_tracks and self.rcp_tracks is not None:
       vls_t = self.rcp_tracks.update(can_strings)
       self.updated_tracks.update(vls_t)

@@ -940,15 +940,6 @@ class TestBoschPublicationAlias:
     after.points[1].trackId = physical_id
     assert before.to_bytes() == after.to_bytes()
 
-  def test_perf_counters_survive_logging_reset(self):
-    provider = BoschRadarProvider(1, qualification=False)
-    provider.publication_aliases.update(0, [self.PID], {self.PID})
-    for _ in range(2):
-      message = provider.perf_message()
-      assert 'alias_usage=1/64' in message
-      assert 'alias_peak=1' in message
-      assert 'alias_denial=0' in message
-
   def test_offpath_publication_and_stale_cleanup_preserve_scc(self, monkeypatch):
     provider = BoschRadarProvider(1)
     interface = RadarInterface.__new__(RadarInterface)
@@ -1575,7 +1566,7 @@ class TestBoschMirrorFamilyResearchShadow:
     assert f'cloneType={clone_type}' in events[0]
     assert 'FALSE_CLONE' not in events[0]
 
-  def test_baseline_sampling_is_deterministic_and_sparse(self, monkeypatch):
+  def test_baseline_sampling_is_disabled(self, monkeypatch):
     provider = BoschRadarProvider(1, qualification=False, mirror_research_shadow=True)
     messages = []
     monkeypatch.setattr(radar_interface_module.researchlog, 'debug', messages.append)
@@ -1583,9 +1574,7 @@ class TestBoschMirrorFamilyResearchShadow:
       objects = (self.obj(self.ROOT_PID, 593, ns, 20, 60., .2),)
       provider.mirror_research_shadow.update(objects, ns, 30.)
       provider._log_research_shadow_events(objects)
-    baseline = [message for message in messages if 'event=BOSCH_RESEARCH_BASELINE' in message]
-    assert len(baseline) == 2
-    assert 'objectCount=1 publishedCount=1' in baseline[0]
+    assert all('event=BOSCH_RESEARCH_BASELINE' not in message for message in messages)
 
 
 class TestBoschRawAssociationTrace:
