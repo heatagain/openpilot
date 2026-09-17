@@ -838,7 +838,7 @@ class TestBoschActiveTestPublication:
       return result
     monkeypatch.setattr(module.RadarInterfaceBase, 'update_carrot', baseline)
     messages = []
-    monkeypatch.setattr(module.carlog, 'info', messages.append)
+    monkeypatch.setattr(module.researchlog, 'debug', messages.append)
     interfaces = []
     for mode in (BOSCH_CAMERA_EXTENDED_OFF, BOSCH_CAMERA_EXTENDED_ACTIVE_TEST):
       ri = RadarInterface.__new__(RadarInterface)

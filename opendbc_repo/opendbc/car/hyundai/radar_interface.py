@@ -4836,11 +4836,11 @@ class BoschRadarProvider:
         camera_id = next((c.obj_id for c in snapshot[0][:snapshot[1]] if c.episode == state.cam_key), -1) if snapshot else -1
         detail = ';'.join(f'{p}:{self.publication_aliases.physical_to_alias.get(p, -1)}:'
                           f'{by_pid[p].d_rel}:{by_pid[p].y_rel}:{by_pid[p].v_rel}' for p in members)
-        carlog.info(f'BoschActiveTest mode=ACTIVE_TEST ns={timestamp_ns} scan_ns={ext.last_ns} '
-                    f'maturity={state.stable_intervals} rep_pid={rep.representative_pid} '
-                    f'suppressed_pids={",".join(str(p) for p in members if p != rep.representative_pid)} '
-                    f'suppressed_count={len(members) - 1} camera_id={camera_id} episode={state.cam_key} '
-                    f'camera_ns={ext.last_camera_ns} members_pid_alias_d_y_v={detail}')
+        researchlog.debug(f'BoschActiveTest mode=ACTIVE_TEST ns={timestamp_ns} scan_ns={ext.last_ns} '
+                          f'maturity={state.stable_intervals} rep_pid={rep.representative_pid} '
+                          f'suppressed_pids={",".join(str(p) for p in members if p != rep.representative_pid)} '
+                          f'suppressed_count={len(members) - 1} camera_id={camera_id} episode={state.cam_key} '
+                          f'camera_ns={ext.last_camera_ns} members_pid_alias_d_y_v={detail}')
     return self.family_companion.publication_view(self._final_view(
       tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects))
 
@@ -5218,7 +5218,7 @@ class BoschRadarProvider:
       self.family_companion, qualified, availability_ns, v_ego, yaw_rate=yaw_rate_left, path=path)
     for decision in self.family_companion.last_decisions:
       event = f'B1_COMPANION_{decision.action}'
-      carlog.info(
+      researchlog.debug(
         f'{event} ns={decision.timestamp_ns} reason={decision.release_reason or "PROOF_COMPLETE"} '
         f'newborn_pid={decision.newborn_pid} newborn_raw={decision.newborn_raw_id} '
         f'anchor_pid={decision.anchor_pid} anchor_raw={",".join(map(str, decision.anchor_raw_ids))} '
@@ -5568,7 +5568,7 @@ class RadarInterface(RadarInterfaceBase):
         self._bosch_objects = objects
         track_ready = True
         if now_ns - self._bosch_debug_ns >= 1_000_000_000:
-          carlog.info(self.bosch.perf_message())
+          researchlog.debug(self.bosch.perf_message())
           self._bosch_debug_ns = now_ns
     if self.radar_tracks and self.rcp_tracks is not None:
       vls_t = self.rcp_tracks.update(can_strings)

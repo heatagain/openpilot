@@ -1540,7 +1540,7 @@ class TestBoschMirrorFamilyResearchShadow:
     provider = BoschRadarProvider(1, qualification=False, mirror_research_shadow=True)
     messages = []
     monkeypatch.setattr(radar_interface_module.carlog, 'info',
-                        lambda _message: pytest.fail('BOSCH_RESEARCH reached tmux carlog'))
+                        lambda _message: pytest.fail('Bosch research log reached tmux carlog'))
     monkeypatch.setattr(radar_interface_module.researchlog, 'debug', messages.append)
     for index in range(3):
       ns, objects = self.scan(index)
