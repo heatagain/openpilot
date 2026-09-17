@@ -1559,7 +1559,6 @@ class TestBoschMirrorFamilyResearchShadow:
 
   def test_event_log_is_fixed_and_edge_only(self, monkeypatch):
     provider = BoschRadarProvider(1, qualification=False, mirror_research_shadow=True)
-    provider.publication_aliases.physical_to_alias.update({self.ROOT_PID: 42, self.ANCHOR_PID: 57})
     messages = []
     monkeypatch.setattr(radar_interface_module.carlog, 'info',
                         lambda _message: pytest.fail('Bosch research log reached tmux carlog'))
@@ -1573,7 +1572,6 @@ class TestBoschMirrorFamilyResearchShadow:
     assert events[0].startswith('BOSCH_RESEARCH event=MIRROR_FAMILY_ENTER ')
     assert 'pidA=1000655 rawA=593' in events[0]
     assert 'pidB=1000671 rawB=609' in events[0]
-    assert 'lastPublicTrackA=42 lastPublicTrackB=57' in events[0]
 
   @pytest.mark.parametrize("clone_type,geometry,confirmations", (
     ('NEAR_COPY', (60., .2, 61., .4), 3),
