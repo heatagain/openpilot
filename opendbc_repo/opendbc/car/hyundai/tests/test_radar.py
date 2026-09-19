@@ -1450,6 +1450,279 @@ class TestBoschFamilyCompanionB1:
     assert actions == ['CREATE', 'COHERENT', 'HANDOFF']
 
 
+class TestBoschBurstMultiReturnDefer:
+  """S33 burst multi-return: three surfaces of one body born in one scan.
+
+  The reference scene is route28b S33, where a truck at 24 m/s world speed
+  produced five singleton births across two scans; one of them landed in the
+  ego lane and became a false lead.  The geometry reproduced here -- a thin
+  range slab, a wide lateral fan, one world speed, a mature neighbour at that
+  same speed -- is the one the user confirmed on video for three cargo trucks
+  and one distant passenger car.
+  """
+  SCAN_NS = 100_000_000
+  ANCHOR_PID = 1_000_012
+  ANCHOR_RAW = 61
+  V_EGO = 29.5
+  # Route28b S33 geometry: the burst sits in a 3 m slab about 60 m out, fanned
+  # from -3.1 m to +10.75 m, all of it at the anchor's world speed.
+  BURST = ((1_000_116, 201, 57.25, -3.125), (1_000_117, 202, 58.75, 3.5),
+           (1_000_118, 203, 58.75, 7.5), (1_000_119, 204, 60.25, 10.75))
+
+  @staticmethod
+  def obj(pid, raw_id, slot, ns, age, d_rel, y_rel, v_rel, *, vision=False, oem=False,
+          extra_members=()):
+    tracks = [BoschRawTrack(raw_id, BoschRawDetection(ns, slot, d_rel, y_rel, v_rel,
+                                                      raw_word=raw_id), age, False)]
+    for extra_raw, extra_slot in extra_members:
+      tracks.append(BoschRawTrack(extra_raw, BoschRawDetection(ns, extra_slot, d_rel+.25, y_rel,
+                                                               v_rel, raw_word=extra_raw),
+                                  age, False))
+    return BoschPhysicalObject(pid, ns, tuple(tracks), raw_id, d_rel, y_rel, v_rel, oem, vision,
+                               age, 'single_return' if len(tracks) == 1 else 'temporal_complete_link')
+
+  @classmethod
+  def scan(cls, index, *, members=3, anchor=True, anchor_v=-5.5, births=True, child_age=None,
+           d_span=None, y_span=None, world_offsets=(), drop=(), supported={}, grew=()):
+    """One scan: a mature anchor plus `members` singleton births beside it.
+
+    `index` 0 is the burst scan; later indices keep the same objects alive so a
+    hold can be followed.  Every keyword exists to break exactly one clause of
+    the burst proof without disturbing the others.
+    """
+    ns = (index+1)*cls.SCAN_NS
+    result = []
+    if anchor:
+      result.append(cls.obj(cls.ANCHOR_PID, cls.ANCHOR_RAW, 4, ns, 30+index, 64.5, -3.375,
+                            anchor_v))
+    if births:
+      selected = cls.BURST[:members]
+      base_d = selected[0][2]
+      base_y = selected[0][3]
+      for position, (pid, raw, d_rel, y_rel) in enumerate(selected):
+        if pid in drop:
+          continue
+        if d_span is not None:
+          d_rel = base_d + d_span*position/max(1, len(selected)-1)
+        if y_span is not None:
+          y_rel = base_y + y_span*position/max(1, len(selected)-1)
+        v_rel = -5.5 + (world_offsets[position] if position < len(world_offsets) else 0.)
+        result.append(cls.obj(pid, raw, 20+position, ns, index+1 if child_age is None else child_age,
+                              d_rel, y_rel, v_rel,
+                              vision=supported.get(pid) == 'camera',
+                              oem=supported.get(pid) == 'word1',
+                              extra_members=((raw+64, 26+position),) if pid in grew else ()))
+    return ns, tuple(result)
+
+  @staticmethod
+  def filter(mode=None):
+    mode = radar_interface_module.BOSCH_BURST_MULTIRETURN_ACTIVE if mode is None else mode
+    return radar_interface_module._BoschBurstMultiReturnDefer(mode)
+
+  @classmethod
+  def arm(cls, defer=None, **kwargs):
+    defer = defer or cls.filter()
+    ns, objects = cls.scan(0, **kwargs)
+    held = defer.update(objects, ns, cls.V_EGO)
+    return defer, ns, objects, held
+
+  def test_bosch_burst_s33_style_burst_is_held_on_its_birth_scan(self):
+    defer, _ns, objects, held = self.arm()
+    assert held == frozenset({1_000_116, 1_000_117, 1_000_118})
+    assert [obj.physical_track_id for obj in defer.publication_view(objects)] == [self.ANCHOR_PID]
+    decision = defer.last_decisions[-1]
+    assert (decision.action, decision.release_reason) == ('HOLD', '')
+    assert decision.burst_members == 3
+    assert decision.anchor_pid == self.ANCHOR_PID
+    assert decision.burst_d_span_m == pytest.approx(1.5)
+    assert decision.burst_y_span_m == pytest.approx(10.625)
+
+  def test_bosch_burst_two_births_are_never_held(self):
+    # Two surfaces are an ordinary pair of objects, not a proven burst.
+    _defer, _ns, objects, held = self.arm(members=2, y_span=10.625)
+    assert held == frozenset()
+
+  def test_bosch_burst_four_births_are_held(self):
+    _defer, _ns, objects, held = self.arm(members=4)
+    assert held == frozenset({1_000_116, 1_000_117, 1_000_118, 1_000_119})
+
+  def test_bosch_burst_range_spread_beyond_the_slab_is_not_a_burst(self):
+    _defer, _ns, _objects, held = self.arm(d_span=4.0)
+    assert held == frozenset()
+
+  def test_bosch_burst_narrow_lateral_fan_is_not_a_burst(self):
+    _defer, _ns, _objects, held = self.arm(y_span=6.0)
+    assert held == frozenset()
+
+  def test_bosch_burst_mixed_world_speeds_do_not_band_together(self):
+    _defer, _ns, _objects, held = self.arm(world_offsets=(0., .5, 1.0))
+    assert held == frozenset()
+
+  def test_bosch_burst_without_a_mature_neighbour_is_not_held(self):
+    _defer, _ns, _objects, held = self.arm(anchor=False)
+    assert held == frozenset()
+
+  def test_bosch_burst_neighbour_at_a_different_speed_is_not_an_anchor(self):
+    _defer, _ns, _objects, held = self.arm(anchor_v=-2.)
+    assert held == frozenset()
+
+  def test_bosch_burst_member_with_word1_is_published(self):
+    _defer, _ns, _objects, held = self.arm(supported={1_000_118: 'word1'})
+    assert held == frozenset({1_000_116, 1_000_117})
+
+  def test_bosch_burst_member_with_camera_is_published(self):
+    _defer, _ns, _objects, held = self.arm(supported={1_000_118: 'camera'})
+    assert held == frozenset({1_000_116, 1_000_117})
+
+  def test_bosch_burst_member_with_validated_word0_is_published(self):
+    defer = self.filter()
+    ns, objects = self.scan(0)
+    held = defer.update(objects, ns, self.V_EGO, word0_validated_pids=(1_000_118,))
+    assert held == frozenset({1_000_116, 1_000_117})
+
+  def test_bosch_burst_unvalidated_word0_is_not_identity_evidence(self):
+    # word0 alone has been observed pointing at a clone, so the provider only
+    # passes it here once the OEM validated it in the same scan.
+    _defer, _ns, _objects, held = self.arm()
+    assert 1_000_118 in held
+
+  def test_bosch_burst_evidence_during_hold_releases_immediately(self):
+    defer, _ns, _objects, _held = self.arm()
+    ns, objects = self.scan(1, supported={1_000_118: 'camera'})
+    assert defer.update(objects, ns, self.V_EGO) == frozenset({1_000_116, 1_000_117})
+    release = next(d for d in defer.last_decisions if d.child_pid == 1_000_118)
+    assert (release.action, release.release_reason) == ('RELEASE', 'CHILD_EVIDENCE')
+    assert 1_000_118 in {obj.physical_track_id for obj in defer.publication_view(objects)}
+
+  def test_bosch_burst_child_gaining_a_member_releases_immediately(self):
+    defer, _ns, _objects, _held = self.arm()
+    ns, objects = self.scan(1, grew=(1_000_118,))
+    assert defer.update(objects, ns, self.V_EGO) == frozenset({1_000_116, 1_000_117})
+    release = next(d for d in defer.last_decisions if d.child_pid == 1_000_118)
+    assert release.release_reason == 'CHILD_GREW'
+
+  def test_bosch_burst_two_missing_scans_expire_the_state(self):
+    defer, _ns, _objects, _held = self.arm()
+    ns, objects = self.scan(1, drop=(1_000_118,))
+    assert 1_000_118 in defer.update(objects, ns, self.V_EGO)
+    ns, objects = self.scan(2, drop=(1_000_118,))
+    assert defer.update(objects, ns, self.V_EGO) == frozenset({1_000_116, 1_000_117})
+    release = next(d for d in defer.last_decisions if d.child_pid == 1_000_118)
+    assert release.release_reason == 'CHILD_LOST'
+    assert 1_000_118 not in defer._states
+
+  def test_bosch_burst_scan_gap_releases_and_cannot_start_a_burst(self):
+    defer, ns, _objects, held = self.arm()
+    assert held
+    late_ns = ns + radar_interface_module.BOSCH_BURST_MAX_GAP_NS + 1
+    _ns, objects = self.scan(0)
+    assert defer.update(objects, late_ns, self.V_EGO) == frozenset()
+    assert defer._states == {}
+    assert {d.release_reason for d in defer.last_decisions} == {'SCAN_GAP'}
+
+  def test_bosch_burst_hold_budget_bounds_the_defer_at_five_scans(self):
+    defer, _ns, _objects, _held = self.arm()
+    suppressed = 1
+    for index in range(1, 12):
+      ns, objects = self.scan(index)
+      if 1_000_118 in defer.update(objects, ns, self.V_EGO):
+        suppressed += 1
+      else:
+        break
+    assert suppressed == radar_interface_module.BOSCH_BURST_HOLD_MAX_SCANS
+    release = next(d for d in defer.last_decisions if d.child_pid == 1_000_118)
+    assert release.release_reason == 'HOLD_BUDGET'
+    assert defer._states == {}
+
+  def test_bosch_burst_reset_clears_every_hold(self):
+    defer, ns, _objects, held = self.arm()
+    assert held and defer._states
+    defer.reset(ns + self.SCAN_NS, 'STATE_RESET')
+    assert defer._states == {} and defer.would_suppress == frozenset()
+    assert {d.release_reason for d in defer.last_decisions} == {'STATE_RESET'}
+
+  def test_bosch_burst_below_the_speed_floor_never_arms(self):
+    defer = self.filter()
+    ns, objects = self.scan(0)
+    assert defer.update(objects, ns, 4.) == frozenset()
+
+  def test_bosch_burst_off_and_shadow_modes_do_not_change_publication(self):
+    for mode in (radar_interface_module.BOSCH_BURST_MULTIRETURN_OFF,
+                 radar_interface_module.BOSCH_BURST_MULTIRETURN_SHADOW):
+      defer = self.filter(mode)
+      ns, objects = self.scan(0)
+      held = defer.update(objects, ns, self.V_EGO)
+      assert defer.publication_view(objects) == objects
+      assert held == (frozenset() if mode == radar_interface_module.BOSCH_BURST_MULTIRETURN_OFF
+                      else frozenset({1_000_116, 1_000_117, 1_000_118}))
+
+  def test_bosch_burst_two_adjacent_vehicles_are_never_held(self):
+    # Two real cars in neighbouring lanes, born together beside a mature third:
+    # the pair count alone keeps them out, and so does the lateral span once a
+    # plausible third object joins them one lane over.
+    ns = self.SCAN_NS
+    anchor = self.obj(self.ANCHOR_PID, self.ANCHOR_RAW, 4, ns, 30, 64.5, -3.375, -5.5)
+    left = self.obj(1_000_301, 211, 21, ns, 1, 58.75, 3.5, -5.5)
+    right = self.obj(1_000_302, 212, 22, ns, 1, 59.0, -0.125, -5.5)
+    third = self.obj(1_000_303, 213, 23, ns, 1, 58.5, -3.5, -5.5)
+    defer = self.filter()
+    assert defer.update((anchor, left, right), ns, self.V_EGO) == frozenset()
+    defer = self.filter()
+    assert defer.update((anchor, left, right, third), ns, self.V_EGO) == frozenset()
+
+  def test_bosch_burst_member_order_does_not_change_the_result(self):
+    _ns, objects = self.scan(0)
+    reference = self.filter().update(objects, self.SCAN_NS, self.V_EGO)
+    for rotation in range(1, len(objects)):
+      shuffled = objects[rotation:] + objects[:rotation]
+      assert self.filter().update(shuffled, self.SCAN_NS, self.V_EGO) == reference
+
+  def test_bosch_burst_does_not_change_family_companion_behaviour(self):
+    # B1's own window is untouched: the same scans produce the same B1 states
+    # and the same B1 hold whether or not the burst filter runs beside it.
+    helper = TestBoschFamilyCompanionB1
+    expected = []
+    family = helper.filter()
+    for index in range(3):
+      ns, objects = helper.scan(index)
+      expected.append(family.update(objects, ns, 29.5))
+    family = helper.filter()
+    defer = self.filter()
+    actual = []
+    for index in range(3):
+      ns, objects = helper.scan(index)
+      actual.append(family.update(objects, ns, 29.5))
+      defer.update(objects, ns, 29.5)
+    assert actual == expected
+    assert expected[1] == frozenset({helper.NEWBORN_PID})
+    assert defer.holds == 0
+
+  def test_bosch_burst_hold_preserves_object_identity_and_state(self):
+    # A deferred surface keeps its physical id, members, representative and age:
+    # only the public tuple loses it, and only for this scan.
+    defer, _ns, objects, held = self.arm()
+    assert held
+    view = defer.publication_view(objects)
+    assert all(obj in objects for obj in view)
+    ns, objects = self.scan(1, supported={1_000_118: 'word1'})
+    defer.update(objects, ns, self.V_EGO)
+    released = next(obj for obj in defer.publication_view(objects)
+                    if obj.physical_track_id == 1_000_118)
+    assert released.age_scans == 2
+    assert released.representative_raw_track_id == 203
+    assert [member.raw_track_id for member in released.members] == [203]
+
+  def test_bosch_burst_state_is_bounded(self):
+    defer, _ns, _objects, _held = self.arm(members=4)
+    assert len(defer._states) <= radar_interface_module.BOSCH_BURST_STATE_MAX
+    assert defer.state_peak == 4
+    for index in range(1, 8):
+      ns, objects = self.scan(index)
+      defer.update(objects, ns, self.V_EGO)
+      assert len(defer._states) <= radar_interface_module.BOSCH_BURST_STATE_MAX
+    assert defer._states == {}
+
+
 class TestBoschMirrorFamilyResearchShadow:
   SCAN_NS = 100_000_000
   ROOT_PID = 1_000_655

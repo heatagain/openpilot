@@ -306,6 +306,31 @@ BOSCH_FAMILY_MAX_GAP_NS = 160_000_000
 BOSCH_FAMILY_INWARD_SCANS = 3
 BOSCH_FAMILY_INWARD_MPS = .90
 
+# S33 burst multi-return: one physical body can split into several radar
+# surfaces inside a single scan.  The signature is a burst -- three or more
+# singletons born in the same scan at one world speed, packed into a thin range
+# slab but fanned out laterally, beside a mature object already moving at that
+# same world speed.  Confirmed on video for a cargo truck (route26d S11,
+# route26a S26, route247 S18) and for a distant passenger car (route283 S14),
+# so the bounds below describe the return geometry, not a vehicle class.
+# Like B1 above this only withholds the newborn from the final public view.
+BOSCH_BURST_MULTIRETURN_OFF = 0
+BOSCH_BURST_MULTIRETURN_SHADOW = 1
+BOSCH_BURST_MULTIRETURN_ACTIVE = 2
+BOSCH_BURST_MULTIRETURN_MODE = BOSCH_BURST_MULTIRETURN_ACTIVE
+BOSCH_BURST_MIN_MEMBERS = 3
+BOSCH_BURST_MAX_WORLD_SPAN_MPS = .35
+BOSCH_BURST_MAX_D_SPAN_M = 3.0
+BOSCH_BURST_MIN_Y_SPAN_M = 8.0
+BOSCH_BURST_MIN_WORLD_SPEED_MPS = 4.0
+BOSCH_BURST_MIN_VEGO_MPS = 8.0
+BOSCH_BURST_NEIGHBOUR_AGE_SCANS = 25
+BOSCH_BURST_NEIGHBOUR_D_M = 30.0
+BOSCH_BURST_HOLD_MAX_SCANS = 5
+BOSCH_BURST_MAX_MISSING_SCANS = 1
+BOSCH_BURST_MAX_GAP_NS = 320_000_000
+BOSCH_BURST_STATE_MAX = 16
+
 # RESEARCH_SHADOW: publication-neutral S36 mirror-family collection. Remove
 # this block and its detector before the final production PR.
 BOSCH_MIRROR_SHADOW_CONFIRMATIONS = 3
@@ -3569,6 +3594,220 @@ class _BoschFamilyCompanionFilter:
     return tuple(obj for obj in objects if obj.physical_track_id not in suppressed)
 
 
+@dataclass
+class _BoschBurstMultiReturnState:
+  child_pid: int
+  anchor_pid: int
+  arm_ns: int
+  last_ns: int
+  burst_members: int
+  burst_d_span_m: float
+  burst_y_span_m: float
+  burst_world_mean_mps: float
+  child_d_rel_m: float
+  child_y_rel_m: float
+  anchor_age: int
+  held_scans: int
+  missing_scans: int
+
+
+@dataclass(frozen=True)
+class BoschBurstMultiReturnDecision:
+  timestamp_ns: int
+  action: str
+  release_reason: str
+  child_pid: int
+  anchor_pid: int
+  burst_members: int
+  burst_d_span_m: float
+  burst_y_span_m: float
+  burst_world_mean_mps: float
+  child_d_rel_m: float
+  child_y_rel_m: float
+  anchor_age: int
+  held_scans: int
+
+
+class _BoschBurstMultiReturnDefer:
+  """S33 burst multi-return proof and publication-only defer.
+
+  One physical body can break into several radar surfaces inside a single
+  scan.  The signature this reads is entirely present-scan physics: three or
+  more singletons born together, their world speeds inside one narrow band,
+  their ranges inside a thin slab, their lateral positions fanned wide apart,
+  and a mature object already tracked at that same world speed nearby.  A
+  burst that wide cannot be three vehicles that all became visible in the same
+  100 ms while driving abreast inside an 8 m lateral window at one speed.
+
+  Absence of camera or word1 support is never the reason a hold starts: the
+  burst geometry is.  Independent support only decides which members of an
+  already-proven burst are deferred, and regaining any of it releases the hold
+  immediately.  Nothing here touches raw tracks, physical identity, grouping,
+  representatives, camera or OEM history, or aliases -- a deferred object keeps
+  every bit of its state and can be published on the very next scan.
+  """
+
+  def __init__(self, mode=BOSCH_BURST_MULTIRETURN_MODE):
+    if mode not in (BOSCH_BURST_MULTIRETURN_OFF, BOSCH_BURST_MULTIRETURN_SHADOW,
+                    BOSCH_BURST_MULTIRETURN_ACTIVE):
+      raise ValueError('invalid Bosch burst multi-return mode')
+    self.mode = mode
+    self._states: dict[int, _BoschBurstMultiReturnState] = {}
+    self.last_ns = None
+    self.would_suppress = frozenset()
+    self.last_decisions: tuple[BoschBurstMultiReturnDecision, ...] = ()
+    self.pair_evaluations_last = self.pair_evaluations_total = self.pair_evaluations_peak = 0
+    self.holds = self.releases = self.publication_suppressed = 0
+    self.state_peak = 0
+
+  @staticmethod
+  def _world_speed(obj, v_ego, yaw):
+    return obj.v_rel + v_ego - yaw*obj.y_rel
+
+  def _decision(self, timestamp_ns, action, reason, state):
+    return BoschBurstMultiReturnDecision(
+      timestamp_ns, action, reason, state.child_pid, state.anchor_pid, state.burst_members,
+      state.burst_d_span_m, state.burst_y_span_m, state.burst_world_mean_mps,
+      state.child_d_rel_m, state.child_y_rel_m, state.anchor_age, state.held_scans)
+
+  def reset(self, timestamp_ns, reason='STATE_RESET'):
+    decisions = [self._decision(timestamp_ns, 'RELEASE', reason, state)
+                 for state in self._states.values()]
+    self.releases += len(decisions)
+    self._states = {}
+    self.would_suppress = frozenset()
+    self.last_decisions = tuple(decisions)
+    self.last_ns = timestamp_ns
+
+  def update(self, objects, timestamp_ns, v_ego, *, yaw_rate=None, word0_validated_pids=()):
+    self.would_suppress = frozenset()
+    self.last_decisions = ()
+    self.pair_evaluations_last = 0
+    if self.mode == BOSCH_BURST_MULTIRETURN_OFF:
+      self._states = {}
+      self.last_ns = timestamp_ns
+      return self.would_suppress
+    if not math.isfinite(v_ego):
+      self.reset(timestamp_ns, 'SPEED_DIVERGENCE')
+      return self.would_suppress
+    if (self.last_ns is not None and
+        (timestamp_ns <= self.last_ns or timestamp_ns-self.last_ns > BOSCH_BURST_MAX_GAP_NS)):
+      # The proof is a one-scan observation; a discontinuity cannot carry a hold
+      # across it, and cannot be the scan that starts one either.
+      self.reset(timestamp_ns, 'STATE_RESET' if timestamp_ns <= self.last_ns else 'SCAN_GAP')
+      return self.would_suppress
+    self.last_ns = timestamp_ns
+    present = {obj.physical_track_id: obj for obj in objects}
+    validated = set(word0_validated_pids)
+    decisions = []
+    suppress = set()
+    alive = {}
+    for pid, state in self._states.items():
+      child = present.get(pid)
+      if child is None:
+        if state.missing_scans < BOSCH_BURST_MAX_MISSING_SCANS:
+          # One dropped scan is ordinary radar behaviour, not a new object.
+          state.missing_scans += 1
+          alive[pid] = state
+          suppress.add(pid)
+          continue
+        reason = 'CHILD_LOST'
+      elif child.oem_selected or child.vision_supported or pid in validated:
+        reason = 'CHILD_EVIDENCE'
+      elif len(child.members) != 1:
+        reason = 'CHILD_GREW'
+      elif state.held_scans >= BOSCH_BURST_HOLD_MAX_SCANS:
+        reason = 'HOLD_BUDGET'
+      else:
+        state.held_scans += 1
+        state.missing_scans = 0
+        state.last_ns = timestamp_ns
+        alive[pid] = state
+        suppress.add(pid)
+        continue
+      decisions.append(self._decision(timestamp_ns, 'RELEASE', reason, state))
+      self.releases += 1
+    self._states = alive
+
+    if v_ego >= BOSCH_BURST_MIN_VEGO_MPS:
+      yaw = yaw_rate if yaw_rate is not None and math.isfinite(yaw_rate) else 0.
+      newborn = [(self._world_speed(obj, v_ego, yaw), obj) for obj in objects
+                 if obj.age_scans == 1 and len(obj.members) == 1]
+      if len(newborn) >= BOSCH_BURST_MIN_MEMBERS:
+        # World speed orders the scan; range, offset and identity break ties so
+        # the banding cannot depend on the order objects arrived in.
+        newborn.sort(key=lambda item: (item[0], item[1].d_rel, item[1].y_rel,
+                                       item[1].physical_track_id))
+        others = None
+        index = 0
+        while index < len(newborn):
+          end = index
+          while (end+1 < len(newborn) and
+                 newborn[end+1][0]-newborn[index][0] <= BOSCH_BURST_MAX_WORLD_SPAN_MPS):
+            end += 1
+          group, index = newborn[index:end+1], end+1
+          if len(group) < BOSCH_BURST_MIN_MEMBERS:
+            continue
+          ranges = [obj.d_rel for _speed, obj in group]
+          offsets = [obj.y_rel for _speed, obj in group]
+          if (max(ranges)-min(ranges) > BOSCH_BURST_MAX_D_SPAN_M or
+              max(offsets)-min(offsets) < BOSCH_BURST_MIN_Y_SPAN_M):
+            continue
+          world_mean = sum(speed for speed, _obj in group)/len(group)
+          if abs(world_mean) < BOSCH_BURST_MIN_WORLD_SPEED_MPS:
+            continue
+          if others is None:
+            others = [(self._world_speed(obj, v_ego, yaw), obj) for obj in objects
+                      if obj.age_scans >= BOSCH_BURST_NEIGHBOUR_AGE_SCANS]
+          members = {obj.physical_track_id for _speed, obj in group}
+          neighbours = []
+          for speed, obj in others:
+            if obj.physical_track_id in members:
+              continue
+            self.pair_evaluations_last += 1
+            if (abs(speed-world_mean) <= BOSCH_BURST_MAX_WORLD_SPAN_MPS and
+                min(abs(obj.d_rel-value) for value in ranges) <= BOSCH_BURST_NEIGHBOUR_D_M):
+              neighbours.append(obj)
+          if not neighbours:
+            continue
+          # The burst is proven; the anchor is recorded, never decided on.
+          anchor = min(neighbours, key=lambda obj: (-obj.age_scans, obj.d_rel,
+                                                    obj.physical_track_id))
+          d_span = max(ranges)-min(ranges)
+          y_span = max(offsets)-min(offsets)
+          for _speed, child in group:
+            pid = child.physical_track_id
+            if (pid in self._states or child.oem_selected or child.vision_supported or
+                pid in validated):
+              continue
+            if len(self._states) >= BOSCH_BURST_STATE_MAX:
+              break
+            state = _BoschBurstMultiReturnState(
+              pid, anchor.physical_track_id, timestamp_ns, timestamp_ns, len(group),
+              d_span, y_span, world_mean, child.d_rel, child.y_rel, anchor.age_scans, 1, 0)
+            self._states[pid] = state
+            suppress.add(pid)
+            self.holds += 1
+            decisions.append(self._decision(timestamp_ns, 'HOLD', '', state))
+
+    self.would_suppress = frozenset(suppress)
+    self.last_decisions = tuple(decisions)
+    self.pair_evaluations_total += self.pair_evaluations_last
+    self.pair_evaluations_peak = max(self.pair_evaluations_peak, self.pair_evaluations_last)
+    self.state_peak = max(self.state_peak, len(self._states))
+    return self.would_suppress
+
+  def publication_view(self, objects):
+    if self.mode != BOSCH_BURST_MULTIRETURN_ACTIVE or not self.would_suppress or not objects:
+      return objects
+    suppressed = {obj.physical_track_id for obj in objects
+                  if obj.physical_track_id in self.would_suppress}
+    if not suppressed:
+      return objects
+    self.publication_suppressed += len(suppressed)
+    return tuple(obj for obj in objects if obj.physical_track_id not in suppressed)
+
+
 # RESEARCH_SHADOW / TEMP_BOSCH_MIRROR_RESEARCH / TEMP_BOSCH_CLONE_RESEARCH:
 # none of the state below is
 # consumed by tracking, grouping, qualification, aliasing, or publication.
@@ -4525,6 +4764,7 @@ class BoschRadarProvider:
                oem_gate_mode=BOSCH_OEM_GATE_MODE, scc_bus=BOSCH_SCC_BUS,
                curve_reacquire_mode=BOSCH_CAMERA_CURVE_REACQUIRE_MODE,
                provisional_bundle=True, family_companion_mode=BOSCH_FAMILY_COMPANION_MODE,
+               burst_multireturn_mode=BOSCH_BURST_MULTIRETURN_MODE,
                mirror_research_shadow=True):
     self.bus = bus
     self.camera_bus = camera_bus
@@ -4534,6 +4774,7 @@ class BoschRadarProvider:
     self.publication_aliases = BoschPublicationAliasAllocator()
     self.qualifier = _BoschPublicationPassThrough() if qualification else None
     self.family_companion = _BoschFamilyCompanionFilter(family_companion_mode)
+    self.burst_multireturn = _BoschBurstMultiReturnDefer(burst_multireturn_mode)
     self.mirror_research_shadow = _BoschMirrorFamilyResearchShadow(mirror_research_shadow)
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
     self.oem_gate = _BoschOemValidationGate(oem_gate_mode)
@@ -4726,6 +4967,13 @@ class BoschRadarProvider:
     return manager.provisional_publication_view(
       objects, strict_associations=strict, oem_pids=oem_pids)
 
+  def _burst_view(self, objects):
+    """Defer this scan's proven burst multi-return surfaces, publication only."""
+    burst = self.burst_multireturn
+    if not objects or not all(obj.timestamp_ns == burst.last_ns for obj in objects):
+      return objects
+    return burst.publication_view(objects)
+
   def publication_view(self, objects, timestamp_ns=None):
     # Candidate P91 ACTIVE is the Bosch research-branch production path. The
     # independent camera-extended ACTIVE_TEST path below remains experimental.
@@ -4748,11 +4996,11 @@ class BoschRadarProvider:
       objects = tuple(obj for obj in objects if obj.physical_track_id not in withheld)
     ext = self.camera_extended
     if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
-      return self.family_companion.publication_view(self._final_view(objects))
+      return self._burst_view(self.family_companion.publication_view(self._final_view(objects)))
     if not ext.mature_groups or not objects:
       self.test_last_suppressed = ()
       self.test_last_active_groups = 0
-      return self.family_companion.publication_view(self._final_view(objects))
+      return self._burst_view(self.family_companion.publication_view(self._final_view(objects)))
     # 다른 scan의 tuple 또는 qualification에서 대표가 빠진 그룹은 baseline으로 연다.
     by_pid = {obj.physical_track_id: obj for obj in objects}
     suppressed = set()
@@ -4766,8 +5014,8 @@ class BoschRadarProvider:
       active_groups += 1
     self.test_last_suppressed = tuple(sorted(suppressed))
     self.test_last_active_groups = active_groups
-    return self.family_companion.publication_view(self._final_view(
-      tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects))
+    return self._burst_view(self.family_companion.publication_view(self._final_view(
+      tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects)))
 
   @property
   def slot_to_ids(self):
@@ -4804,6 +5052,9 @@ class BoschRadarProvider:
       'provisional_decisions': [vars(decision) for decision in self.tracker.group_manager.last_provisional_decisions],
       'family_companion_suppressed': sorted(self.family_companion.would_suppress),
       'family_companion_decisions': [vars(decision) for decision in self.family_companion.last_decisions],
+      'burst_multireturn_mode': self.burst_multireturn.mode,
+      'burst_multireturn_suppressed': sorted(self.burst_multireturn.would_suppress),
+      'burst_multireturn_decisions': [vars(decision) for decision in self.burst_multireturn.last_decisions],
       'objects': [{'physicalTrackId': obj.physical_track_id,
                    'rawTrackIds': [member.raw_track_id for member in obj.members],
                    'slots': list(obj.member_slots),
@@ -4941,6 +5192,7 @@ class BoschRadarProvider:
       self._debug_timeout = True
       self.tracker.group_manager.reset_provisional(now_ns, 'provider_timeout')
       self.family_companion.reset(now_ns, 'STATE_RESET')
+      self.burst_multireturn.reset(now_ns, 'STATE_RESET')
       self.mirror_research_shadow.reset(now_ns, 'STATE_RESET')
       self.mirror_research_shadow.update_false_anchor_chains(
         self.family_companion, (), now_ns, v_ego, yaw_rate=yaw_rate_left, path=())
@@ -5050,6 +5302,22 @@ class BoschRadarProvider:
         f'camera_coarse={int(decision.camera_coarse)} camera_strict={int(decision.camera_strict)} '
         f'oem={int(decision.oem_identity)} dPath={decision.d_path_m} '
         f'public_suppressed={int(decision.public_suppressed)}')
+    # Burst multi-return defer reads the same scan the B1 family filter just read.
+    # Only a word0 record the OEM also validated counts as identity evidence here,
+    # for the reason P91 uses below: word0 alone has been observed on a clone.
+    self.burst_multireturn.update(
+      qualified, availability_ns, v_ego, yaw_rate=yaw_rate_left,
+      word0_validated_pids=processed_pids if oem_state == BOSCH_OEM_STATE_VALIDATED
+      else frozenset())
+    for decision in self.burst_multireturn.last_decisions:
+      researchlog.debug(
+        f'BOSCH_BURST_MULTIRETURN_{decision.action} ns={decision.timestamp_ns} '
+        f'reason={decision.release_reason or "BURST_PROVEN"} child_pid={decision.child_pid} '
+        f'anchor_pid={decision.anchor_pid} anchor_age={decision.anchor_age} '
+        f'burst_n={decision.burst_members} d_span={decision.burst_d_span_m} '
+        f'y_span={decision.burst_y_span_m} world_mean={decision.burst_world_mean_mps} '
+        f'child_d={decision.child_d_rel_m} child_y={decision.child_y_rel_m} '
+        f'held_scans={decision.held_scans}')
     self.oem_gate.update(qualified, availability_ns, v_ego, state=oem_state,
                          word0_pids=processed_pids, oem_valid=scc_valid)
     self._debug_gate_suppress = self.oem_gate.would_withhold
@@ -5073,6 +5341,8 @@ class BoschRadarProvider:
       return 'OEM_HELD'
     if pid in self.family_companion.would_suppress:
       return 'B1_HELD'
+    if pid in self.burst_multireturn.would_suppress:
+      return 'BURST_HELD'
     return 'PUBLICATION_ELIGIBLE'
 
   def _shadow_b1_state(self, pid):
