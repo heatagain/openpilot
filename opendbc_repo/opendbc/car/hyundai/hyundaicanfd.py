@@ -377,13 +377,21 @@ def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC):
     ret.append(packer.make_can_msg("ADRV_0x161", CAN.ECAN, values, rx_counter=rx_counter))
   return ret
 
+def _display_lead(radar_state):
+  # Vehicle displays show the nearest valid control lead, including leadTwo.
+  # Equal distances retain leadOne; this does not change radar/control roles.
+  leads = (getattr(radar_state, name, None) for name in ("leadOne", "leadTwo"))
+  return min((lead for lead in leads
+              if lead is not None and lead.status and lead.dRel > 0
+              and all(math.isfinite(v) for v in (lead.dRel, lead.yRel, lead.vRel))),
+             key=lambda lead: lead.dRel, default=None)
+
+
 def _apply_scc_lead(values, radar_state):
-  lead = radar_state.leadOne if radar_state is not None else None
-  valid = (lead is not None and lead.status and lead.dRel > 0
-           and all(math.isfinite(v) for v in (lead.dRel, lead.yRel, lead.vRel)))
+  lead = _display_lead(radar_state)
   # Match the stock no-object encoding; never retain an old camera target.
   values.update(ACC_ObjDist=204.6, ACC_ObjLatPos=0.0, ACC_ObjRelSpd=239.4, HUD_LEAD_INFO=0)
-  if valid:
+  if lead is not None:
     values["ACC_ObjDist"] = float(np.clip(lead.dRel, 0.1, 204.5))
     # SCC lateral position has the opposite sign to radarState.yRel. Bound to
     # the signed 9-bit signal's representable range (0.1 scale, -20 offset).
@@ -735,11 +743,37 @@ def _convert_ccnc_boxes_to_cars(values):
     if values[key] in (1, 2):
       values[key] += 2
 
+
+def _apply_ccnc_lead(values, radar_state, enabled):
+  lead = _display_lead(radar_state)
+  if lead is None:
+    values.update(FF_DETECT=0, FF_DISTANCE=204.6, FF_LATERAL=0.0)
+    return
+
+  # The DBC exposes FF_LATERAL as unsigned, but OEM negative positions are
+  # encoded in 7-bit two's complement (e.g. 11.6 represents -1.2 m).
+  stock_lateral = values["FF_LATERAL"]
+  if stock_lateral >= 6.4:
+    stock_lateral -= 12.8
+  same_object = (values["FF_DETECT"] != 0
+                 and abs(values["FF_DISTANCE"] - lead.dRel) <= 3.0
+                 and abs(stock_lateral + lead.yRel) <= 1.0)
+  # Radar leads have no object class. Retain the OEM class only for a matching
+  # target; otherwise use the existing generic gray/white car presentation.
+  if not same_object:
+    values["FF_DETECT"] = 4 if enabled else 3
+  values["FF_DISTANCE"] = float(np.clip(lead.dRel, 0.1, 204.5))
+  values["FF_LATERAL"] = float(np.clip(-lead.yRel, -6.4, 6.3))
+
+
 def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
                          disp_angle, left_lane_warning, right_lane_warning,
                          enable_corner_radar, stopping, canfd_debug, paddle_mode):
   ret = []
   interlock_active = longitudinal_interlock_active(CS)
+  display_lead = _display_lead(getattr(CS, "radarState", None))
+  lead_visible = display_lead is not None
+  lead_distance = float(np.clip(display_lead.dRel, 0.1, 204.5)) if lead_visible else 0.0
 
   md = CS.modelV2
   if not hasattr(create_ccnc_messages, '_lane_line_check') or frame % 100 == 0:
@@ -814,12 +848,12 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
         values["vSetDis"] = int(set_speed_in_units + 0.5)
 
         values["DISTANCE"] = 4 if hdp_active else hud_control.leadDistanceBars
-        values["DISTANCE_LEAD"] = 2 if cruise_enabled and hud_control.leadVisible else 1 if main_enabled and hud_control.leadVisible else 0
+        values["DISTANCE_LEAD"] = 2 if cruise_enabled and lead_visible else 1 if main_enabled and lead_visible else 0
         values["DISTANCE_CAR"] = 3 if hdp_active else 2 if cruise_enabled else 1 if main_enabled else 0
         values["DISTANCE_SPACING"] = 5 if hdp_active else 1 if cruise_enabled else 0
 
-        values["TARGET"] = 1 if hud_control.leadVisible and cruise_enabled else 0
-        values["TARGET_DISTANCE"] = int(hud_control.leadDistance)
+        values["TARGET"] = 1 if lead_visible and cruise_enabled else 0
+        values["TARGET_DISTANCE"] = lead_distance
 
         values["BACKGROUND"] = _select_cluster_background(
           cruise_enabled, lat_active, CS.paddle_button_prev > 0, paddle_mode,
@@ -922,6 +956,7 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
         values = copy.copy(CS.ccnc_0x162)
 
         _convert_ccnc_boxes_to_cars(values)
+        _apply_ccnc_lead(values, getattr(CS, "radarState", None), CC.enabled)
 
         if (left_lane_warning and not CS.out.leftBlinker) or (right_lane_warning and not CS.out.rightBlinker):
           values["VIBRATE"] = 1
