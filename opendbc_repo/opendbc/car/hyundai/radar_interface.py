@@ -1618,6 +1618,8 @@ class BoschRawAssociationDecision:
   so residual_d_m and residual_bearing_rad are the quantities the distance and
   bearing gates were applied to. best_alternative_cost is the cheapest edge
   this detection did not take, which is what makes a swap visible offline.
+  identity_ambiguous marks a detection in a globally tied component; it is
+  diagnostic only and does not change the historical deterministic assignment.
   """
   timestamp_ns: int
   raw_track_id: int
@@ -1637,6 +1639,7 @@ class BoschRawAssociationDecision:
   chosen_cost: float | None
   best_alternative_cost: float | None
   candidate_count: int
+  identity_ambiguous: bool
 
 
 @dataclass
@@ -1962,17 +1965,23 @@ def _bosch_raw_assignment(n, m, row_edges, column_edges, unmatched_cost):
   largest = max((len(rows) + len(columns) for rows, columns in components), default=0)
   assignment = {}
   certified = 0
+  ambiguous_columns = None
   for rows, columns in components:
     result = _bosch_raw_unique_component(rows, columns, row_edges, column_edges, unmatched_cost)
     if result is not None:
       certified += 1
     else:
-      # A genuinely tied component. Solve it on its own, presenting its rows and
-      # columns in ascending order: the solver breaks ties by index, and inside
-      # one component the whole-scan matrix presents exactly that order.
+      # Record exact identity ambiguity, but retain the historical deterministic
+      # tie-break until replay plus video GT can show that a generation break is
+      # safer. Refusing here can create more coasted states and cascade ties.
       solved = _bosch_component_matching(sorted(rows), sorted(columns), row_edges, unmatched_cost)
       if solved is not None:
-        result = solved[0]
+        result, unique = solved
+        if not unique:
+          if ambiguous_columns is None:
+            ambiguous_columns = set(columns)
+          else:
+            ambiguous_columns.update(columns)
     if result is None:
       # Not self-contained, or the component solver refused it. Rebuild the
       # exact old matrix so this path stays a faithful last resort.
@@ -1986,9 +1995,9 @@ def _bosch_raw_assignment(n, m, row_edges, column_edges, unmatched_cost):
       costs[n:, m:] = 0.0
       ri, ci = bosch_linear_sum_assignment(costs)
       assignment = {int(column): int(row) for row, column in zip(ri, ci) if row < n and column < m}
-      return assignment, len(components), largest, 0, True
+      return assignment, len(components), largest, 0, True, frozenset()
     assignment.update(result)
-  return assignment, len(components), largest, certified, False
+  return assignment, len(components), largest, certified, False, (frozenset() if ambiguous_columns is None else frozenset(ambiguous_columns))
 
 
 class BoschRawTrackManager:
@@ -2017,12 +2026,14 @@ class BoschRawTrackManager:
     self.last_pair_possible = self.last_pair_candidates = 0
     self.last_component_count = self.last_largest_component = 0
     self.last_fast_components = self.last_tied_components = 0
+    self.last_ambiguous_detections = 0
     self.last_solver_fallback = False
     self.stats = {name: 0 for name in (
       "updates", "detections", "created", "deleted", "assignments",
       "cross_slot", "recovered", "coasted_track_scans", "max_active",
       "gated_pairs", "distance_rejections", "speed_rejections", "bearing_rejections",
       "yaw_compensated_updates", "yaw_unavailable_updates",
+      "ambiguous_identity_components", "ambiguous_identity_detections",
     )}
     # Shadow diagnostic switch, matching the group manager. Off leaves the scan
     # path unchanged; on only fills last_decisions. Neither setting gates a match.
@@ -2161,7 +2172,7 @@ class BoschRawTrackManager:
             cost = max(0.0, cost - same_slot_bonus)
           row_edge.append((col, cost))
           column_edges[col].append((row, cost))
-    assignment, components, largest, fast_components, fallback = _bosch_raw_assignment(
+    assignment, components, largest, fast_components, fallback, ambiguous_columns = _bosch_raw_assignment(
       n, m, row_edges, column_edges, config.unmatched_cost,
     )
     pending_stats = {"gated_pairs": gated_pairs, "distance_rejections": n * m - distance_pairs,
@@ -2175,6 +2186,7 @@ class BoschRawTrackManager:
     self.last_component_count, self.last_largest_component = components, largest
     self.last_fast_components, self.last_solver_fallback = fast_components, fallback
     self.last_tied_components = 0 if fallback else components - fast_components
+    self.last_ambiguous_detections = len(ambiguous_columns)
     self._update_count += 1
     update_count = self._update_count
     # A coasted state only advances its projection, so it is re-seated in place
@@ -2227,7 +2239,7 @@ class BoschRawTrackManager:
           bearing_gate_rad=(config.bearing_gate_rad(max(0.0, min(predicted[row][0], x)))
                             if row is not None else None),
           chosen_cost=chosen, best_alternative_cost=alternatives[0] if alternatives else None,
-          candidate_count=len(column_edges[col])))
+          candidate_count=len(column_edges[col]), identity_ambiguous=col in ambiguous_columns))
     self.last_decisions = tuple(decisions)
     self.last_timestamp_ns = int(timestamp_ns)
     stats = self.stats
@@ -2241,6 +2253,8 @@ class BoschRawTrackManager:
     stats["detections"] += m
     stats["deleted"] += expired_count
     stats["coasted_track_scans"] += n - len(assignment)
+    stats["ambiguous_identity_components"] += self.last_tied_components
+    stats["ambiguous_identity_detections"] += len(ambiguous_columns)
     stats["max_active"] = max(stats["max_active"], len(states))
     stats["yaw_compensated_updates" if yaw_rate is not None else "yaw_unavailable_updates"] += 1
     return tuple(output)

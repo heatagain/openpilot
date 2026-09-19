@@ -2336,6 +2336,38 @@ class TestBoschRawAssociationLowSpeedInvariants:
     _, outputs = self.run(scans)
     assert outputs[1][0].raw_track_id == self.ids(outputs[0])[4]
 
+  def test_exact_identity_tie_is_traced_without_changing_generation(self):
+    """A tied result is observable, but remains behaviour-neutral pending GT."""
+    first, second = self.SCAN_NS, 2 * self.SCAN_NS
+    manager = BoschRawTrackManager()
+    manager.trace_decisions = True
+    initial = manager.update(first, (
+      self.detection(4, 5., 0., 0., first),
+      self.detection(9, 7., 0., 0., first),
+    ))
+    observed = manager.update(second, (self.detection(12, 6., 0., 0., second),))
+
+    assert observed[0].raw_track_id in {track.raw_track_id for track in initial}
+    assert manager.last_tied_components == 1
+    assert manager.last_ambiguous_detections == 1
+    assert manager.stats["ambiguous_identity_components"] == 1
+    assert manager.stats["ambiguous_identity_detections"] == 1
+    assert not manager.last_decisions[0].created
+    assert manager.last_decisions[0].identity_ambiguous
+
+  def test_slot_evidence_resolves_an_otherwise_equal_identity_choice(self):
+    first, second = self.SCAN_NS, 2 * self.SCAN_NS
+    manager = BoschRawTrackManager()
+    initial = manager.update(first, (
+      self.detection(4, 5., 0., 0., first),
+      self.detection(9, 7., 0., 0., first),
+    ))
+    observed = manager.update(second, (self.detection(4, 6., 0., 0., second),))
+
+    assert observed[0].raw_track_id == self.ids(initial)[4]
+    assert manager.last_tied_components == 0
+    assert manager.last_ambiguous_detections == 0
+
   # --- slot is not identity ------------------------------------------------
   def test_slot_reuse_by_a_distant_target_starts_a_new_identity(self):
     first, second = self.SCAN_NS, 2 * self.SCAN_NS
