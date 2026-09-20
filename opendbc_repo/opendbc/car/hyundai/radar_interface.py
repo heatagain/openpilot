@@ -477,13 +477,9 @@ BOSCH_TRUCK_P2_DV_MAX_MPS = 0.50
 BOSCH_TRUCK_A0_RECOVERY_HOLD_SCANS = 2
 BOSCH_TRUCK_A0_RECOVERY_BEARING_EXCESS_RAD = 0.010
 BOSCH_TRUCK_A0_RECOVERY_COST_MARGIN = 0.15
-# 같은 LDWS camera episode에 배정된 두 발행 contact가 rigid pair 창 안에 있으면
-# 한 차량의 두 표면이다. downstream은 moving lead를 model의 시각 거리와의 일치도로
-# 고르고 stationary lead는 track age로 유지하므로, 긴 차량에서는 후면보다 몇 m 뒤에
-# 있는 표면에 leadOne을 앉히고 정작 후면을 별도의 cut-in으로 보고할 수 있다.
-# OEM이 더 가까운 contact를 자기 제어 대상(0x601 word1)으로 고르고 0x601이
-# VALIDATED인 동안에만 더 먼 표면을 발행에서 미룬다. 더 먼 쪽만, 그리고 가까운 쪽이
-# 실제로 발행되는 동안에만 숨기므로 그 차량의 contact가 사라지는 일은 없다.
+# Shared camera episode와 OEM selection은 physical identity proof가 아니다.
+# 기존 rigid-pair opportunity 안에서도 prior raw/group split과 representative handoff가
+# 모두 확인된 경우에만 먼 표면의 publication을 미룬다. 근거가 없으면 fail open한다.
 BOSCH_COMPANION_DEFER_OFF = 0
 BOSCH_COMPANION_DEFER_ACTIVE = 1
 BOSCH_COMPANION_DEFER_MODE = BOSCH_COMPANION_DEFER_ACTIVE
@@ -495,6 +491,8 @@ BOSCH_COMPANION_DEFER_DD_MAX_M = 12.0
 BOSCH_COMPANION_DEFER_DY_MAX_M = 1.5
 BOSCH_COMPANION_DEFER_DV_MAX_MPS = 1.0
 BOSCH_COMPANION_DEFER_Y_MAX_M = 2.5
+BOSCH_COMMON_ANCESTRY_MAX_AGE_NS = 40_000_000_000
+BOSCH_COMMON_ANCESTRY_RAW_PAIR_MAX = 32 * 31 // 2
 # 좁은 camera object는 여러 m 떨어진 두 return을 가질 수 없다.
 BOSCH_COMPANION_DEFER_WIDTH_DD_M = ((2.00, 5.0), (2.30, 7.0))
 # 물리 객체는 대표 member의 거리를 발행한다. 대표는 연속성을 첫 키로 고르므로 한 번
@@ -2391,6 +2389,12 @@ class _BoschPairEvidence:
   samples: deque = field(default_factory=deque)
 
 
+@dataclass(frozen=True, slots=True)
+class _BoschCommonGroupAncestry:
+  timestamp_ns: int
+  physical_track_id: int
+
+
 @dataclass
 class _BoschPhysicalState:
   observation: BoschPhysicalObject
@@ -2578,6 +2582,10 @@ class BoschObjectGroupManager:
     self.last_provisional_decisions: tuple[BoschProvisionalBundleDecision, ...] = ()
     self.provisional_created = self.provisional_coherent = 0
     self.provisional_handoffs = self.provisional_releases = 0
+    # Bounded Bosch-only lineage used by the final CAMERA_COMPANION publication
+    # gate. raw_track_id is provider association state, not a native OBJECT_ID.
+    self.common_group_ancestry: dict[tuple[int, int], _BoschCommonGroupAncestry] = {}
+    self.common_representative_owners: dict[int, dict[int, int]] = {}
     # Shadow diagnostic switch. Off leaves the scan path byte-for-byte as it
     # was; on only fills last_decisions. Neither setting gates an assignment.
     self.trace_decisions = False
@@ -2620,6 +2628,65 @@ class BoschObjectGroupManager:
     return any(math.isfinite(c.d_rel) and math.isfinite(c.y_rel) and c.probability >= .7
          and abs(member.d_rel - c.d_rel) <= c.distance_tolerance_m
          and abs(member.y_rel - c.y_rel) <= c.lateral_tolerance_m for c in vision)
+
+  def reset_common_ancestry(self):
+    self.common_group_ancestry = {}
+    self.common_representative_owners = {}
+
+  def _update_common_ancestry(self, timestamp_ns, objects):
+    """Keep only live, recent raw/group and representative ownership history."""
+    live_pids = set(self.states)
+    active_raw = {raw_id for state in self.states.values() for raw_id in state.member_last_seen}
+    max_age = BOSCH_COMMON_ANCESTRY_MAX_AGE_NS
+    self.common_group_ancestry = {
+      raw_pair: evidence for raw_pair, evidence in self.common_group_ancestry.items()
+      if (0 <= timestamp_ns - evidence.timestamp_ns <= max_age and
+          raw_pair[0] in active_raw and raw_pair[1] in active_raw)
+    }
+    for raw_id in list(self.common_representative_owners):
+      if raw_id not in active_raw:
+        del self.common_representative_owners[raw_id]
+        continue
+      owners = self.common_representative_owners[raw_id]
+      owners = {pid: ns for pid, ns in owners.items()
+                if pid in live_pids and 0 <= timestamp_ns - ns <= max_age}
+      if owners:
+        self.common_representative_owners[raw_id] = owners
+      else:
+        del self.common_representative_owners[raw_id]
+
+    for obj in objects:
+      raw_ids = sorted(member.raw_track_id for member in obj.members)
+      for index, raw_a in enumerate(raw_ids):
+        for raw_b in raw_ids[index + 1:]:
+          key = (raw_a, raw_b)
+          self.common_group_ancestry.setdefault(
+            key, _BoschCommonGroupAncestry(timestamp_ns, obj.physical_track_id))
+      owners = self.common_representative_owners.setdefault(
+        obj.representative_raw_track_id, {})
+      owners[obj.physical_track_id] = timestamp_ns
+
+    if len(self.common_group_ancestry) > BOSCH_COMMON_ANCESTRY_RAW_PAIR_MAX:
+      keep = sorted(self.common_group_ancestry.items(),
+                    key=lambda item: (-item[1].timestamp_ns, item[0]))[
+                      :BOSCH_COMMON_ANCESTRY_RAW_PAIR_MAX]
+      self.common_group_ancestry = dict(keep)
+
+  def common_ancestry_evidence(self, first, second, shared_start_ns, timestamp_ns):
+    """Return prior group split and representative handoff for this PID pair."""
+    first_raw = {member.raw_track_id for member in first.members}
+    second_raw = {member.raw_track_id for member in second.members}
+    split = any(
+      (evidence := self.common_group_ancestry.get(tuple(sorted((raw_a, raw_b))))) is not None and
+      evidence.timestamp_ns < shared_start_ns and
+      0 <= timestamp_ns - evidence.timestamp_ns <= BOSCH_COMMON_ANCESTRY_MAX_AGE_NS
+      for raw_a in first_raw for raw_b in second_raw if raw_a != raw_b)
+    pair = {first.physical_track_id, second.physical_track_id}
+    handoff = any(
+      pair.issubset(owners) and
+      all(0 <= timestamp_ns - owners[pid] <= BOSCH_COMMON_ANCESTRY_MAX_AGE_NS for pid in pair)
+      for owners in self.common_representative_owners.values())
+    return split, handoff
 
   def update(self, timestamp_ns: int, raw_tracks: Sequence[BoschRawTrack], *,
        yaw_rate: float | None = None, v_ego: float = math.nan,
@@ -3142,6 +3209,7 @@ class BoschObjectGroupManager:
       if not last_seen and pid not in output_ids:
         del states[pid]
         stats['absorbed'] += 1
+    self._update_common_ancestry(timestamp_ns, result)
     stats['scans'] += 1
     stats['output_objects'] += len(result)
     multi = 0
@@ -4457,6 +4525,7 @@ class BoschRadarProvider:
     self._companion_ns = None
     self._companion_prev_ns = None
     self._companion_hidden = {}
+    self._companion_shared_start = {}
     self.last_oem_slot = None
     self.oem_nearer_corrections = 0
     self.oem_nearer_scans = 0
@@ -4469,11 +4538,13 @@ class BoschRadarProvider:
     if (self._companion_prev_ns is not None and
         timestamp_ns - self._companion_prev_ns > BOSCH_CAMERA_OBSERVATION_GAP_NS):
       self.companion_pairs = {}
+      self._companion_shared_start = {}
     self._companion_prev_ns = timestamp_ns
     if (ext.last_camera_ns is None or
         not 0 <= timestamp_ns - ext.last_camera_ns <= BOSCH_CAMERA_OBSERVATION_GAP_NS):
       # camera가 낡으면 identity 근거가 없다. fail-open으로 상태를 버린다.
       self.companion_pairs = {}
+      self._companion_shared_start = {}
       return {}
     by_pid = {obj.physical_track_id: obj for obj in objects if obj.timestamp_ns == timestamp_ns}
     episodes = {}
@@ -4484,6 +4555,7 @@ class BoschRadarProvider:
     v_ego = ext.last_v_ego
     yaw = ext.last_yaw_rate if ext.last_yaw_rate is not None and math.isfinite(ext.last_yaw_rate) else 0.0
     next_pairs = {}
+    next_shared_start = {}
     hidden = {}
     for episode, pids in sorted(episodes.items()):
       if len(pids) < 2:
@@ -4501,28 +4573,35 @@ class BoschRadarProvider:
         near, far = by_pid[members[index]], by_pid[members[index + 1]]
         key = (episode, members[index], members[index + 1])
         confirmations, last_ns = self.companion_pairs.get(key, (0, 0))
+        shared_start_ns = self._companion_shared_start.get(key, timestamp_ns)
         conflict = False
         if math.isfinite(v_ego):
           world_near = abs(near.v_rel + v_ego - yaw * near.y_rel)
           world_far = abs(far.v_rel + v_ego - yaw * far.y_rel)
           conflict = min(world_near, world_far) <= 0.6 and max(world_near, world_far) >= 1.4
-        okay = (validated and near.oem_selected and not far.oem_selected and not conflict and
-                BOSCH_COMPANION_DEFER_DD_MIN_M < far.d_rel - near.d_rel <= limit and
-                abs(far.y_rel - near.y_rel) <= BOSCH_COMPANION_DEFER_DY_MAX_M and
-                abs(far.v_rel - near.v_rel) <= BOSCH_COMPANION_DEFER_DV_MAX_MPS and
-                abs(near.y_rel) <= BOSCH_COMPANION_DEFER_Y_MAX_M and
-                abs(far.y_rel) <= BOSCH_COMPANION_DEFER_Y_MAX_M)
-        if okay:
+        baseline_ok = (validated and near.oem_selected and not far.oem_selected and not conflict and
+                       BOSCH_COMPANION_DEFER_DD_MIN_M < far.d_rel - near.d_rel <= limit and
+                       abs(far.y_rel - near.y_rel) <= BOSCH_COMPANION_DEFER_DY_MAX_M and
+                       abs(far.v_rel - near.v_rel) <= BOSCH_COMPANION_DEFER_DV_MAX_MPS and
+                       abs(near.y_rel) <= BOSCH_COMPANION_DEFER_Y_MAX_M and
+                       abs(far.y_rel) <= BOSCH_COMPANION_DEFER_Y_MAX_M)
+        split, handoff = self.tracker.group_manager.common_ancestry_evidence(
+          far, near, shared_start_ns, timestamp_ns)
+        common_ancestry = split and handoff
+        if baseline_ok and common_ancestry:
           confirmations, last_ns = confirmations + 1, timestamp_ns
-        elif not (confirmations >= BOSCH_COMPANION_DEFER_CONFIRMATIONS and
-                  0 <= timestamp_ns - last_ns <= BOSCH_COMPANION_DEFER_HOLD_NS):
+        elif (not common_ancestry or
+              not (confirmations >= BOSCH_COMPANION_DEFER_CONFIRMATIONS and
+                   0 <= timestamp_ns - last_ns <= BOSCH_COMPANION_DEFER_HOLD_NS)):
           # 근거가 끊기면 즉시 발행을 되돌린다. hold는 확인된 쌍에만 준다.
           confirmations = 0
         if len(next_pairs) < BOSCH_COMPANION_DEFER_STATE_MAX:
           next_pairs[key] = (confirmations, last_ns)
+          next_shared_start[key] = shared_start_ns
         if confirmations >= BOSCH_COMPANION_DEFER_CONFIRMATIONS:
           hidden[members[index + 1]] = members[index]
     self.companion_pairs = next_pairs
+    self._companion_shared_start = next_shared_start
     return hidden
 
   def _oem_nearer_view(self, objects):
@@ -4568,7 +4647,7 @@ class BoschRadarProvider:
     return self._oem_nearer_view(self._companion_view(objects))
 
   def _companion_view(self, objects):
-    """OEM anchor가 확인한 same-vehicle pair에서 더 먼 표면을 발행에서 미룬다."""
+    """Prior common raw/group ancestry가 확인된 pair의 먼 표면만 발행에서 미룬다."""
     ext = self.camera_extended
     if (BOSCH_COMPANION_DEFER_MODE != BOSCH_COMPANION_DEFER_ACTIVE or
         ext.mode == BOSCH_CAMERA_EXTENDED_OFF or ext.last_ns is None or not objects):
@@ -4830,6 +4909,13 @@ class BoschRadarProvider:
       self._debug_objects = ()
       self._debug_timeout = True
       self.tracker.group_manager.reset_provisional(now_ns, 'provider_timeout')
+      self.tracker.group_manager.reset_common_ancestry()
+      self.companion_pairs = {}
+      self._companion_shared_start = {}
+      self._companion_hidden = {}
+      self._companion_ns = None
+      self._companion_prev_ns = None
+      self.last_companion_deferred = ()
       self.family_companion.reset(now_ns, 'STATE_RESET')
       self.burst_multireturn.reset(now_ns, 'STATE_RESET')
       self.p91.update((), now_ns, v_ego, yaw_rate=yaw_rate_left)

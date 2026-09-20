@@ -1307,12 +1307,10 @@ class TestBoschLargeVehicleA0Recovery:
 
 
 class TestBoschCompanionDeferral:
-  """OEM-anchored longitudinal companion deferral.
+  """Baseline geometry/hold behaviour after common ancestry is confirmed.
 
-  Two published contacts the camera assigns to one episode, inside the rigid
-  pair window, with the OEM's own word1 target on the nearer one: the farther
-  surface must not stay in the published set competing for the longitudinal
-  lead, and the nearer one must always survive.
+  Common-ancestry construction and fail-open cases live in test_radar.py. This
+  class keeps the pre-existing geometry, OEM and hold boundaries isolated.
   """
   EPISODE = 7
   NEAR, FAR = 1_000_001, 1_000_002
@@ -1351,6 +1349,7 @@ class TestBoschCompanionDeferral:
   @classmethod
   def provider(cls, width_m=2.5):
     provider = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)
+    provider.tracker.group_manager.common_ancestry_evidence = lambda *_args: (True, True)
     cls.configure(provider, width_m=width_m)
     return provider
 

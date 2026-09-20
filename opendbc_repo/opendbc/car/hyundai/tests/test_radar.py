@@ -1731,6 +1731,193 @@ class TestBoschResearchShadowRemoval:
       BoschRadarProvider(1, qualification=False, mirror_research_shadow=True)
 
 
+class TestBoschCameraCompanionCommonAncestry:
+  START_NS = 20_000_000_000
+  STEP_NS = 100_000_000
+  EPISODE = 7
+  NEAR = 1_000_101
+  FAR = 1_000_102
+
+  @staticmethod
+  def raw(raw_id, slot, ns, d_rel, y_rel=0., v_rel=0., age=10):
+    detection = BoschRawDetection(ns, slot, d_rel, y_rel, v_rel, raw_word=raw_id)
+    return BoschRawTrack(raw_id, detection, age, False)
+
+  @classmethod
+  def obj(cls, pid, ns, raw_specs, representative, d_rel, *, oem=False, age=10):
+    members = tuple(cls.raw(raw_id, slot, ns, d_rel, age=age) for raw_id, slot in raw_specs)
+    return BoschPhysicalObject(pid, ns, members, representative, d_rel, 0., 0., oem, True,
+                               age, 'single_return' if len(members) == 1 else 'temporal_complete_link')
+
+  @classmethod
+  def current_pair(cls, ns, *, near_pid=None, far_pid=None, near_raw=2, far_raw=1,
+                   near_slot=2, far_slot=1):
+    near_pid = cls.NEAR if near_pid is None else near_pid
+    far_pid = cls.FAR if far_pid is None else far_pid
+    near = cls.obj(near_pid, ns, ((near_raw, near_slot),), near_raw, 2.5, oem=True)
+    far = cls.obj(far_pid, ns, ((far_raw, far_slot),), far_raw, 6.0)
+    return near, far
+
+  @staticmethod
+  def set_live(manager, objects):
+    manager.states = {
+      obj.physical_track_id: radar_interface_module._BoschPhysicalState(
+        obj, {member.raw_track_id: obj.timestamp_ns for member in obj.members})
+      for obj in objects
+    }
+    manager._update_common_ancestry(objects[0].timestamp_ns, objects)
+
+  @classmethod
+  def provider(cls):
+    provider = BoschRadarProvider(
+      1, qualification=False,
+      camera_extended_mode=radar_interface_module.BOSCH_CAMERA_EXTENDED_ACTIVE,
+      p91_mode=radar_interface_module.BOSCH_P91_OFF,
+      oem_gate_mode=radar_interface_module.BOSCH_OEM_GATE_OFF,
+      family_companion_mode=radar_interface_module.BOSCH_FAMILY_COMPANION_OFF,
+      burst_multireturn_mode=radar_interface_module.BOSCH_BURST_MULTIRETURN_OFF)
+    ext = provider.camera_extended
+    ext._associate = lambda _obj, *_args: (
+      radar_interface_module.BOSCH_CAMERA_ASSOC_ASSIGNED, cls.EPISODE, 6)
+    camera = radar_interface_module.BoschCameraObject(
+      obj_id=3, episode=cls.EPISODE, long_m=4., width_m=2.5, class_code=6)
+    ext.camera.snapshot = lambda ns: ([camera], 1, 0, ns)
+    return provider
+
+  @classmethod
+  def publication(cls, provider, objects):
+    ns = objects[0].timestamp_ns
+    provider.last_oem_state = radar_interface_module.BOSCH_OEM_STATE_VALIDATED
+    provider.camera_extended.update(ns, objects, 10.)
+    return provider.publication_view(objects)
+
+  @classmethod
+  def seed(cls, provider, *, split=True, handoff=True):
+    manager = provider.tracker.group_manager
+    t0 = cls.START_NS
+    if split:
+      ancestor = cls.obj(cls.NEAR, t0, ((1, 1), (2, 2)), 1, 4.)
+    else:
+      ancestor = cls.obj(cls.NEAR, t0, ((1, 1),), 1, 4.)
+    cls.set_live(manager, (ancestor,))
+    t1 = t0 + cls.STEP_NS
+    pair = (cls.current_pair(t1) if handoff else
+            cls.current_pair(t1, near_raw=1, far_raw=2, near_slot=1, far_slot=2))
+    cls.set_live(manager, pair)
+    return pair
+
+  def test_baseline_geometry_without_common_ancestry_keeps_far_object(self):
+    provider = self.provider()
+    pair = self.current_pair(self.START_NS)
+    self.set_live(provider.tracker.group_manager, pair)
+    assert [obj.physical_track_id for obj in self.publication(provider, pair)] == [self.NEAR, self.FAR]
+
+  def test_group_split_without_representative_handoff_keeps_far_object(self):
+    provider = self.provider()
+    pair = self.seed(provider, split=True, handoff=False)
+    evidence = provider.tracker.group_manager.common_ancestry_evidence(
+      pair[0], pair[1], pair[0].timestamp_ns, pair[0].timestamp_ns)
+    assert evidence == (True, False)
+    assert [obj.physical_track_id for obj in self.publication(provider, pair)] == [self.NEAR, self.FAR]
+
+  def test_representative_handoff_without_prior_group_split_keeps_far_object(self):
+    provider = self.provider()
+    pair = self.seed(provider, split=False, handoff=True)
+    evidence = provider.tracker.group_manager.common_ancestry_evidence(
+      pair[0], pair[1], pair[0].timestamp_ns, pair[0].timestamp_ns)
+    assert evidence == (False, True)
+    assert [obj.physical_track_id for obj in self.publication(provider, pair)] == [self.NEAR, self.FAR]
+
+  def test_split_and_handoff_with_baseline_conditions_defers_far_object(self):
+    provider = self.provider()
+    pair = self.seed(provider)
+    assert [obj.physical_track_id for obj in self.publication(provider, pair)] == [self.NEAR]
+    assert provider.last_companion_deferred == (self.FAR,)
+
+  def test_independent_long_lived_child_like_geometry_keeps_far_object(self):
+    provider = self.provider()
+    for index in range(100):
+      pair = self.current_pair(self.START_NS + index * self.STEP_NS, near_raw=11, far_raw=12)
+      self.set_live(provider.tracker.group_manager, pair)
+      assert [obj.physical_track_id for obj in self.publication(provider, pair)] == [self.NEAR, self.FAR]
+
+  def test_expired_ancestry_keeps_far_object(self):
+    provider = self.provider()
+    pair = self.seed(provider)
+    assert len(self.publication(provider, pair)) == 1
+    ns = pair[0].timestamp_ns + radar_interface_module.BOSCH_COMMON_ANCESTRY_MAX_AGE_NS + 1
+    expired_pair = self.current_pair(ns)
+    self.set_live(provider.tracker.group_manager, expired_pair)
+    assert [obj.physical_track_id for obj in self.publication(provider, expired_pair)] == [self.NEAR, self.FAR]
+
+  def test_pid_loss_and_provider_reset_do_not_reuse_stale_ancestry(self):
+    provider = self.provider()
+    pair = self.seed(provider)
+    assert len(self.publication(provider, pair)) == 1
+    manager = provider.tracker.group_manager
+    far_only = (self.current_pair(pair[0].timestamp_ns + self.STEP_NS)[1],)
+    self.set_live(manager, far_only)
+    assert manager.common_group_ancestry == {}
+
+    reset_provider = self.provider()
+    reset_pair = self.seed(reset_provider)
+    assert len(self.publication(reset_provider, reset_pair)) == 1
+    assert reset_provider.update([], now_ns=reset_pair[0].timestamp_ns, v_ego=0.) is None
+    timeout_ns = reset_pair[0].timestamp_ns + radar_interface_module.BOSCH_STALE_NS
+    assert reset_provider.update([], now_ns=timeout_ns, v_ego=0.) == ()
+    assert reset_provider.tracker.group_manager.common_group_ancestry == {}
+    assert reset_provider.tracker.group_manager.common_representative_owners == {}
+    reused_pair = self.current_pair(timeout_ns + self.STEP_NS)
+    self.set_live(reset_provider.tracker.group_manager, reused_pair)
+    assert [obj.physical_track_id for obj in self.publication(reset_provider, reused_pair)] == [self.NEAR, self.FAR]
+
+  def test_raw_slot_reuse_without_lineage_keeps_far_object(self):
+    provider = self.provider()
+    ancestor = self.obj(self.NEAR, self.START_NS, ((1, 1), (2, 2)), 1, 4.)
+    self.set_live(provider.tracker.group_manager, (ancestor,))
+    pair = self.current_pair(self.START_NS + self.STEP_NS, near_raw=101, far_raw=102,
+                             near_slot=1, far_slot=2)
+    self.set_live(provider.tracker.group_manager, pair)
+    assert [obj.physical_track_id for obj in self.publication(provider, pair)] == [self.NEAR, self.FAR]
+
+  def test_pair_disappearance_and_reacquisition_do_not_reuse_ancestry(self):
+    provider = self.provider()
+    pair = self.seed(provider)
+    assert len(self.publication(provider, pair)) == 1
+    near_only = (self.current_pair(pair[0].timestamp_ns + self.STEP_NS)[0],)
+    self.set_live(provider.tracker.group_manager, near_only)
+    assert [obj.physical_track_id for obj in self.publication(provider, near_only)] == [self.NEAR]
+    reacquired = self.current_pair(near_only[0].timestamp_ns + self.STEP_NS)
+    self.set_live(provider.tracker.group_manager, reacquired)
+    assert [obj.physical_track_id for obj in self.publication(provider, reacquired)] == [self.NEAR, self.FAR]
+
+  def test_candidate_b_burst_decision_is_unchanged(self):
+    helper = TestBoschBurstMultiReturnDefer
+    first, second = helper.filter(), helper.filter()
+    ns, objects = helper.scan(0)
+    expected = first.update(objects, ns, helper.V_EGO)
+
+    provider = self.provider()
+    self.seed(provider)
+    actual = second.update(objects, ns, helper.V_EGO)
+    assert actual == expected == frozenset({1_000_116, 1_000_117, 1_000_118})
+
+  def test_non_bosch_hyundai_does_not_construct_the_provider(self, monkeypatch):
+    class FakeParams:
+      def get_int(self, key):
+        return 1 if key == 'EnableRadarTracks' else 0
+
+    monkeypatch.setattr(radar_interface_module, 'Params', FakeParams)
+    monkeypatch.setattr(radar_interface_module, 'get_radar_can_parser', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(radar_interface_module, 'get_radar_can_parser_scc', lambda *_args, **_kwargs: None)
+    cp = structs.CarParams()
+    cp.carFingerprint = CAR.HYUNDAI_GRANDEUR_IG
+    cp.extFlags = 0
+    cp.radarUnavailable = True
+    interface = RadarInterface(cp)
+    assert interface.bosch is None
+
+
 class TestBoschRawAssociationTrace:
   """Raw returns are matched globally, and a coasted track outbids a new one.
 
