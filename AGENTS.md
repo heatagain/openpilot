@@ -1,5 +1,25 @@
 # Repository memory
 
+- On 2026-09-21, after Ioniq 5 C4 `00000f90--96d7dcd525--4` reproduced a
+  101 ms wide-camera SOF gap, the user authorized a CPU-placement trial:
+  main UI uses cores0..3 with SCHED_OTHER (core0 bootstrap), camerad and its
+  camera IRQ targets move from core6 to core5. card remains core6 FIFO53;
+  planner/radard remain core5 FIFO51 and camera keeps normal scheduling.
+  Preserve the UI's verified SCHED_OTHER contract and pose validity limits.
+  This supersedes the camera/UI placements described in older observations,
+  not radar isolation or cluster affinity. No C3/C4 vehicle benefit is yet
+  validated; do not claim same-core contention caused the camera fault.
+  See docs/camera_core5_trial.md for scope, trade-offs and validation.
+
+- On 2026-09-21, ID.4 replay showed that adding CP.radarDelay (0.8 s) to
+  distance alignment could switch the selected lead to a farther CAN object.
+  The user approved zero extra distance projection for VW MEB. Use the shared
+  radar_motion/timing.py policy in runtime and NAS replay; preserve measured
+  camera/publication skew. Do not also zero CP.radarDelay: its ego-history
+  compensation and velocity/acceleration effects have not been recalibrated.
+  Other platforms retain their existing delay. See
+  docs/meb_radar_distance_alignment.md for scope and regression evidence.
+
 - On 2026-09-21, K9 C4 logs reproduced locationd timing-check invalidity from
   repeated IMU timestamps over 100 ms old. Historical captures first showed
   these failures after the September 19 update, despite unchanged HUD 10 FPS,
