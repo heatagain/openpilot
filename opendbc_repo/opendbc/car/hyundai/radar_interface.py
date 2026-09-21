@@ -2635,31 +2635,35 @@ class BoschObjectGroupManager:
 
   def _update_common_ancestry(self, timestamp_ns, objects):
     """Keep only live, recent raw/group and representative ownership history."""
-    live_pids = set(self.states)
+    live_pids = self.states.keys()
     active_raw = {raw_id for state in self.states.values() for raw_id in state.member_last_seen}
     max_age = BOSCH_COMMON_ANCESTRY_MAX_AGE_NS
-    self.common_group_ancestry = {
-      raw_pair: evidence for raw_pair, evidence in self.common_group_ancestry.items()
-      if (0 <= timestamp_ns - evidence.timestamp_ns <= max_age and
-          raw_pair[0] in active_raw and raw_pair[1] in active_raw)
-    }
-    for raw_id in list(self.common_representative_owners):
+    ancestry = self.common_group_ancestry
+    for raw_pair in tuple(ancestry):
+      evidence = ancestry[raw_pair]
+      if (not 0 <= timestamp_ns - evidence.timestamp_ns <= max_age or
+          raw_pair[0] not in active_raw or raw_pair[1] not in active_raw):
+        del ancestry[raw_pair]
+    owners_by_raw = self.common_representative_owners
+    for raw_id in tuple(owners_by_raw):
       if raw_id not in active_raw:
-        del self.common_representative_owners[raw_id]
+        del owners_by_raw[raw_id]
         continue
-      owners = self.common_representative_owners[raw_id]
-      owners = {pid: ns for pid, ns in owners.items()
-                if pid in live_pids and 0 <= timestamp_ns - ns <= max_age}
-      if owners:
-        self.common_representative_owners[raw_id] = owners
-      else:
-        del self.common_representative_owners[raw_id]
+      owners = owners_by_raw[raw_id]
+      for pid in tuple(owners):
+        ns = owners[pid]
+        if pid not in live_pids or not 0 <= timestamp_ns - ns <= max_age:
+          del owners[pid]
+      if not owners:
+        del owners_by_raw[raw_id]
 
     for obj in objects:
-      raw_ids = sorted(member.raw_track_id for member in obj.members)
-      for index, raw_a in enumerate(raw_ids):
-        for raw_b in raw_ids[index + 1:]:
-          key = (raw_a, raw_b)
+      members = obj.members
+      for index, member_a in enumerate(members):
+        raw_a = member_a.raw_track_id
+        for other_index in range(index + 1, len(members)):
+          raw_b = members[other_index].raw_track_id
+          key = (raw_a, raw_b) if raw_a < raw_b else (raw_b, raw_a)
           self.common_group_ancestry.setdefault(
             key, _BoschCommonGroupAncestry(timestamp_ns, obj.physical_track_id))
       owners = self.common_representative_owners.setdefault(
