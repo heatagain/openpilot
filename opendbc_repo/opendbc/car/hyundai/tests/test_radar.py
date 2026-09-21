@@ -1,5 +1,6 @@
 import math
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,7 +15,14 @@ from opendbc.car.hyundai.radar_interface import (
   RADAR_MSG_COUNT4,
   RADAR_REQUIRED_MSG_COUNT,
   RADAR_START_ADDR_CANFD3,
+  BOSCH_B5_ACTIVE,
+  BOSCH_B5_PARENT_STABILITY_SCANS,
+  BOSCH_CAMERA_ASSOC_ASSIGNED,
+  BOSCH_CAMERA_ASSOC_UNRESOLVED,
+  BOSCH_OEM_STATE_NONE,
   BoschObjectGroupManager,
+  BoschB5ModelContext,
+  BoschBirthB5Defer,
   BoschGroupingConfig,
   BoschPhysicalObject,
   BoschPhysicalTracker,
@@ -1027,6 +1035,245 @@ class TestBoschPublicationAlias:
         publications.append(frame)
     assert publications == [9, 14, 19, 24, 29]
     assert interface.bosch.publication_aliases.denial_count == 0
+
+
+class TestBoschB5BirthDefer:
+  STEP_NS = 100_000_000
+  START_NS = 1_000_000_000
+  PARENT_PID = 1_000_100
+  TARGET_PID = 1_000_101
+
+  @staticmethod
+  def track(raw_id, slot, timestamp_ns, age, *, d_rel=40., y_rel=0., vcode=512):
+    word = (vcode << 21) | 1
+    detection = BoschRawDetection(timestamp_ns, slot, d_rel, y_rel, vcode * .25 - 128., raw_word=word)
+    return BoschRawTrack(raw_id, detection, age)
+
+  @staticmethod
+  def obj(pid, timestamp_ns, members, age, *, representative=None):
+    representative = members[0].raw_track_id if representative is None else representative
+    surface = next(member for member in members if member.raw_track_id == representative)
+    return BoschPhysicalObject(
+      pid, timestamp_ns, tuple(members), representative,
+      surface.d_rel, surface.y_rel, surface.v_rel, False, False, age, 'single_return')
+
+  @staticmethod
+  def model(source_ns, publication_ns, *, edge_std=.1, lane_shift=0.):
+    xs = tuple(float(value) for value in range(0, 201, 10))
+
+    def line(radar_y):
+      return tuple((x, -(radar_y + lane_shift)) for x in xs)
+
+    return BoschB5ModelContext(
+      publication_ns, source_ns,
+      (line(3.), line(-3.)), (edge_std, edge_std),
+      (line(2.), line(.7), line(-.7), line(-2.)),
+      (1., 1., 1., 1.), (.1, .1, .1, .1), line(0.))
+
+  @classmethod
+  def prime(cls, scans=249, *, parent_raws=(10,), representative=10):
+    b5 = BoschBirthB5Defer(BOSCH_B5_ACTIVE)
+    for index in range(1, scans + 1):
+      ns = cls.START_NS + (index - 1) * cls.STEP_NS
+      members = tuple(cls.track(raw_id, raw_id, ns, index) for raw_id in parent_raws)
+      parent = cls.obj(cls.PARENT_PID, ns, members, index, representative=representative)
+      b5.update((parent,), members, ns, ns + 5_000_000, 10., 0.,
+                live_pids=(cls.PARENT_PID,), live_raw_ids=parent_raws)
+    return b5
+
+  @classmethod
+  def add_context(cls, b5, scan_ns, *, edge_std=.1):
+    for offset in (120_000_000, 80_000_000, 40_000_000, 0):
+      b5.ingest_speed(scan_ns - offset, 0.)
+      b5.ingest_pose(scan_ns - offset, 0.)
+    b5.model_contexts = [
+      cls.model(scan_ns - 110_000_000, scan_ns - 100_000_000, edge_std=edge_std),
+      cls.model(scan_ns - 70_000_000, scan_ns - 60_000_000, edge_std=edge_std),
+      cls.model(scan_ns - 30_000_000, scan_ns - 20_000_000, edge_std=edge_std),
+    ]
+
+  @classmethod
+  def birth(cls, b5, scan_index=250, *, parent_raws=(10,), parent_rep=10,
+            target_raws=(20,), target_rep=20, parent_vcode=512, target_vcode=512,
+            v_ego=10., yaw=0., edge_std=.1, context=True, extra_objects=(),
+            extra_raw=(), camera=(), word0=()):
+    ns = cls.START_NS + (scan_index - 1) * cls.STEP_NS
+    if context:
+      cls.add_context(b5, ns, edge_std=edge_std)
+    parent_members = tuple(cls.track(raw_id, raw_id, ns, scan_index, d_rel=40., y_rel=0., vcode=parent_vcode)
+                           for raw_id in parent_raws)
+    target_members = tuple(cls.track(raw_id, raw_id, ns, 1, d_rel=45., y_rel=4.5, vcode=target_vcode)
+                           for raw_id in target_raws)
+    parent = cls.obj(cls.PARENT_PID, ns, parent_members, scan_index, representative=parent_rep)
+    target = cls.obj(cls.TARGET_PID, ns, target_members, 1, representative=target_rep)
+    objects = (parent, target) + tuple(extra_objects)
+    raw = parent_members + target_members + tuple(extra_raw)
+    live_pids = tuple(obj.physical_track_id for obj in objects)
+    live_raw = tuple(member.raw_track_id for obj in objects for member in obj.members)
+    live_raw += tuple(track.raw_track_id for track in extra_raw)
+    b5.update(objects, raw, ns, ns + 5_000_000, v_ego, yaw,
+              camera_associations=camera, oem_state=BOSCH_OEM_STATE_NONE,
+              word0_pids=word0, live_pids=live_pids, live_raw_ids=live_raw)
+    return parent, target, b5.last_decisions[0]
+
+  def test_exact_b5_defers_birth_once_and_restores_next_scan(self):
+    b5 = self.prime()
+    parent, target, decision = self.birth(b5)
+    assert decision.decision and decision.parent_stable_scans == BOSCH_B5_PARENT_STABILITY_SCANS
+    assert b5.publication_view((parent, target)) == (parent,)
+    # RadarInterface may build more than one consumer view of the same scan;
+    # the action and accounting remain one birth publication tick.
+    assert b5.publication_view((parent, target)) == (parent,)
+    assert b5.suppressed_scans == 1 and b5.suppressed_points == 1
+    assert self.TARGET_PID in b5.states
+
+    ns = target.timestamp_ns + self.STEP_NS
+    parent_track = self.track(10, 10, ns, 251, d_rel=40., y_rel=0.)
+    target_track = self.track(20, 20, ns, 2, d_rel=45., y_rel=4.5)
+    parent2 = self.obj(self.PARENT_PID, ns, (parent_track,), 251)
+    target2 = self.obj(self.TARGET_PID, ns, (target_track,), 2)
+    b5.update((parent2, target2), (parent_track, target_track), ns, ns + 5_000_000, 10., 0.,
+              live_pids=(self.PARENT_PID, self.TARGET_PID), live_raw_ids=(10, 20))
+    assert b5.would_suppress == frozenset()
+    assert b5.publication_view((parent2, target2)) == (parent2, target2)
+
+  def test_radar_interface_ingests_bosch_pose_and_frozen_model_context(self):
+    interface = RadarInterface.__new__(RadarInterface)
+    interface.bosch = BoschRadarProvider(1, b5_mode=BOSCH_B5_ACTIVE)
+    interface._bosch_path_ns = None
+    interface._bosch_path = ()
+    interface._bosch_path_source_ns = 0
+    interface._bosch_context = None
+    now_ns = self.START_NS
+
+    def line(y):
+      return SimpleNamespace(x=(0., 10., 20.), y=(y, y, y))
+
+    pose = SimpleNamespace(
+      inputsOK=True, sensorsOK=True,
+      angularVelocityDevice=SimpleNamespace(valid=True, z=.2))
+    model = SimpleNamespace(
+      timestampEof=now_ns - 30_000_000, roadEdges=(line(-3.), line(3.)),
+      roadEdgeStds=(.1, .1), laneLines=(line(-2.), line(-.7), line(.7), line(2.)),
+      laneLineProbs=(1., 1., 1., 1.), laneLineStds=(.1, .1, .1, .1),
+      position=line(0.), leadsV3=())
+    interface.set_bosch_context(
+      now_ns, pose, now_ns - 10_000_000, model, now_ns - 5_000_000)
+
+    b5 = interface.bosch.b5_birth_defer
+    assert b5.pose_samples[-1] == (now_ns - 10_000_000, -.2, True)
+    assert b5.model_contexts[-1].source_ns == model.timestampEof
+    assert interface._bosch_context[0] == now_ns
+
+  def test_249_is_fail_open_and_250_is_eligible(self):
+    _, _, before = self.birth(self.prime(248), scan_index=249)
+    _, _, at = self.birth(self.prime(249), scan_index=250)
+    assert before.parent_stable_scans == 249 and not before.decision
+    assert at.parent_stable_scans == 250 and at.decision
+
+  def test_member_or_representative_change_resets_counter(self):
+    _, _, member = self.birth(self.prime(), parent_raws=(10, 11), parent_rep=10)
+    _, _, representative = self.birth(
+      self.prime(parent_raws=(10, 11), representative=10),
+      parent_raws=(10, 11), parent_rep=11)
+    assert member.parent_stable_scans == 1 and not member.decision
+    assert representative.parent_stable_scans == 1 and not representative.decision
+
+  def test_pid_death_rebirth_and_gap_do_not_inherit_stability(self):
+    b5 = self.prime()
+    death_ns = self.START_NS + 249 * self.STEP_NS
+    b5.update((), (), death_ns, death_ns, 10., 0., live_pids=(), live_raw_ids=())
+    assert self.PARENT_PID not in b5.states
+    raw = self.track(30, 30, death_ns + self.STEP_NS, 1)
+    parent = self.obj(self.PARENT_PID, death_ns + self.STEP_NS, (raw,), 1)
+    b5.update((parent,), (raw,), death_ns + self.STEP_NS, death_ns + self.STEP_NS, 10., 0.,
+              live_pids=(self.PARENT_PID,), live_raw_ids=(30,))
+    assert b5.states[self.PARENT_PID].stable_scans == 1
+
+    b5 = self.prime()
+    gap_ns = b5.last_scan_ns + 300_000_000
+    raw = self.track(10, 10, gap_ns, 250)
+    parent = self.obj(self.PARENT_PID, gap_ns, (raw,), 250)
+    b5.update((parent,), (raw,), gap_ns, gap_ns, 10., 0.,
+              live_pids=(self.PARENT_PID,), live_raw_ids=(10,))
+    assert b5.last_reset_reason == 'RADAR_INPUT_GAP'
+    assert b5.states[self.PARENT_PID].stable_scans == 1
+
+  def test_exact_vrel_is_required_and_one_lsb_fails_open(self):
+    _, _, exact = self.birth(self.prime(), parent_vcode=512, target_vcode=512)
+    _, _, one_lsb = self.birth(self.prime(), parent_vcode=512, target_vcode=513)
+    assert exact.decision
+    assert not one_lsb.decision and one_lsb.reason == 'VREL_NOT_EXACT_FAIL_OPEN'
+
+  def test_birth_counts_and_singleton_are_exact(self):
+    ns = self.START_NS + 249 * self.STEP_NS
+    extra_track = self.track(30, 30, ns, 1, d_rel=150., y_rel=0.)
+    extra_obj = self.obj(1_000_200, ns, (extra_track,), 100)
+    _, _, raw_two = self.birth(self.prime(), extra_objects=(extra_obj,), extra_raw=(extra_track,))
+    assert not raw_two.decision and raw_two.reason == 'NEW_RAW_COUNT_FAIL_OPEN'
+
+    second_track = self.track(30, 30, ns, 1, d_rel=150., y_rel=0.)
+    second_birth = self.obj(1_000_200, ns, (second_track,), 1)
+    _, _, pid_two = self.birth(self.prime(), extra_objects=(second_birth,), extra_raw=(second_track,))
+    assert pid_two.new_pid_count == 2 and not pid_two.decision
+
+    _, _, grouped = self.birth(self.prime(), target_raws=(20, 21), target_rep=20)
+    assert not grouped.singleton and not grouped.decision and grouped.reason == 'NON_SINGLETON_FAIL_OPEN'
+
+  @pytest.mark.parametrize(('v_ego', 'yaw', 'context', 'edge_std', 'reason'), (
+    (2.9, 0., True, .1, 'LOW_SPEED_FAIL_OPEN'),
+    (10., .21, True, .1, 'HIGH_CURVATURE_FAIL_OPEN'),
+    (10., 0., False, .1, 'MODEL_STALE_FAIL_OPEN'),
+    (10., 0., True, .6, 'ROAD_EDGE_UNSTABLE_FAIL_OPEN'),
+  ))
+  def test_context_fail_open_conditions(self, v_ego, yaw, context, edge_std, reason):
+    _, _, decision = self.birth(self.prime(), v_ego=v_ego, yaw=yaw, context=context, edge_std=edge_std)
+    assert not decision.decision and decision.reason == reason
+
+  def test_independent_camera_and_ambiguous_parent_fail_open(self):
+    camera = {
+      self.TARGET_PID: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1),
+      self.PARENT_PID: (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, 0),
+    }
+    _, _, independent = self.birth(self.prime(), camera=camera)
+    assert not independent.decision and independent.reason == 'INDEPENDENT_CAMERA_FAIL_OPEN'
+
+    ns = self.START_NS + 249 * self.STEP_NS
+    other_track = self.track(30, 30, ns, 300, d_rel=42., y_rel=1.)
+    other = self.obj(1_000_200, ns, (other_track,), 300)
+    _, _, ambiguous = self.birth(self.prime(), extra_objects=(other,), extra_raw=(other_track,))
+    assert not ambiguous.decision and ambiguous.reason == 'AMBIGUOUS_PARENT_FAIL_OPEN'
+
+  def test_alias_is_allocated_before_defer_and_reused_on_release(self):
+    b5 = self.prime()
+    parent, target, decision = self.birth(b5)
+    assert decision.decision
+    allocator = BoschPublicationAliasAllocator()
+    first = allocator.update(target.timestamp_ns, (self.PARENT_PID, self.TARGET_PID),
+                             (self.PARENT_PID, self.TARGET_PID))
+    assert self.TARGET_PID not in {obj.physical_track_id for obj in b5.publication_view((parent, target))}
+    target_alias = first[self.TARGET_PID]
+
+    ns = target.timestamp_ns + self.STEP_NS
+    ptrack = self.track(10, 10, ns, 251, d_rel=40., y_rel=0.)
+    ttrack = self.track(20, 20, ns, 2, d_rel=45., y_rel=4.5)
+    parent2 = self.obj(self.PARENT_PID, ns, (ptrack,), 251)
+    target2 = self.obj(self.TARGET_PID, ns, (ttrack,), 2)
+    b5.update((parent2, target2), (ptrack, ttrack), ns, ns, 10., 0.,
+              live_pids=(self.PARENT_PID, self.TARGET_PID), live_raw_ids=(10, 20))
+    second = allocator.update(ns, (self.PARENT_PID, self.TARGET_PID),
+                              (self.PARENT_PID, self.TARGET_PID))
+    assert second[self.TARGET_PID] == target_alias
+    assert b5.publication_view((parent2, target2)) == (parent2, target2)
+
+  def test_negative_view_is_tuple_identical_and_state_is_bounded(self):
+    b5 = self.prime()
+    parent, target, decision = self.birth(b5, context=False)
+    baseline = (parent, target)
+    assert not decision.decision
+    assert b5.publication_view(baseline) is baseline
+    assert len(b5.states) <= 2
+    assert len(b5.raw_prior_owners) <= 2
 
 
 class TestBoschPhysicalIdContinuityTrace:

@@ -1,3 +1,4 @@
+import bisect
 import copy
 import math
 import os
@@ -271,6 +272,39 @@ BOSCH_WINDOW_NS = 20_000_000
 BOSCH_STALE_NS = 300_000_000
 BOSCH_OUTPUT_INTERVAL_NS = 100_000_000
 BOSCH_SAMPLE_HOLD_NS = 150_000_000  # one 10 Hz observation period plus one SCC publication period
+
+# Candidate A B5: the frozen birth signature may defer only the newborn's
+# first publication. Tracking, grouping, physical IDs, qualification, aliases
+# and every existing filter continue to observe the complete object tuple.
+BOSCH_B5_OFF = 0
+BOSCH_B5_ACTIVE = 1
+BOSCH_B5_MODE = BOSCH_B5_ACTIVE
+BOSCH_B5_PARENT_STABILITY_SCANS = 250
+BOSCH_B5_COUNTER_MAX = 255
+BOSCH_B5_CONTEXT_MAX_AGE_NS = 200_000_000
+BOSCH_B5_HISTORY_NS = 120_000_000
+BOSCH_B5_HISTORY_MIN_SPAN_NS = 40_000_000
+BOSCH_B5_MOTION_HISTORY_NS = 400_000_000
+BOSCH_B5_RADAR_TO_DEVICE_X_M = 1.52
+BOSCH_B5_OUTSIDE_MARGIN_M = 1.0
+BOSCH_B5_PARENT_MIN_AGE_SCANS = 20
+BOSCH_B5_MIN_WORLD_SPEED_MPS = 1.0
+BOSCH_B5_MAX_D_M = 12.0
+BOSCH_B5_MAX_Y_M = 10.0
+BOSCH_B5_MAX_DV_MPS = 1.5
+BOSCH_B5_MAX_DWORLD_MPS = 1.5
+BOSCH_B5_MIN_VEGO_MPS = 3.0
+BOSCH_B5_MAX_CURVATURE_1PM = 0.02
+BOSCH_B5_EDGE_STD_MAX_M = 0.5
+BOSCH_B5_EDGE_WIDTH_MIN_M = 2.0
+BOSCH_B5_EDGE_WIDTH_MAX_M = 20.0
+BOSCH_B5_LANE_PROB_MIN = 0.5
+BOSCH_B5_LANE_STD_MAX_M = 0.5
+BOSCH_B5_LANE_STABILITY_MAX_M = 0.5
+BOSCH_B5_CORRIDOR_WIDTH_MIN_M = 2.0
+BOSCH_B5_CORRIDOR_WIDTH_MAX_M = 5.5
+BOSCH_B5_EDGE_LANE_BAND_MAX_M = 7.0
+BOSCH_B5_DIVERGENCE_MIN_M = 0.75
 
 # Candidate P91 changes only the final Bosch publication view; raw detections,
 # grouping, physical IDs, qualification and alias bindings remain. SHADOW
@@ -3319,6 +3353,7 @@ class BoschPhysicalTracker:
   def __init__(self, raw_config: BoschRawTrackingConfig | None = None, group_config: BoschGroupingConfig | None = None):
     self.raw_manager = BoschRawTrackManager(raw_config)
     self.group_manager = BoschObjectGroupManager(group_config)
+    self.last_raw_tracks: tuple[BoschRawTrack, ...] = ()
 
   def set_decision_trace(self, enabled: bool) -> None:
     """Turn the shadow association traces on both layers on or off.
@@ -3331,6 +3366,7 @@ class BoschPhysicalTracker:
 
   def update(self, timestamp_ns, detections, *, yaw_rate=None, v_ego=math.nan, oem_slot=None, vision=()):
     raw = self.raw_manager.update(timestamp_ns, detections, yaw_rate=yaw_rate)
+    self.last_raw_tracks = raw
     result = self.group_manager.update(timestamp_ns, raw, yaw_rate=yaw_rate, v_ego=v_ego,
                                        oem_slot=oem_slot, vision=vision)
     return result
@@ -4342,6 +4378,496 @@ class BoschPublicationAliasAllocator:
     return {physical_id: self.physical_to_alias[physical_id] for physical_id in published}
 
 
+@dataclass(frozen=True, slots=True)
+class BoschB5ModelContext:
+  publication_ns: int
+  source_ns: int
+  road_edges: tuple[tuple[tuple[float, float], ...], ...]
+  road_edge_stds: tuple[float, ...]
+  lane_lines: tuple[tuple[tuple[float, float], ...], ...]
+  lane_probs: tuple[float, ...]
+  lane_stds: tuple[float, ...]
+  path: tuple[tuple[float, float], ...]
+
+
+@dataclass(slots=True)
+class _BoschB5ParentState:
+  raw_member_set: tuple[int, ...]
+  representative_raw_id: int
+  stable_scans: int
+  last_seen_ns: int
+  lifecycle_birth_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class BoschB5Decision:
+  timestamp_ns: int
+  target_pid: int
+  parent_pid: int | None
+  parent_stable_scans: int
+  target_vrel_code: int | None
+  parent_vrel_code: int | None
+  new_raw_count: int
+  new_pid_count: int
+  singleton: bool
+  n4_eligible: bool
+  decision: bool
+  reason: str
+
+
+class BoschBirthB5Defer:
+  """Frozen B5 decision plus a one-publication birth defer.
+
+  This state is downstream of raw association and physical grouping. Nothing
+  here is read by either tracker, and publication_view never feeds its result
+  back into this class or any existing Bosch filter.
+  """
+
+  def __init__(self, mode=BOSCH_B5_MODE):
+    self.mode = mode
+    self.states: dict[int, _BoschB5ParentState] = {}
+    self.raw_prior_owners: dict[int, set[int]] = {}
+    self.speed_samples: list[tuple[int, float]] = []
+    self.pose_samples: list[tuple[int, float, bool]] = []
+    self.model_contexts: list[BoschB5ModelContext] = []
+    self.last_scan_ns: int | None = None
+    self.last_decisions: tuple[BoschB5Decision, ...] = ()
+    self.would_suppress = frozenset()
+    self.last_suppressed: tuple[int, ...] = ()
+    self._counted_suppression_ns: int | None = None
+    self.suppressed_points = 0
+    self.suppressed_scans = 0
+    self.max_state_count = 0
+    self.max_raw_owner_count = 0
+    self.reset_count = 0
+    self.last_reset_reason = 'CONSTRUCTION'
+
+  def reset(self, reason='STATE_RESET'):
+    self.states.clear()
+    self.raw_prior_owners.clear()
+    self.speed_samples.clear()
+    self.pose_samples.clear()
+    self.model_contexts.clear()
+    self.last_scan_ns = None
+    self.last_decisions = ()
+    self.would_suppress = frozenset()
+    self.last_suppressed = ()
+    self._counted_suppression_ns = None
+    self.reset_count += 1
+    self.last_reset_reason = reason
+
+  @staticmethod
+  def _append_sample(samples, sample, *, horizon_ns=BOSCH_B5_MOTION_HISTORY_NS, maximum=64):
+    timestamp_ns = sample[0]
+    if samples and timestamp_ns < samples[-1][0]:
+      samples.clear()
+    if samples and timestamp_ns == samples[-1][0]:
+      samples[-1] = sample
+    else:
+      samples.append(sample)
+    cutoff = timestamp_ns - horizon_ns
+    first = bisect.bisect_left([row[0] for row in samples], cutoff)
+    if first:
+      del samples[:first]
+    if len(samples) > maximum:
+      del samples[:-maximum]
+
+  def ingest_pose(self, timestamp_ns, yaw_rate_left):
+    if not isinstance(timestamp_ns, int) or timestamp_ns <= 0:
+      return
+    valid = yaw_rate_left is not None and math.isfinite(yaw_rate_left)
+    self._append_sample(self.pose_samples, (timestamp_ns, float(yaw_rate_left or 0.), valid))
+
+  def ingest_speed(self, timestamp_ns, v_ego):
+    if not isinstance(timestamp_ns, int) or timestamp_ns <= 0 or not math.isfinite(v_ego):
+      return
+    self._append_sample(self.speed_samples, (timestamp_ns, float(v_ego)))
+
+  def ingest_model(self, model, publication_ns):
+    if model is None or not isinstance(publication_ns, int) or publication_ns <= 0:
+      return
+    source_ns = int(getattr(model, 'timestampEof', 0) or 0)
+    edges = getattr(model, 'roadEdges', ())
+    lanes = getattr(model, 'laneLines', ())
+    position = getattr(model, 'position', None)
+    edge_stds = tuple(float(value) for value in getattr(model, 'roadEdgeStds', ()))
+    lane_probs = tuple(float(value) for value in getattr(model, 'laneLineProbs', ()))
+    lane_stds = tuple(float(value) for value in getattr(model, 'laneLineStds', ()))
+    if (source_ns <= 0 or len(edges) != 2 or len(lanes) != 4 or position is None or
+        len(edge_stds) != 2 or len(lane_probs) != 4 or len(lane_stds) != 4):
+      return
+
+    def points(polyline):
+      return tuple((float(x), float(y)) for x, y in zip(polyline.x, polyline.y, strict=False)
+                   if math.isfinite(x) and math.isfinite(y))
+
+    context = BoschB5ModelContext(
+      publication_ns, source_ns, tuple(points(edge) for edge in edges), edge_stds,
+      tuple(points(lane) for lane in lanes), lane_probs, lane_stds, points(position))
+    if any(len(polyline) < 2 for polyline in context.road_edges + context.lane_lines) or len(context.path) < 2:
+      return
+    contexts = self.model_contexts
+    if contexts and publication_ns < contexts[-1].publication_ns:
+      contexts.clear()
+    if contexts and publication_ns == contexts[-1].publication_ns:
+      contexts[-1] = context
+    else:
+      contexts.append(context)
+    if len(contexts) > 4:
+      del contexts[:-4]
+
+  @staticmethod
+  def _interpolate(samples, timestamp_ns, value_index=1):
+    times = [row[0] for row in samples]
+    index = bisect.bisect_left(times, timestamp_ns)
+    if index <= 0:
+      return samples[0][value_index]
+    if index >= len(samples):
+      return samples[-1][value_index]
+    before, after = samples[index - 1], samples[index]
+    if after[0] == before[0]:
+      return before[value_index]
+    weight = (timestamp_ns - before[0]) / (after[0] - before[0])
+    return before[value_index] + weight * (after[value_index] - before[value_index])
+
+  def _integrate_motion(self, start_ns, end_ns):
+    speeds, poses = self.speed_samples, self.pose_samples
+    if (end_ns < start_ns or not speeds or not poses or
+        speeds[0][0] > start_ns or poses[0][0] > start_ns):
+      return None
+    x = y = heading = 0.
+    timestamp_ns = start_ns
+    pose_times = [row[0] for row in poses]
+    while timestamp_ns < end_ns:
+      next_ns = min(timestamp_ns + 10_000_000, end_ns)
+      middle_ns = (timestamp_ns + next_ns) // 2
+      pose_index = bisect.bisect_right(pose_times, middle_ns) - 1
+      if (pose_index < 0 or middle_ns - poses[pose_index][0] > BOSCH_B5_CONTEXT_MAX_AGE_NS or
+          not poses[pose_index][2]):
+        return None
+      speed = self._interpolate(speeds, middle_ns)
+      yaw = self._interpolate(poses, middle_ns)
+      if not math.isfinite(speed) or not math.isfinite(yaw):
+        return None
+      dt = (next_ns - timestamp_ns) * 1e-9
+      middle_heading = heading + .5 * yaw * dt
+      x += speed * math.cos(middle_heading) * dt
+      y += speed * math.sin(middle_heading) * dt
+      heading += yaw * dt
+      timestamp_ns = next_ns
+    return x, y, heading
+
+  @staticmethod
+  def _transform(points, dx, dy, heading):
+    cosine, sine = math.cos(heading), math.sin(heading)
+    transformed = []
+    for model_x, model_y in points:
+      x = model_x - BOSCH_B5_RADAR_TO_DEVICE_X_M - dx
+      y = -model_y - dy
+      transformed.append((cosine * x + sine * y, -sine * x + cosine * y))
+    return tuple(sorted(transformed))
+
+  @staticmethod
+  def _interp(points, x):
+    if len(points) < 2 or x < points[0][0] or x > points[-1][0]:
+      return math.nan
+    xs = [point[0] for point in points]
+    index = bisect.bisect_left(xs, x)
+    if index <= 0:
+      return points[0][1]
+    if index >= len(points):
+      return points[-1][1]
+    x0, y0 = points[index - 1]
+    x1, y1 = points[index]
+    return .5 * (y0 + y1) if x1 == x0 else y0 + (x - x0) / (x1 - x0) * (y1 - y0)
+
+  def _geometry(self, context, scan_ns):
+    if context.source_ns > scan_ns or scan_ns - context.source_ns > BOSCH_B5_CONTEXT_MAX_AGE_NS:
+      return None
+    motion = self._integrate_motion(context.source_ns, scan_ns)
+    if motion is None:
+      return None
+    dx, dy, heading = motion
+    return {
+      'edges': tuple(self._transform(edge, dx, dy, heading) for edge in context.road_edges),
+      'lanes': tuple(self._transform(lane, dx, dy, heading) for lane in context.lane_lines),
+      'path': self._transform(context.path, dx, dy, heading),
+      'edge_stds': context.road_edge_stds, 'lane_probs': context.lane_probs,
+      'lane_stds': context.lane_stds, 'source_ns': context.source_ns,
+    }
+
+  def _latest_context(self, scan_ns, now_ns):
+    available = [context for context in self.model_contexts if context.publication_ns <= now_ns]
+    if not available:
+      return None
+    latest = available[-1]
+    if now_ns - latest.publication_ns > BOSCH_B5_CONTEXT_MAX_AGE_NS:
+      return None
+    if latest.source_ns > scan_ns or scan_ns - latest.source_ns > BOSCH_B5_CONTEXT_MAX_AGE_NS:
+      return None
+    return latest
+
+  def _align(self, obj, geometry):
+    d_rel, y_rel = obj.d_rel, obj.y_rel
+    left = self._interp(geometry['edges'][0], d_rel)
+    right = self._interp(geometry['edges'][1], d_rel)
+    if not math.isfinite(left) or not math.isfinite(right) or left <= right:
+      return None
+    path_y = self._interp(geometry['path'], d_rel)
+    is_left = y_rel >= 0.
+    edge_y = left if is_left else right
+    outside = y_rel - left if is_left else right - y_rel
+    return {
+      'outside': outside, 'left': left, 'right': right, 'width': left - right,
+      'path_inside': math.isfinite(path_y) and right <= path_y <= left,
+      'edge_std': geometry['edge_stds'][0 if is_left else 1], 'edge_y': edge_y,
+    }
+
+  def _instant_lane(self, obj, geometry):
+    d_rel, y_rel = obj.d_rel, obj.y_rel
+    left = self._interp(geometry['edges'][0], d_rel)
+    right = self._interp(geometry['edges'][1], d_rel)
+    lane_y = [self._interp(line, d_rel) for line in geometry['lanes']]
+    if (not math.isfinite(left) or not math.isfinite(right) or left <= right or
+        len(lane_y) != 4 or not all(math.isfinite(value) for value in lane_y)):
+      return {'available': False}
+    reliable = [geometry['lane_probs'][index] >= BOSCH_B5_LANE_PROB_MIN and
+                geometry['lane_stds'][index] <= BOSCH_B5_LANE_STD_MAX_M for index in range(4)]
+    sign = 1. if y_rel >= 0. else -1.
+    edge_y = left if sign > 0. else right
+    entries = sorted(((value, index) for index, value in enumerate(lane_y)), reverse=True)
+    pair = any(
+      reliable[high_i] and reliable[low_i] and low <= y_rel <= high and
+      BOSCH_B5_CORRIDOR_WIDTH_MIN_M <= high - low <= BOSCH_B5_CORRIDOR_WIDTH_MAX_M and
+      sign * (.5 * (high + low) - edge_y) >= 0.
+      for (high, high_i), (low, low_i) in zip(entries, entries[1:], strict=False))
+    band = any(
+      reliable[index] and BOSCH_B5_CORRIDOR_WIDTH_MIN_M <= sign * (value - edge_y) <= BOSCH_B5_EDGE_LANE_BAND_MAX_M and
+      sign * (value - y_rel) >= 0.
+      for index, value in enumerate(lane_y))
+    diverging = False
+    inside_lines = [(sign * (edge_y - value), index) for index, value in enumerate(lane_y)
+                    if reliable[index] and sign * (edge_y - value) >= 0.]
+    if inside_lines:
+      target_gap, lane_index = min(inside_lines)
+      lane, edge = geometry['lanes'][lane_index], geometry['edges'][0 if sign > 0. else 1]
+      minimum_x = max(lane[0][0], edge[0][0])
+      anchor_x = max(minimum_x, d_rel - 20.)
+      if d_rel - anchor_x >= 10.:
+        lane_anchor, edge_anchor = self._interp(lane, anchor_x), self._interp(edge, anchor_x)
+        if math.isfinite(lane_anchor) and math.isfinite(edge_anchor):
+          anchor_gap = sign * (edge_anchor - lane_anchor)
+          diverging = target_gap >= 1. and target_gap - anchor_gap >= BOSCH_B5_DIVERGENCE_MIN_M
+    return {'available': True, 'lane_y': tuple(lane_y), 'reliable_count': sum(reliable),
+            'evidence': bool(pair or band or diverging)}
+
+  @staticmethod
+  def _population_std(values):
+    if len(values) < 2:
+      return math.nan
+    mean = sum(values) / len(values)
+    return math.sqrt(sum((value - mean) ** 2 for value in values) / len(values))
+
+  def _corridor_clear(self, obj, scan_ns, now_ns):
+    latest = self._latest_context(scan_ns, now_ns)
+    if latest is None:
+      return False
+    samples = []
+    for context in self.model_contexts:
+      if (context.publication_ns > now_ns or context.source_ns > scan_ns or
+          context.source_ns < scan_ns - BOSCH_B5_HISTORY_NS):
+        continue
+      geometry = self._geometry(context, scan_ns)
+      if geometry is None:
+        continue
+      instant = self._instant_lane(obj, geometry)
+      instant['source_ns'] = context.source_ns
+      samples.append(instant)
+    samples.sort(key=lambda row: row['source_ns'])
+    valid = [row for row in samples if row['available']]
+    if len(valid) < 2 or valid[-1]['source_ns'] - valid[0]['source_ns'] < BOSCH_B5_HISTORY_MIN_SPAN_NS:
+      return False
+    line_stds = []
+    for index in range(4):
+      values = [row['lane_y'][index] for row in valid]
+      std = self._population_std(values)
+      if math.isfinite(std):
+        line_stds.append(std)
+    if (not line_stds or max(line_stds) > BOSCH_B5_LANE_STABILITY_MAX_M or
+        min(row['reliable_count'] for row in valid[-2:]) < 2):
+      return False
+    return not all(row['evidence'] for row in valid[-2:])
+
+  @staticmethod
+  def _representative_code(obj):
+    member = next((member for member in obj.members
+                   if member.raw_track_id == obj.representative_raw_track_id), None)
+    return None if member is None else (member.detection.raw_word >> 21) & 0x3ff
+
+  def _n4_parent(self, target, objects, scan_ns, now_ns, v_ego, yaw_rate_left,
+                 camera_associations, oem_state, word0_pids, prior_raw_owners):
+    if not math.isfinite(v_ego) or v_ego < BOSCH_B5_MIN_VEGO_MPS:
+      return None, 'LOW_SPEED_FAIL_OPEN'
+    if yaw_rate_left is None or not math.isfinite(yaw_rate_left):
+      return None, 'POSE_UNAVAILABLE_FAIL_OPEN'
+    if abs(yaw_rate_left / max(v_ego, .1)) > BOSCH_B5_MAX_CURVATURE_1PM:
+      return None, 'HIGH_CURVATURE_FAIL_OPEN'
+    context = self._latest_context(scan_ns, now_ns)
+    if context is None:
+      return None, 'MODEL_STALE_FAIL_OPEN'
+    geometry = self._geometry(context, scan_ns)
+    if geometry is None:
+      return None, 'POSE_UNAVAILABLE_FAIL_OPEN'
+    aligned = {obj.physical_track_id: self._align(obj, geometry) for obj in objects}
+    target_alignment = aligned.get(target.physical_track_id)
+    if (target_alignment is None or not target_alignment['path_inside'] or
+        not BOSCH_B5_EDGE_WIDTH_MIN_M <= target_alignment['width'] <= BOSCH_B5_EDGE_WIDTH_MAX_M or
+        not math.isfinite(target_alignment['edge_std']) or
+        target_alignment['edge_std'] > BOSCH_B5_EDGE_STD_MAX_M):
+      return None, 'ROAD_EDGE_UNSTABLE_FAIL_OPEN'
+    if target_alignment['outside'] < BOSCH_B5_OUTSIDE_MARGIN_M:
+      return None, 'OUTSIDE_MARGIN_FAIL_OPEN'
+    target_world = target.v_rel + v_ego - yaw_rate_left * target.y_rel
+    if target_world <= BOSCH_B5_MIN_WORLD_SPEED_MPS:
+      return None, 'TARGET_DIRECTION_FAIL_OPEN'
+    if not self._corridor_clear(target, scan_ns, now_ns):
+      return None, 'CORRIDOR_UNKNOWN_OR_POSITIVE_FAIL_OPEN'
+
+    candidates = []
+    for parent in objects:
+      if parent.physical_track_id == target.physical_track_id:
+        continue
+      parent_alignment = aligned.get(parent.physical_track_id)
+      parent_world = parent.v_rel + v_ego - yaw_rate_left * parent.y_rel
+      if (parent_alignment is None or parent_alignment['outside'] > 0. or
+          parent.age_scans < BOSCH_B5_PARENT_MIN_AGE_SCANS or
+          parent_world <= BOSCH_B5_MIN_WORLD_SPEED_MPS):
+        continue
+      if (abs(target.d_rel - parent.d_rel) <= BOSCH_B5_MAX_D_M and
+          abs(target.y_rel - parent.y_rel) <= BOSCH_B5_MAX_Y_M and
+          abs(target.v_rel - parent.v_rel) <= BOSCH_B5_MAX_DV_MPS and
+          abs(target_world - parent_world) <= BOSCH_B5_MAX_DWORLD_MPS):
+        score = (abs(target_world - parent_world) + abs(target.d_rel - parent.d_rel) / BOSCH_B5_MAX_D_M +
+                 abs(target.y_rel - parent.y_rel) / BOSCH_B5_MAX_Y_M)
+        candidates.append((score, parent.physical_track_id, parent))
+    if len(candidates) != 1:
+      return None, 'AMBIGUOUS_PARENT_FAIL_OPEN' if candidates else 'NO_PARENT_FAIL_OPEN'
+    parent = candidates[0][2]
+    target_assoc = camera_associations.get(target.physical_track_id)
+    parent_assoc = camera_associations.get(parent.physical_track_id)
+    if (target_assoc is not None and target_assoc[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and target_assoc[1] >= 0 and
+        (parent_assoc is None or parent_assoc[0] != BOSCH_CAMERA_ASSOC_ASSIGNED or
+         parent_assoc[1] != target_assoc[1])):
+      return None, 'INDEPENDENT_CAMERA_FAIL_OPEN'
+    if oem_state == BOSCH_OEM_STATE_VALIDATED and target.physical_track_id in word0_pids:
+      return None, 'INDEPENDENT_OEM_FAIL_OPEN'
+    target_raws = {member.raw_track_id for member in target.members}
+    if any(owner != parent.physical_track_id for raw_id in target_raws
+           for owner in prior_raw_owners.get(raw_id, ())):
+      return None, 'INDEPENDENT_RAW_FAIL_OPEN'
+    return parent, 'N4_FROZEN'
+
+  def update(self, objects, raw_tracks, timestamp_ns, now_ns, v_ego, yaw_rate_left,
+             *, camera_associations=(), oem_state=BOSCH_OEM_STATE_NONE,
+             word0_pids=(), live_pids=(), live_raw_ids=()):
+    if self.mode == BOSCH_B5_OFF:
+      self.last_decisions = ()
+      self.would_suppress = frozenset()
+      return self.would_suppress
+    if self.last_scan_ns is not None:
+      if timestamp_ns <= self.last_scan_ns:
+        self.reset('CLOCK_RESET')
+      elif timestamp_ns - self.last_scan_ns >= BOSCH_STALE_NS:
+        self.reset('RADAR_INPUT_GAP')
+    self.last_scan_ns = timestamp_ns
+    live_pids = set(live_pids)
+    live_raw_ids = set(live_raw_ids)
+    for pid in tuple(self.states):
+      if pid not in live_pids:
+        del self.states[pid]
+    for raw_id in tuple(self.raw_prior_owners):
+      if raw_id not in live_raw_ids:
+        del self.raw_prior_owners[raw_id]
+    prior_raw_owners = {raw_id: frozenset(owners) for raw_id, owners in self.raw_prior_owners.items()}
+    for obj in objects:
+      pid = obj.physical_track_id
+      structure = tuple(sorted(member.raw_track_id for member in obj.members))
+      previous = self.states.get(pid)
+      if (previous is None or obj.age_scans == 1 or previous.raw_member_set != structure or
+          previous.representative_raw_id != obj.representative_raw_track_id):
+        birth_ns = timestamp_ns if previous is None or obj.age_scans == 1 else previous.lifecycle_birth_ns
+        self.states[pid] = _BoschB5ParentState(
+          structure, obj.representative_raw_track_id, 1, timestamp_ns, birth_ns)
+      else:
+        previous.stable_scans = min(BOSCH_B5_COUNTER_MAX, previous.stable_scans + 1)
+        previous.last_seen_ns = timestamp_ns
+    self.max_state_count = max(self.max_state_count, len(self.states))
+
+    new_raw_count = sum(track.age_scans == 1 for track in raw_tracks)
+    newborns = [obj for obj in objects if obj.age_scans == 1]
+    new_pid_count = len(newborns)
+    camera_associations = dict(camera_associations)
+    word0_pids = frozenset(word0_pids)
+    decisions = []
+    suppressed = set()
+    for target in newborns:
+      singleton = len(target.members) == 1
+      parent, reason = self._n4_parent(
+        target, objects, timestamp_ns, now_ns, v_ego, yaw_rate_left,
+        camera_associations, oem_state, word0_pids, prior_raw_owners)
+      n4 = parent is not None
+      parent_state = self.states.get(parent.physical_track_id) if parent is not None else None
+      stable_scans = parent_state.stable_scans if parent_state is not None else 0
+      target_code = self._representative_code(target)
+      parent_code = self._representative_code(parent) if parent is not None else None
+      if not n4:
+        decision = False
+      elif not singleton:
+        decision, reason = False, 'NON_SINGLETON_FAIL_OPEN'
+      elif target_code is None or parent_code is None or target_code != parent_code:
+        decision, reason = False, 'VREL_NOT_EXACT_FAIL_OPEN'
+      elif new_raw_count != 1:
+        decision, reason = False, 'NEW_RAW_COUNT_FAIL_OPEN'
+      elif new_pid_count != 1:
+        decision, reason = False, 'NEW_PID_COUNT_FAIL_OPEN'
+      elif stable_scans < BOSCH_B5_PARENT_STABILITY_SCANS:
+        decision, reason = False, 'PARENT_NOT_STABLE_FAIL_OPEN'
+      else:
+        decision, reason = True, 'BIRTH_B5_ACTIVE_DEFER'
+        suppressed.add(target.physical_track_id)
+      decisions.append(BoschB5Decision(
+        timestamp_ns, target.physical_track_id,
+        parent.physical_track_id if parent is not None else None,
+        stable_scans, target_code, parent_code, new_raw_count, new_pid_count,
+        singleton, n4, decision, reason))
+
+    for obj in objects:
+      for member in obj.members:
+        self.raw_prior_owners.setdefault(member.raw_track_id, set()).add(obj.physical_track_id)
+    self.max_raw_owner_count = max(self.max_raw_owner_count, len(self.raw_prior_owners))
+    self.last_decisions = tuple(decisions)
+    self.would_suppress = frozenset(suppressed)
+    self.last_suppressed = ()
+    return self.would_suppress
+
+  def publication_view(self, objects):
+    if (self.mode != BOSCH_B5_ACTIVE or not objects or not self.would_suppress or
+        not all(obj.timestamp_ns == self.last_scan_ns for obj in objects)):
+      self.last_suppressed = ()
+      return objects
+    suppressed = tuple(sorted(obj.physical_track_id for obj in objects
+                              if obj.physical_track_id in self.would_suppress))
+    self.last_suppressed = suppressed
+    if not suppressed:
+      return objects
+    if self._counted_suppression_ns != self.last_scan_ns:
+      self.suppressed_points += len(suppressed)
+      self.suppressed_scans += 1
+      self._counted_suppression_ns = self.last_scan_ns
+    hidden = set(suppressed)
+    return tuple(obj for obj in objects if obj.physical_track_id not in hidden)
+
+
 def bosch_published_surface(obj):
   """(raw_track_id, d_rel, y_rel, v_rel) that reaches RadarData for `obj`.
 
@@ -4477,7 +5003,8 @@ class BoschRadarProvider:
                oem_gate_mode=BOSCH_OEM_GATE_MODE, scc_bus=BOSCH_SCC_BUS,
                curve_reacquire_mode=BOSCH_CAMERA_CURVE_REACQUIRE_MODE,
                provisional_bundle=True, family_companion_mode=BOSCH_FAMILY_COMPANION_MODE,
-               burst_multireturn_mode=BOSCH_BURST_MULTIRETURN_MODE):
+               burst_multireturn_mode=BOSCH_BURST_MULTIRETURN_MODE,
+               b5_mode=BOSCH_B5_MODE):
     self.bus = bus
     self.camera_bus = camera_bus
     self.scc_bus = scc_bus
@@ -4487,6 +5014,7 @@ class BoschRadarProvider:
     self.qualifier = _BoschPublicationPassThrough() if qualification else None
     self.family_companion = _BoschFamilyCompanionFilter(family_companion_mode)
     self.burst_multireturn = _BoschBurstMultiReturnDefer(burst_multireturn_mode)
+    self.b5_birth_defer = BoschBirthB5Defer(b5_mode)
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
     self.oem_gate = _BoschOemValidationGate(oem_gate_mode)
     self.scc_obj_valid = None
@@ -4718,11 +5246,13 @@ class BoschRadarProvider:
       objects = tuple(obj for obj in objects if obj.physical_track_id not in withheld)
     ext = self.camera_extended
     if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
-      return self._burst_view(self.family_companion.publication_view(self._final_view(objects)))
+      return self.b5_birth_defer.publication_view(
+        self._burst_view(self.family_companion.publication_view(self._final_view(objects))))
     if not ext.mature_groups or not objects:
       self.test_last_suppressed = ()
       self.test_last_active_groups = 0
-      return self._burst_view(self.family_companion.publication_view(self._final_view(objects)))
+      return self.b5_birth_defer.publication_view(
+        self._burst_view(self.family_companion.publication_view(self._final_view(objects))))
     # 다른 scan의 tuple 또는 qualification에서 대표가 빠진 그룹은 baseline으로 연다.
     by_pid = {obj.physical_track_id: obj for obj in objects}
     suppressed = set()
@@ -4736,8 +5266,9 @@ class BoschRadarProvider:
       active_groups += 1
     self.test_last_suppressed = tuple(sorted(suppressed))
     self.test_last_active_groups = active_groups
-    return self._burst_view(self.family_companion.publication_view(self._final_view(
-      tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects)))
+    return self.b5_birth_defer.publication_view(
+      self._burst_view(self.family_companion.publication_view(self._final_view(
+        tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects))))
 
   @property
   def slot_to_ids(self):
@@ -4777,6 +5308,10 @@ class BoschRadarProvider:
       'burst_multireturn_mode': self.burst_multireturn.mode,
       'burst_multireturn_suppressed': sorted(self.burst_multireturn.would_suppress),
       'burst_multireturn_decisions': [vars(decision) for decision in self.burst_multireturn.last_decisions],
+      'b5_mode': self.b5_birth_defer.mode,
+      'b5_suppressed': sorted(self.b5_birth_defer.would_suppress),
+      'b5_decisions': [{name: getattr(decision, name) for name in decision.__dataclass_fields__}
+                       for decision in self.b5_birth_defer.last_decisions],
       'objects': [{'physicalTrackId': obj.physical_track_id,
                    'rawTrackIds': [member.raw_track_id for member in obj.members],
                    'slots': list(obj.member_slots),
@@ -4922,6 +5457,7 @@ class BoschRadarProvider:
       self.last_companion_deferred = ()
       self.family_companion.reset(now_ns, 'STATE_RESET')
       self.burst_multireturn.reset(now_ns, 'STATE_RESET')
+      self.b5_birth_defer.reset('PROVIDER_TIMEOUT')
       self.p91.update((), now_ns, v_ego, yaw_rate=yaw_rate_left)
       self.oem_gate.update((), now_ns, v_ego, state=BOSCH_OEM_STATE_NONE)
       self._debug_gate_suppress = frozenset()
@@ -5047,6 +5583,16 @@ class BoschRadarProvider:
     # OEM also validated in the same scan can clear a clone suspicion.
     p91_word0 = processed_pids if oem_state == BOSCH_OEM_STATE_VALIDATED and scc_valid is not False else frozenset()
     self.p91.update(qualified, availability_ns, v_ego, word0_pids=p91_word0, yaw_rate=yaw_rate_left)
+    # B5 reads the complete post-grouping tuple and the already-computed
+    # camera/OEM evidence, but no existing filter reads B5 state. Its action is
+    # applied only after alias allocation in publication_view().
+    self.b5_birth_defer.update(
+      qualified, self.tracker.last_raw_tracks, availability_ns, self._last_now_ns,
+      v_ego, yaw_rate_left,
+      camera_associations=self.camera_extended.last_associations,
+      oem_state=oem_state, word0_pids=processed_pids,
+      live_pids=self.tracker.group_manager.states,
+      live_raw_ids=self.tracker.raw_manager._states)
     return qualified
 
 # End Bosch MRRevo14F passive radar
@@ -5201,10 +5747,12 @@ class RadarInterface(RadarInterfaceBase):
     if (pose is not None and 0 <= now_ns - pose_ns <= 200_000_000 and
         pose.inputsOK and pose.sensorsOK and angular is not None and angular.valid and math.isfinite(angular.z)):
       yaw = -float(angular.z)
+    self.bosch.b5_birth_defer.ingest_pose(int(pose_ns), yaw)
     cues = ()
     path = ()
     source_ns = 0
     if model is not None and 0 <= now_ns - model_ns <= 200_000_000:
+      self.bosch.b5_birth_defer.ingest_model(model, int(model_ns))
       if model.leadsV3:
         lead = model.leadsV3[0]
         if lead.x and lead.y:
@@ -5250,6 +5798,7 @@ class RadarInterface(RadarInterfaceBase):
         self._bosch_context or (time.monotonic_ns(), None, (), (), None, 0))
       self._bosch_now_ns = now_ns
       self._bosch_context = None
+      self.bosch.b5_birth_defer.ingest_speed(now_ns, self.v_ego)
       objects = self.bosch.update(can_strings, now_ns=now_ns, v_ego=self.v_ego,
                                   yaw_rate_left=yaw, vision=cues, path=path, path_ns=path_ns,
                                   path_source_ns=path_source_ns)
