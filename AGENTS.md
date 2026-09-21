@@ -1,5 +1,18 @@
 # Repository memory
 
+- On 2026-09-21 the user authorized radar optimization and preprocessing
+  isolation to reduce card/camerad contention on core6, with mandatory radar
+  regression validation. RadarInterface/liveTracks now belong to radarcan on
+  core4 FIFO51 (below controlsd/selfdrived FIFO53); card remains core6 FIFO53,
+  model-driven radard/planner core5. Preserve carState.radarInput batch metadata
+  and non-conflated CAN/ego joining: using an arbitrary latest ego sample breaks
+  delay/filter cadence. Keep planner's existing fast liveTracks path during this
+  first isolation step. See docs/radar_process_isolation.md for equivalence,
+  corpus failures and limits. C3/C4 device timing/camera improvements are NOT
+  yet validated. Never present same-core contention as a proved IFE root cause
+  or desktop speedup as a vehicle result. Radar changes also require NAS replay
+  deployment and actual result verification below.
+
 - On 2026-09-20, EV9 `3eef70e8fb92485c` (tizi/C3 family) reproduced Cinque v3
   dropped-frame odometry invalidity even with `xiaoge_data` stopped. Raw-image
   upload averaged 24.75 ms and model execution 50.69 ms; C4 `07b62e389ed26c81`
@@ -10,14 +23,23 @@
   `docs/c3_preupload_warp.md` for implementation, validation limits and evidence.
   EV9 segment `000002c9--15d447d91b--0` on 9a349b60 failed the QCOM/AMD pixel
   comparison and fell back to AMD (7,471,616 USB bytes, about 24.8 ms upload).
-  The optimization is NOT vehicle-validated or confirmed active. Diagnose the
+  At that stage the optimization was NOT confirmed active. Diagnose the
   per-probe mismatch details before changing warp math or acceptance criteria.
   Follow-up `000002ca--50469cb155--0` on 820f82ea found 16 repeat-stable
   projective-only mismatches; all eight logged samples reconstruct as adjacent
   source pixels at half-pixel rounding boundaries. Validation now checks each
   mismatch against correct-camera/plane NV12 source values within 0.00025
   source pixels of a rounding boundary. Do not replace this with a percentage
-  or intensity tolerance; device activation/timing still need confirmation.
+  or intensity tolerance. On 2026-09-21, EV9 `000002cc--03d0a44f7d--10`
+  on 2723a8eb confirmed QCOM active: 393,728 USB bytes, 5.36 ms upload,
+  34.98 ms mean model execution. Four remaining warnings matched complete
+  camera streams with 12.6-13.2 ms SOF skew: Carrot's strict 10 ms pairing
+  discarded four main frames. Current pairing allows at most 20 ms skew;
+  metadata replay retains all 1,200 EV9 pairs while preserving real Ioniq
+  phase-slip/IFE-loss gaps. This is not on-device validation of the pairing fix.
+  Official v3 also publishes invalid odometry after a real main-frame gap;
+  do not describe this policy as a Carrot-only regression. Official pairing
+  logs >10 ms skew but proceeds; Carrot still bounds large/stale pairs.
   Preserve official model input/outputs and recurrent state; never hide overload
   by weakening pose validity. Evaluate model/runtime updates per device family;
   do not assume C4 validation covers C3, or automatically freeze all C3 models.

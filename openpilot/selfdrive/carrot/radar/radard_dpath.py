@@ -9,6 +9,7 @@ from typing import Any
 from openpilot.cereal import car, log, messaging
 from openpilot.common.params import Params
 from openpilot.common.realtime import Priority, config_realtime_process
+from openpilot.common.runtime_diagnostics import RuntimeDiagnostics
 from openpilot.common.swaglog import cloudlog
 from opendbc.car.hyundai.values import HyundaiExtFlags
 from openpilot.selfdrive.carrot.radar import effective_radar_track_mode
@@ -61,12 +62,12 @@ def corner_radar_enabled(CP: car.CarParams, enable_corner_radar: int) -> bool:
 
 
 def bosch_radar_tracks_active(CP: car.CarParams, enable_radar_tracks: int) -> bool:
-  """Cars whose liveTracks cadence comes from card's own frame counter.
+  """Cars whose liveTracks cadence comes from RadarInterface's frame counter.
 
   This is the same condition that builds the Hyundai Bosch provider in
   opendbc hyundai/radar_interface.py, so it selects exactly the configurations
-  whose liveTracks publication is gated on `self.frame % 5 == 0` inside card's
-  free-running 100 Hz Ratekeeper instead of a radar CAN trigger message.
+  whose liveTracks publication is gated on `self.frame % 5 == 0` inside
+  radarcan's exact 100 Hz card-batch stream instead of a radar CAN trigger.
   """
   return (
     CP.brand == "hyundai"
@@ -244,11 +245,12 @@ def main() -> None:
   )
   cloudlog.info("dPath radard got CarParams")
 
-  # Hyundai Bosch publishes liveTracks on card's own 20 Hz frame counter, a clock
-  # that is independent of modelV2. A conflated non-polled socket read once per
-  # modelV2 wake therefore aliases 2:1 whenever the two 20 Hz clocks drift onto the
-  # same boundary, and the conflated queue discards the second record. Waking on
-  # liveTracks as well keeps the observed cadence equal to the publication cadence.
+  # Hyundai Bosch publishes liveTracks on RadarInterface's 20 Hz frame counter,
+  # driven by card's exact batches and independent of modelV2. A conflated read
+  # once per modelV2 wake therefore aliases 2:1 whenever the two 20 Hz clocks
+  # drift onto the same boundary, and the conflated queue discards the second
+  # record. Waking on liveTracks as well keeps the observed cadence equal to the
+  # publication cadence.
   # Its 11.2 Hz lower bound is unchanged, and every other car keeps the single poll.
   poll: str | list[str] = "modelV2"
   if bosch_radar_tracks_active(CP, effective_radar_track_mode(
@@ -263,12 +265,18 @@ def main() -> None:
   )
   pm = messaging.PubMaster(["radarState"])
   radar = DPathRadarD(CP)
+  diagnostics = RuntimeDiagnostics('radard', cloudlog.event)
 
   while True:
     sm.update()
     if sm.updated["modelV2"]:
+      start, cpu_start = time.monotonic(), time.thread_time()
       radar.update(sm, sm["liveTracks"])
       radar.publish(pm)
+      diagnostics.record(work_ms=(time.monotonic() - start) * 1000,
+                         thread_cpu_ms=(time.thread_time() - cpu_start) * 1000,
+                         model_age_ms=(start - sm.logMonoTime['modelV2'] * 1e-9) * 1000,
+                         tracks_age_ms=(start - sm.logMonoTime['liveTracks'] * 1e-9) * 1000)
 
 
 if __name__ == "__main__":

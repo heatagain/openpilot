@@ -116,6 +116,7 @@ class _FakeSubMaster:
     self.script: list[dict] = []
     self.updated: dict = {}
     self.data = {s: object() for s in services}
+    self.logMonoTime = dict.fromkeys(services, 0)
 
   def update(self):
     if not self.script:
