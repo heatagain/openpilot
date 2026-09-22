@@ -15,6 +15,7 @@ from opendbc.can import CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.carlog import researchlog
 from opendbc.car.interfaces import RadarInterfaceBase
+from opendbc.car.radar_lead_filter import RadarLeadFilter
 from opendbc.car.hyundai.values import DBC, HyundaiFlags, HyundaiExtFlags
 from openpilot.common.params import Params
 from opendbc.car.hyundai.hyundaicanfd import CanBus
@@ -272,6 +273,8 @@ BOSCH_WINDOW_NS = 20_000_000
 BOSCH_STALE_NS = 300_000_000
 BOSCH_OUTPUT_INTERVAL_NS = 100_000_000
 BOSCH_SAMPLE_HOLD_NS = 150_000_000  # one 10 Hz observation period plus one SCC publication period
+BOSCH_ALEAD_SAMPLE_PERIOD_S = .10
+BOSCH_ALEAD_STATE_MAX = 128
 
 # Candidate A B5: the frozen birth signature may defer only the newborn's
 # first publication. Tracking, grouping, physical IDs, qualification, aliases
@@ -4885,18 +4888,170 @@ def bosch_published_surface(obj):
   return surface.raw_track_id, surface.d_rel, surface.y_rel, surface.v_rel
 
 
-def bosch_fill_point(point, obj, v_ego, alias=None):
+@dataclass(slots=True)
+class BoschLeadAccelerationState:
+  v_lead_filtered: float
+  lead_filter: RadarLeadFilter
+  last_scan_ns: int
+  update_count: int
+  a_lead: float
+
+  def update(self, v_lead):
+    self.v_lead_filtered = .5 * self.v_lead_filtered + .5 * v_lead
+    stationary = abs(self.v_lead_filtered) < .3 and abs(v_lead - self.v_lead_filtered) < .05
+    return self.lead_filter.update(v_lead, stationary=stationary)
+
+
+class BoschLeadAccelerationEstimator:
+  """Physical-PID-owned software causal lead acceleration estimate.
+
+  This is not Bosch-native decoded acceleration. State updates happen only on
+  fresh completed Bosch scans; held publications reuse the stored estimate.
+  """
+  def __init__(self):
+    self.states = {}
+    self._a_lead_by_pid = {}
+    self.last_scan_ns = None
+    self.reset_count = 0
+    self.last_reset_reason = 'INITIAL'
+    self.last_publication_kind = 'INITIAL'
+    self.expired_count = 0
+    self.last_expiry_reason = 'NONE'
+    self.update_count = 0
+    self.peak_state_count = 0
+    self.allocation_count = 0
+    self.held_publication_count = 0
+    self.held_update_count = 0
+    self.invalid_input_count = 0
+    self.corrupt_state_count = 0
+    self.clock_reset_count = 0
+    self.gap_reset_count = 0
+
+  def reset(self, reason='STATE_RESET'):
+    self.states.clear()
+    self._a_lead_by_pid.clear()
+    self.last_scan_ns = None
+    self.reset_count += 1
+    self.last_reset_reason = reason
+    self.last_publication_kind = 'RESET'
+
+  @staticmethod
+  def _v_lead(obj, v_ego):
+    surface = obj.published_surface
+    return v_ego + (obj.v_rel if surface is None else surface.v_rel)
+
+  def update(self, objects, scan_ns, v_ego, live_pids):
+    if scan_ns is None:
+      self.last_publication_kind = 'NO_SCAN'
+      return {}
+    if isinstance(scan_ns, bool) or not isinstance(scan_ns, Integral) or scan_ns < 0:
+      self.reset('INVALID_SCAN_TIMESTAMP')
+      self.invalid_input_count += len(objects)
+      return {}
+    publication_kind = 'HELD' if scan_ns == self.last_scan_ns else 'FRESH'
+    if publication_kind == 'HELD':
+      self.last_publication_kind = publication_kind
+      self.held_publication_count += 1
+      return self._a_lead_by_pid
+    if self.last_scan_ns is not None:
+      if scan_ns < self.last_scan_ns:
+        self.clock_reset_count += 1
+        self.reset('CLOCK_RESET')
+      elif scan_ns > self.last_scan_ns and scan_ns - self.last_scan_ns >= BOSCH_STALE_NS:
+        self.gap_reset_count += 1
+        self.reset('SCAN_GAP')
+    current = objects
+    result = self._a_lead_by_pid
+    result.clear()
+    for obj in current:
+      pid = obj.physical_track_id
+      state = self.states.get(pid)
+      if state is not None and not isinstance(state, BoschLeadAccelerationState):
+        del self.states[pid]
+        state = None
+        result[pid] = math.nan
+        self.corrupt_state_count += 1
+        continue
+      if state is None or state.last_scan_ns != scan_ns:
+        v_lead = self._v_lead(obj, v_ego)
+        if not math.isfinite(v_lead):
+          if state is not None:
+            del self.states[pid]
+          result[pid] = math.nan
+          self.invalid_input_count += 1
+          continue
+        if state is None:
+          state = BoschLeadAccelerationState(
+            float(v_lead), RadarLeadFilter(float(v_lead), BOSCH_ALEAD_SAMPLE_PERIOD_S),
+            scan_ns, 1, 0.0)
+          self.allocation_count += 1
+        else:
+          filtered = state.update(v_lead)
+          if not math.isfinite(filtered):
+            del self.states[pid]
+            result[pid] = math.nan
+            self.corrupt_state_count += 1
+            continue
+          state.last_scan_ns = scan_ns
+          state.update_count += 1
+          state.a_lead = float(filtered) if state.update_count >= 6 else 0.0
+        self.states[pid] = state
+        self.update_count += 1
+      result[pid] = state.a_lead
+    for pid in tuple(self.states):
+      if pid not in live_pids and pid not in result:
+        del self.states[pid]
+        self.expired_count += 1
+        self.last_expiry_reason = 'PID_DEATH'
+    if len(self.states) > BOSCH_ALEAD_STATE_MAX:
+      victims = sorted((pid in result, state.last_scan_ns, pid) for pid, state in self.states.items())
+      for _, _, pid in victims[:len(self.states) - BOSCH_ALEAD_STATE_MAX]:
+        del self.states[pid]
+        if pid in result:
+          result[pid] = math.nan
+        self.expired_count += 1
+        self.last_expiry_reason = 'STATE_CAP'
+    self.last_scan_ns = scan_ns
+    self.last_publication_kind = publication_kind
+    self.peak_state_count = max(self.peak_state_count, len(self.states))
+    return result
+
+  def debug_snapshot(self, now_ns):
+    return {
+      'last_scan_ns': self.last_scan_ns, 'reset_count': self.reset_count,
+      'last_reset_reason': self.last_reset_reason,
+      'last_publication_kind': self.last_publication_kind,
+      'expired_count': self.expired_count, 'last_expiry_reason': self.last_expiry_reason,
+      'update_count': self.update_count, 'state_count': len(self.states),
+      'peak_state_count': self.peak_state_count,
+      'allocation_count': self.allocation_count,
+      'held_publication_count': self.held_publication_count,
+      'held_update_count': self.held_update_count,
+      'invalid_input_count': self.invalid_input_count,
+      'corrupt_state_count': self.corrupt_state_count,
+      'clock_reset_count': self.clock_reset_count, 'gap_reset_count': self.gap_reset_count,
+      'states': [{
+        'physical_pid': pid, 'source_scan_timestamp_ns': state.last_scan_ns,
+        'estimator_update_count': state.update_count,
+        'estimated_aLead': state.a_lead,
+        'state_age_ns': max(0, now_ns - state.last_scan_ns),
+      } for pid, state in sorted(self.states.items())],
+    }
+
+
+def bosch_fill_point(point, obj, v_ego, alias=None, a_lead=math.nan):
   point.trackId = obj.physical_track_id if alias is None else alias[obj.physical_track_id]
   _, d_rel, y_rel, v_rel = bosch_published_surface(obj)
   point.dRel, point.yRel, point.vRel = d_rel, y_rel, v_rel
-  point.aRel = point.yvRel = point.aLead = point.jLead = math.nan
+  point.aRel = point.yvRel = point.jLead = math.nan
+  point.aLead = a_lead
   point.vLead = v_ego + v_rel
   point.radarSource = 'frontRadar'
   point.trackState = 0
   point.measured = True
 
 
-def bosch_append_points(radar, objects, v_ego, now_ns, alias=None):
+def bosch_append_points(radar, objects, v_ego, now_ns, alias=None, a_lead_by_pid=None):
   """Append directly to the final native list, retaining SCC aliasing safety."""
   if not objects:
     return
@@ -4907,7 +5062,8 @@ def bosch_append_points(radar, objects, v_ego, now_ns, alias=None):
     points[index] = values
   for index, obj in enumerate(objects, offset):
     point = points[index]
-    bosch_fill_point(point, obj, v_ego, alias)
+    a_lead = math.nan if a_lead_by_pid is None else a_lead_by_pid.get(obj.physical_track_id, math.nan)
+    bosch_fill_point(point, obj, v_ego, alias, a_lead)
     members = obj.members
     if len(members) == 1:
       representative = members[0]
@@ -5648,6 +5804,7 @@ class RadarInterface(RadarInterfaceBase):
       scc_bus = CAN.CAM if CP.flags & HyundaiFlags.CAMERA_SCC else CAN.ECAN
       self.bosch = BoschRadarProvider(bus, camera_bus=CAN.ACAN, scc_bus=scc_bus,
                                       camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE)
+      self._bosch_lead_acceleration = BoschLeadAccelerationEstimator()
       self._bosch_make_points = bosch_make_points
     self.corner_object_tracks = bool(CP.extFlags & HyundaiExtFlags.CORNER_RADAR_OBJECTS_235.value) and self.params.get_int("EnableCornerRadar") > 0
     self.corner_object_180_tracks = bool(CP.extFlags & HyundaiExtFlags.CORNER_RADAR_OBJECTS_180.value) and self.params.get_int("EnableCornerRadar") > 0
@@ -5784,8 +5941,18 @@ class RadarInterface(RadarInterfaceBase):
                  else ())
       alias = self.bosch.publication_aliases.update(
         self._bosch_now_ns, (obj.physical_track_id for obj in objects), self.bosch.tracker.group_manager.states)
+      # Some replay/test harnesses construct RadarInterface without __init__.
+      # Keep the estimator Bosch-local and initialize it on first use there too.
+      if not hasattr(self, '_bosch_lead_acceleration'):
+        self._bosch_lead_acceleration = BoschLeadAccelerationEstimator()
+      if self.bosch._debug_timeout:
+        self._bosch_lead_acceleration.reset('PROVIDER_TIMEOUT')
+        a_lead_by_pid = {}
+      else:
+        a_lead_by_pid = self._bosch_lead_acceleration.update(
+          objects, scan_ns, self.v_ego, self.bosch.tracker.group_manager.states)
       objects = self.bosch.publication_view(objects, self._bosch_now_ns)
-      bosch_append_points(ret, objects, self.v_ego, self._bosch_now_ns, alias)
+      bosch_append_points(ret, objects, self.v_ego, self._bosch_now_ns, alias, a_lead_by_pid)
     return ret
 
   def update(self, can_strings):

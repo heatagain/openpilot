@@ -17,6 +17,7 @@ from opendbc.car.hyundai.radar_interface import (
   RADAR_START_ADDR_CANFD3,
   BOSCH_B5_ACTIVE,
   BOSCH_B5_PARENT_STABILITY_SCANS,
+  BOSCH_ALEAD_SAMPLE_PERIOD_S,
   BOSCH_CAMERA_ASSOC_ASSIGNED,
   BOSCH_CAMERA_ASSOC_UNRESOLVED,
   BOSCH_OEM_STATE_NONE,
@@ -24,6 +25,7 @@ from opendbc.car.hyundai.radar_interface import (
   BoschB5ModelContext,
   BoschBirthB5Defer,
   BoschGroupingConfig,
+  BoschLeadAccelerationEstimator,
   BoschPhysicalObject,
   BoschPhysicalTracker,
   BoschPublicationAliasAllocator,
@@ -41,6 +43,7 @@ from opendbc.car.hyundai.radar_interface import (
   corner_object_position_valid,
   deduplicate_corner_candidates,
 )
+from opendbc.car.radar_tracks import MyTrack
 from opendbc.car.hyundai.values import CAR, HyundaiExtFlags, HyundaiFlags
 
 
@@ -1035,6 +1038,131 @@ class TestBoschPublicationAlias:
         publications.append(frame)
     assert publications == [9, 14, 19, 24, 29]
     assert interface.bosch.publication_aliases.denial_count == 0
+
+
+class TestBoschLeadAccelerationEstimator:
+  PID = 1_000_700
+
+  @classmethod
+  def obj(cls, ns, v_rel, *, pid=None, raw_id=70):
+    pid = cls.PID if pid is None else pid
+    detection = BoschRawDetection(ns, raw_id % 32, 40., 0., float(v_rel), raw_word=raw_id)
+    track = BoschRawTrack(raw_id, detection, 1, False)
+    return BoschPhysicalObject(pid, ns, (track,), raw_id, 40., 0., float(v_rel),
+                               False, False, 1, 'single_return')
+
+  @classmethod
+  def run(cls, velocities, *, estimator=None, pid=None, start_ns=1_000_000_000):
+    pid = cls.PID if pid is None else pid
+    estimator = BoschLeadAccelerationEstimator() if estimator is None else estimator
+    values = []
+    for index, velocity in enumerate(velocities):
+      ns = start_ns + index * 100_000_000
+      values.append(estimator.update((cls.obj(ns, velocity, pid=pid),), ns, 20., {pid})[pid])
+    return estimator, values
+
+  def test_constant_speed_braking_and_reacceleration(self):
+    _, steady = self.run([0.] * 20)
+    assert steady == [0.] * 20
+    estimator, braking = self.run([0.] * 6 + [-.25 * i for i in range(1, 9)])
+    assert min(braking) < -.2
+    _, release = self.run([-2. + .25 * i for i in range(1, 13)], estimator=estimator,
+                          start_ns=1_000_000_000 + len(braking) * 100_000_000)
+    assert max(release) > 0.
+
+  def test_held_publications_do_not_update(self):
+    estimator = BoschLeadAccelerationEstimator()
+    first = self.obj(1_000_000_000, 0.)
+    estimator.update((first,), first.timestamp_ns, 20., {self.PID})
+    estimator.update((first,), first.timestamp_ns, 21., {self.PID})
+    assert estimator.update_count == 1
+    assert estimator.last_publication_kind == 'HELD'
+    estimator.update((self.obj(1_100_000_000, -.25),), 1_100_000_000, 20., {self.PID})
+    assert estimator.update_count == 2
+    assert estimator.last_publication_kind == 'FRESH'
+
+  def test_same_pid_representative_switch_and_new_pid_independence(self):
+    estimator, _ = self.run([0.] * 6)
+    state = estimator.states[self.PID]
+    estimator.update((self.obj(1_600_000_000, -.25, raw_id=71),), 1_600_000_000, 20., {self.PID})
+    assert estimator.states[self.PID] is state
+    new_pid = self.PID + 1
+    result = estimator.update((self.obj(3_000_000_000, -2., pid=new_pid, raw_id=72),),
+                              3_000_000_000, 20., {new_pid})
+    assert result[new_pid] == 0.
+    assert self.PID not in estimator.states
+
+  def test_expiry_scan_gap_and_explicit_timeout_reset(self):
+    estimator, _ = self.run([0.] * 6)
+    scan_ns = estimator.last_scan_ns
+    estimator.update((), scan_ns + 100_000_000, 20., set())
+    assert not estimator.states
+    assert estimator.last_expiry_reason == 'PID_DEATH'
+    estimator, _ = self.run([0.] * 6)
+    timeout = estimator.last_scan_ns + radar_interface_module.BOSCH_STALE_NS
+    result = estimator.update((self.obj(timeout, -2.),), timeout, 20., {self.PID})
+    assert result[self.PID] == 0.
+    assert estimator.last_reset_reason == 'SCAN_GAP'
+    estimator.reset('PROVIDER_TIMEOUT')
+    assert not estimator.states
+    assert estimator.last_reset_reason == 'PROVIDER_TIMEOUT'
+
+  def test_prefix_and_exact_mytrack_parity(self):
+    velocities = [0.] * 6 + [-.25 * i for i in range(1, 9)] + [-2. + .25 * i for i in range(1, 9)]
+    _, full = self.run(velocities)
+    for cutoff in (1, 6, 10, len(velocities)):
+      _, prefix = self.run(velocities[:cutoff])
+      assert prefix == full[:cutoff]
+    expected, track = [], None
+    for velocity in velocities:
+      point = SimpleNamespace(radarSource='frontRadar', dRel=40., yRel=0., vRel=velocity,
+                              yvRel=0., vLead=20. + velocity, measured=True)
+      track = MyTrack(self.PID, point, BOSCH_ALEAD_SAMPLE_PERIOD_S) if track is None else track
+      track.update(point, 0.)
+      expected.append(float(track.aLead) if track.cnt >= 6 else 0.)
+    assert full == expected
+
+  def test_only_alead_becomes_finite(self):
+    estimator, _ = self.run([0.] * 6 + [-.25] * 4)
+    target = self.obj(estimator.last_scan_ns, -.25)
+    values = estimator.update((target,), estimator.last_scan_ns, 20., {self.PID})
+    data = structs.RadarData.new_message()
+    bosch_append_points(data, (target,), 20., target.timestamp_ns, a_lead_by_pid=values)
+    point = data.points[0]
+    assert math.isfinite(point.aLead)
+    assert math.isnan(point.aRel)
+    assert math.isnan(point.yvRel)
+    assert math.isnan(point.jLead)
+
+  def test_current_fresh_observation_is_written_to_same_frame(self):
+    estimator, values = self.run([0.] * 6)
+    previous = values[-1]
+    ns = estimator.last_scan_ns + 100_000_000
+    target = self.obj(ns, -2.)
+    current = estimator.update((target,), ns, 20., {self.PID})
+    assert current[self.PID] == estimator.states[self.PID].a_lead
+    assert current[self.PID] != previous
+    data = structs.RadarData.new_message()
+    bosch_append_points(data, (target,), 20., ns, a_lead_by_pid=current)
+    assert data.points[0].aLead == pytest.approx(current[self.PID], abs=1e-6)
+
+  def test_nonfinite_input_fails_unknown_and_restarts_state(self):
+    estimator, _ = self.run([0.] * 6)
+    ns = estimator.last_scan_ns + 100_000_000
+    result = estimator.update((self.obj(ns, 0.),), ns, math.nan, {self.PID})
+    assert math.isnan(result[self.PID])
+    assert self.PID not in estimator.states
+    assert estimator.invalid_input_count == 1
+    ns += 100_000_000
+    recovered = estimator.update((self.obj(ns, 0.),), ns, 20., {self.PID})
+    assert recovered[self.PID] == 0.
+    assert estimator.states[self.PID].update_count == 1
+
+  def test_invalid_scan_timestamp_fails_unknown(self):
+    estimator, _ = self.run([0.] * 6)
+    assert estimator.update((self.obj(estimator.last_scan_ns, 0.),), math.nan, 20., {self.PID}) == {}
+    assert not estimator.states
+    assert estimator.last_reset_reason == 'INVALID_SCAN_TIMESTAMP'
 
 
 class TestBoschB5BirthDefer:
