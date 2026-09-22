@@ -967,6 +967,11 @@ class BoschCameraExtendedGrouping:
   @staticmethod
   def _complete_link(objects, edges, previous):
     ids = sorted(obj.physical_track_id for obj in objects)
+    # With no confirmed/coasting camera edge, complete-link can only return
+    # these singleton groups.  Avoid the quadratic failed pair search while
+    # preserving all association/history maintenance that precedes this call.
+    if not edges:
+      return [{pid} for pid in ids]
     active = {pid for pair in edges for pid in pair}
     groups = [{pid} for pid in ids if pid in active]
     groups += [{pid} for pid in ids if pid not in active]

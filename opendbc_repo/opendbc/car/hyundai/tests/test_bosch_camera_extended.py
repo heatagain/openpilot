@@ -229,6 +229,13 @@ class TestBoschCameraAssociationAndGeometry:
     groups = BoschCameraExtendedGrouping._complete_link(objects, edges, ())
     assert max(map(len, groups)) == 2
 
+  def test_complete_link_without_edges_returns_ordered_singletons(self):
+    objects = (physical(1_000_003, 18.), physical(1_000_001, 10.), physical(1_000_002, 14.))
+    previous = ({1_000_001, 1_000_002},)
+    assert BoschCameraExtendedGrouping._complete_link(objects, {}, previous) == [
+      {1_000_001}, {1_000_002}, {1_000_003},
+    ]
+
 
 class TestBoschCameraCurveReacquire:
   NS = 1_000_000_000
