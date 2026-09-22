@@ -4459,6 +4459,8 @@ class BoschBirthB5Defer:
   @staticmethod
   def _append_sample(samples, sample, *, horizon_ns=BOSCH_B5_MOTION_HISTORY_NS, maximum=64):
     timestamp_ns = sample[0]
+    if samples and samples[-1] == sample:
+      return
     if samples and timestamp_ns < samples[-1][0]:
       samples.clear()
     if samples and timestamp_ns == samples[-1][0]:
@@ -4487,6 +4489,10 @@ class BoschBirthB5Defer:
     if model is None or not isinstance(publication_ns, int) or publication_ns <= 0:
       return
     source_ns = int(getattr(model, 'timestampEof', 0) or 0)
+    contexts = self.model_contexts
+    if (contexts and publication_ns == contexts[-1].publication_ns and
+        source_ns == contexts[-1].source_ns):
+      return
     edges = getattr(model, 'roadEdges', ())
     lanes = getattr(model, 'laneLines', ())
     position = getattr(model, 'position', None)
@@ -4506,7 +4512,6 @@ class BoschBirthB5Defer:
       tuple(points(lane) for lane in lanes), lane_probs, lane_stds, points(position))
     if any(len(polyline) < 2 for polyline in context.road_edges + context.lane_lines) or len(context.path) < 2:
       return
-    contexts = self.model_contexts
     if contexts and publication_ns < contexts[-1].publication_ns:
       contexts.clear()
     if contexts and publication_ns == contexts[-1].publication_ns:

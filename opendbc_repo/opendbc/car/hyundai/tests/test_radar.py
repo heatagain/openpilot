@@ -1165,6 +1165,13 @@ class TestBoschB5BirthDefer:
     assert b5.model_contexts[-1].source_ns == model.timestampEof
     assert interface._bosch_context[0] == now_ns
 
+    pose_sample = b5.pose_samples[-1]
+    model_context = b5.model_contexts[-1]
+    interface.set_bosch_context(
+      now_ns + 1_000_000, pose, now_ns - 10_000_000, model, now_ns - 5_000_000)
+    assert b5.pose_samples[-1] is pose_sample
+    assert b5.model_contexts[-1] is model_context
+
   def test_249_is_fail_open_and_250_is_eligible(self):
     _, _, before = self.birth(self.prime(248), scan_index=249)
     _, _, at = self.birth(self.prime(249), scan_index=250)
