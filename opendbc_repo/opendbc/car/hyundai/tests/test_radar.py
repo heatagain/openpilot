@@ -2856,3 +2856,335 @@ class TestBoschRawAssociationLowSpeedInvariants:
     # implied lateral tolerance, which is what actually separates neighbours
     assert 3. * math.tan(config.bearing_gate_rad(3.)) == pytest.approx(.6376, abs=1e-3)
     assert 15. * math.tan(config.bearing_gate_rad(15.)) == pytest.approx(1.3123, abs=1e-3)
+
+
+class TestBoschSidePassLateralEstimator:
+  """Route2bc S21/S23: a real truck's side-body return slides along the body.
+
+  The raw return is real and stays published; only its sliding lateral is not
+  read as vehicle motion.  Actual lane entry must never wait for the gate.
+  """
+  SCAN_NS = 100_000_000
+  PID = 1_000_845
+  RAW = 822
+  V_EGO = 28.
+
+  @staticmethod
+  def obj(pid, raw_id, ns, age, d_rel, y_rel, v_rel, *, oem=False, extra_members=()):
+    tracks = [BoschRawTrack(raw_id, BoschRawDetection(ns, 24, float(d_rel), float(y_rel), float(v_rel),
+                                                      raw_word=raw_id), age, False)]
+    for extra_raw, extra_slot in extra_members:
+      tracks.append(BoschRawTrack(extra_raw, BoschRawDetection(ns, extra_slot, float(d_rel) + .25, float(y_rel),
+                                                               float(v_rel), raw_word=extra_raw), age, False))
+    return BoschPhysicalObject(pid, ns, tuple(tracks), raw_id, float(d_rel), float(y_rel), float(v_rel), oem,
+                               False, age, 'single_return' if len(tracks) == 1 else 'temporal_complete_link')
+
+  @staticmethod
+  def estimator(mode=None):
+    mode = radar_interface_module.BOSCH_SIDEPASS_LATERAL_ACTIVE if mode is None else mode
+    return radar_interface_module._BoschSidePassLateralEstimator(mode)
+
+  @classmethod
+  def side_pass(cls, index, *, pid=None, raw=None, y0=-2.9375, y_rate=.75, range_rate=-5., v_rel=-9., d0=18.75):
+    """Truck side return: range closes 4 m/s slower than vRel, lateral drifts inward."""
+    ns = (index + 1) * cls.SCAN_NS
+    t = index * .1
+    return ns, cls.obj(cls.PID if pid is None else pid, cls.RAW if raw is None else raw, ns, index + 1,
+                       d0 + range_rate * t, y0 + y_rate * t, v_rel)
+
+  @classmethod
+  def run(cls, estimator, scans, decisions=None, **kwargs):
+    published = []
+    for ns, objects in scans:
+      estimator.update(objects, ns, cls.V_EGO, **kwargs)
+      if decisions is not None:
+        decisions.extend(estimator.last_decisions)
+      view = estimator.publication_view(objects)
+      published.append({obj.physical_track_id: radar_interface_module.bosch_published_surface(obj)[2]
+                        for obj in view})
+    return published
+
+  def settle_rigid(self, estimator, ns, d, y, age, *, scans=30):
+    """Feed rigid (range follows vRel) scans at a fixed lateral until disarmed."""
+    for _ in range(scans):
+      ns += self.SCAN_NS
+      d -= .9
+      age += 1
+      obj = self.obj(self.PID, self.RAW, ns, age, d, y, -9.)
+      estimator.update((obj,), ns, self.V_EGO)
+      if not estimator._states[self.PID].armed:
+        return ns, d, age, obj
+    raise AssertionError('slide evidence never ended')
+
+  def armed_estimator(self, scans=6, d0=18.75, y0=-2.9375):
+    estimator = self.estimator()
+    history = [self.side_pass(index, d0=d0, y0=y0) for index in range(scans)]
+    published = self.run(estimator, [(ns, (obj,)) for ns, obj in history])
+    assert any(decision.action == 'ARM' for decision in estimator.last_decisions) or \
+      estimator._states[self.PID].armed
+    return estimator, history, published
+
+  def test_side_pass_sliding_return_keeps_its_physical_anchor(self):
+    estimator = self.estimator()
+    history = [self.side_pass(index) for index in range(11)]
+    published = self.run(estimator, [(ns, (obj,)) for ns, obj in history])
+    state = estimator._states[self.PID]
+    assert state.armed and estimator.arms == 1
+    ys = [row[self.PID] for row in published]
+    arm_index = next(index for index, row in enumerate(published) if row[self.PID] != history[index][1].y_rel)
+    # Before arming the raw lateral is published unchanged; afterwards the
+    # anchor holds while the raw return keeps sliding inward.
+    assert ys[:arm_index] == [obj.y_rel for _, obj in history[:arm_index]]
+    assert len(set(ys[arm_index - 1:])) == 1
+    assert history[-1][1].y_rel > ys[-1] + .3
+
+  def test_raw_member_identity_and_publication_are_preserved(self):
+    estimator = self.estimator()
+    history = [self.side_pass(index) for index in range(11)]
+    for ns, obj in history:
+      estimator.update((obj,), ns, self.V_EGO)
+      view = estimator.publication_view((obj,))
+    ns, obj = history[-1]
+    assert len(view) == 1
+    public = view[0]
+    assert public.physical_track_id == obj.physical_track_id
+    assert public.members == obj.members
+    assert (public.d_rel, public.y_rel, public.v_rel) == (obj.d_rel, obj.y_rel, obj.v_rel)
+    assert public.representative_raw_track_id == obj.representative_raw_track_id
+    surface = public.published_surface
+    assert surface.lateral_estimate and surface.raw_track_id == self.RAW
+    assert (surface.d_rel, surface.v_rel) == (obj.d_rel, obj.v_rel)
+    assert obj.members[0].y_rel == obj.y_rel  # the raw observation itself is untouched
+
+  def test_rigid_inward_lane_entry_is_never_armed(self):
+    estimator = self.estimator()
+    scans = [self.side_pass(index, range_rate=-9., v_rel=-9., y_rate=.9) for index in range(12)]
+    published = self.run(estimator, [(ns, (obj,)) for ns, obj in scans])
+    assert estimator.arms == 0
+    assert [row[self.PID] for row in published] == [obj.y_rel for _, obj in scans]
+
+  def test_corridor_entry_releases_on_the_same_scan(self):
+    estimator, history, _ = self.armed_estimator()
+    ns = history[-1][0] + self.SCAN_NS
+    entering = self.obj(self.PID, self.RAW, ns, 7, 15., -1.5, -9.)
+    estimator.update((entering,), ns, self.V_EGO)
+    view = estimator.publication_view((entering,))
+    assert view[0] is entering
+    assert estimator.last_decisions[-1].reason == 'CORRIDOR_ENTRY'
+    assert not estimator._states[self.PID].armed
+
+  def test_oem_word1_selection_releases_on_the_same_scan(self):
+    estimator, history, _ = self.armed_estimator()
+    ns, obj = self.side_pass(6)
+    selected = self.obj(self.PID, self.RAW, ns, 7, obj.d_rel, obj.y_rel, obj.v_rel, oem=True)
+    estimator.update((selected,), ns, self.V_EGO)
+    assert estimator.publication_view((selected,))[0] is selected
+    assert estimator.last_decisions[-1].reason == 'OEM_SELECTED'
+
+  def test_validated_word0_selection_releases_on_the_same_scan(self):
+    estimator, _, _ = self.armed_estimator()
+    ns, obj = self.side_pass(6)
+    estimator.update((obj,), ns, self.V_EGO, oem_pids=frozenset({self.PID}))
+    assert estimator.publication_view((obj,))[0] is obj
+    assert estimator.last_decisions[-1].reason == 'OEM_SELECTED'
+
+  def test_inward_travel_beyond_one_body_releases(self):
+    estimator = self.estimator()
+    decisions = []
+    scans = [self.side_pass(index, y0=-4.9375, y_rate=1.5) for index in range(13)]
+    published = self.run(estimator, [(ns, (obj,)) for ns, obj in scans], decisions)
+    assert 'BEYOND_BODY' in [decision.reason for decision in decisions]
+    gaps = [abs(row[self.PID] - obj.y_rel) for row, (_, obj) in zip(published, scans)]
+    assert max(gaps) <= radar_interface_module.BOSCH_SIDEPASS_MAX_OFFSET_M + 1e-6
+    release = next(index for index, decision in enumerate(decisions) if decision.reason == 'BEYOND_BODY')
+    assert decisions[release].published_y_m == decisions[release].raw_y_m
+
+  def test_evidence_end_realigns_below_the_downstream_motion_floor(self):
+    estimator, history, _ = self.armed_estimator(8, d0=44.)
+    last_ns, last = history[-1]
+    y = last.y_rel
+    ns, d, age, obj = self.settle_rigid(estimator, last_ns, last.d_rel, y, 8)
+    offsets = [radar_interface_module.bosch_published_surface(estimator.publication_view((obj,))[0])[2] - y]
+    for _ in range(12):
+      ns += self.SCAN_NS
+      d -= .9
+      age += 1
+      obj = self.obj(self.PID, self.RAW, ns, age, d, y, -9.)
+      estimator.update((obj,), ns, self.V_EGO)
+      offsets.append(radar_interface_module.bosch_published_surface(estimator.publication_view((obj,))[0])[2] - y)
+    step_limit = radar_interface_module.BOSCH_SIDEPASS_REALIGN_MPS * .1 + 1e-9
+    assert offsets[0] != 0.
+    for before, after in zip(offsets, offsets[1:]):
+      assert abs(after - before) <= step_limit
+      assert abs(after) <= abs(before)
+    assert abs(offsets[-1]) < abs(offsets[0])
+
+  def test_rigid_motion_after_the_slide_passes_through_without_a_jump(self):
+    estimator, history, _ = self.armed_estimator(8, d0=44., y0=-3.9375)
+    last_ns, last = history[-1]
+    y = last.y_rel
+    ns, d, age, obj = self.settle_rigid(estimator, last_ns, last.d_rel, y, 8)
+    published = radar_interface_module.bosch_published_surface(estimator.publication_view((obj,))[0])[2]
+    step_limit = radar_interface_module.BOSCH_SIDEPASS_REALIGN_MPS * .1 + 1e-9
+    for _ in range(6):
+      ns += self.SCAN_NS
+      d -= .9
+      y += .1  # rigid inward travel of the raw return after the slide ended
+      age += 1
+      obj = self.obj(self.PID, self.RAW, ns, age, d, y, -9.)
+      estimator.update((obj,), ns, self.V_EGO)
+      now = radar_interface_module.bosch_published_surface(estimator.publication_view((obj,))[0])[2]
+      # the new raw movement reaches the published lateral one-to-one; only the
+      # residual offset re-aligns, never as a step
+      assert abs((now - published) - .1) <= step_limit
+      published = now
+
+  def test_anchor_survives_a_one_scan_absence_of_the_same_track(self):
+    estimator, _, published = self.armed_estimator()
+    anchor = published[-1][self.PID]
+    ns, _ = self.side_pass(6)
+    estimator.update((), ns, self.V_EGO)
+    assert estimator._states[self.PID].armed and estimator.last_decisions == ()
+    decisions = []
+    ns, obj = self.side_pass(7)
+    after = self.run(estimator, [(ns, (obj,))], decisions)
+    # reacquisition continues the anchor instead of stepping to the raw lateral
+    assert after[0][self.PID] == anchor and obj.y_rel != anchor
+    assert decisions == [] and estimator._states[self.PID].armed
+
+  def test_pid_death_and_rebirth_do_not_inherit_the_anchor(self):
+    estimator, history, _ = self.armed_estimator()
+    ns = history[-1][0]
+    decisions = []
+    while ns - history[-1][0] <= radar_interface_module.BOSCH_SIDEPASS_MAX_GAP_NS:
+      ns += self.SCAN_NS
+      estimator.update((), ns, self.V_EGO)
+      decisions.extend(estimator.last_decisions)
+    assert self.PID not in estimator._states
+    assert [(decision.action, decision.reason) for decision in decisions] == [('RESET', 'ABSENT')]
+    reborn_pid = self.PID + 1
+    ns += self.SCAN_NS
+    returning = self.obj(self.PID, self.RAW, ns, 12, 14., -2.2, -9.)
+    reborn = self.obj(reborn_pid, self.RAW + 1, ns, 1, 15., -2.5, -9.)
+    estimator.update((returning, reborn), ns, self.V_EGO)
+    view = estimator.publication_view((returning, reborn))
+    assert view[0] is returning and view[1] is reborn
+    for pid in (self.PID, reborn_pid):
+      assert not estimator._states[pid].armed and len(estimator._states[pid].samples) == 1
+
+  def test_representative_change_resets_the_state(self):
+    estimator, history, _ = self.armed_estimator()
+    ns, obj = self.side_pass(6, raw=self.RAW + 5)
+    estimator.update((obj,), ns, self.V_EGO)
+    assert estimator.publication_view((obj,))[0] is obj
+    assert any(decision.reason == 'REPRESENTATIVE_CHANGE' for decision in estimator.last_decisions)
+    assert estimator._states[self.PID].raw_track_id == self.RAW + 5
+    assert not estimator._states[self.PID].armed
+
+  def test_multi_member_object_never_starts_or_arms(self):
+    estimator = self.estimator()
+    scans = []
+    for index in range(10):
+      ns, obj = self.side_pass(index)
+      scans.append((ns, (self.obj(obj.physical_track_id, self.RAW, ns, index + 1, obj.d_rel, obj.y_rel, obj.v_rel,
+                                  extra_members=((self.RAW + 1, 25),)),)))
+    published = self.run(estimator, scans)
+    assert estimator.arms == 0 and self.PID not in estimator._states
+    assert [row[self.PID] for row in published] == [objects[0].y_rel for _, objects in scans]
+
+  def test_scan_gap_resets_every_state(self):
+    estimator, history, _ = self.armed_estimator()
+    ns, obj = self.side_pass(6)
+    ns += radar_interface_module.BOSCH_SIDEPASS_MAX_GAP_NS + self.SCAN_NS
+    late = self.obj(self.PID, self.RAW, ns, 7, obj.d_rel, obj.y_rel, obj.v_rel)
+    estimator.update((late,), ns, self.V_EGO)
+    assert estimator.publication_view((late,))[0] is late
+    assert estimator.last_decisions[0].reason == 'SCAN_GAP'
+    assert not estimator._states[self.PID].armed
+
+  def test_provider_timeout_drops_every_anchor(self):
+    provider = BoschRadarProvider(1)
+    estimator = provider.sidepass_lateral
+    history = [self.side_pass(index) for index in range(8)]
+    for ns, obj in history:
+      estimator.update((obj,), ns, self.V_EGO)
+    assert estimator._states[self.PID].armed
+    start_ns = history[-1][0]
+    assert provider.update([], now_ns=start_ns, v_ego=self.V_EGO) is None
+    timeout_ns = start_ns + radar_interface_module.BOSCH_STALE_NS
+    assert provider.update([], now_ns=timeout_ns, v_ego=self.V_EGO) == ()
+    assert estimator._states == {} and estimator.published_y == {}
+    assert [(decision.action, decision.reason) for decision in estimator.last_decisions] == \
+      [('RESET', 'PROVIDER_TIMEOUT')]
+    ns = timeout_ns + self.SCAN_NS
+    returning = self.obj(self.PID, self.RAW, ns, 20, 14., -2.4, -9.)
+    estimator.update((returning,), ns, self.V_EGO)
+    assert estimator.publication_view((returning,))[0] is returning
+    assert not estimator._states[self.PID].armed and len(estimator._states[self.PID].samples) == 1
+
+  def test_shadow_mode_decides_without_changing_publication(self):
+    estimator = self.estimator(radar_interface_module.BOSCH_SIDEPASS_LATERAL_SHADOW)
+    history = [self.side_pass(index) for index in range(11)]
+    for ns, obj in history:
+      estimator.update((obj,), ns, self.V_EGO)
+      assert estimator.publication_view((obj,))[0] is obj
+    assert estimator.arms == 1 and estimator.published_y
+
+  def test_off_mode_holds_no_state(self):
+    estimator = self.estimator(radar_interface_module.BOSCH_SIDEPASS_LATERAL_OFF)
+    for ns, obj in (self.side_pass(index) for index in range(11)):
+      estimator.update((obj,), ns, self.V_EGO)
+      assert estimator.publication_view((obj,))[0] is obj
+    assert estimator._states == {} and estimator.arms == 0
+
+  def test_slow_or_opposite_direction_objects_are_never_armed(self):
+    for v_rel, v_ego in ((-1., 28.), (-9., 5.), (-30., 20.)):
+      estimator = self.estimator()
+      for index in range(11):
+        ns, obj = self.side_pass(index, v_rel=v_rel, range_rate=v_rel + 4., d0=44.)
+        estimator.update((obj,), ns, v_ego)
+      assert estimator.arms == 0, (v_rel, v_ego)
+
+  def test_two_adjacent_real_vehicles_stay_independent(self):
+    estimator = self.estimator()
+    other_pid, other_raw = self.PID + 7, self.RAW + 7
+    scans = []
+    for index in range(11):
+      ns, sliding = self.side_pass(index)
+      rigid = self.obj(other_pid, other_raw, ns, index + 1, 25. - .9 * index, 2.9 - .06 * index, -9.)
+      scans.append((ns, (sliding, rigid)))
+    published = self.run(estimator, scans)
+    assert estimator._states[self.PID].armed
+    assert other_pid not in estimator.published_y
+    assert [row[other_pid] for row in published] == [objects[1].y_rel for _, objects in scans]
+
+  def test_decisions_are_prefix_invariant(self):
+    history = [self.side_pass(index) for index in range(14)]
+    full = self.run(self.estimator(), [(ns, (obj,)) for ns, obj in history])
+    for cut in (3, 5, 8, 13):
+      assert self.run(self.estimator(), [(ns, (obj,)) for ns, obj in history[:cut]]) == full[:cut]
+
+  def test_estimate_never_mutates_tracker_objects(self):
+    estimator = self.estimator()
+    history = [self.side_pass(index) for index in range(11)]
+    for ns, obj in history:
+      before = (obj.physical_track_id, obj.members, obj.d_rel, obj.y_rel, obj.v_rel, obj.published_surface)
+      estimator.update((obj,), ns, self.V_EGO)
+      estimator.publication_view((obj,))
+      assert (obj.physical_track_id, obj.members, obj.d_rel, obj.y_rel, obj.v_rel, obj.published_surface) == before
+
+  def test_provider_publishes_the_estimate_through_the_native_point(self):
+    provider = BoschRadarProvider(1)
+    history = [self.side_pass(index) for index in range(11)]
+    view = ()
+    for ns, obj in history:
+      provider.sidepass_lateral.update((obj,), ns, self.V_EGO)
+      view = provider.sidepass_lateral.publication_view((obj,))
+    radar = structs.RadarData.new_message()
+    bosch_append_points(radar, view, self.V_EGO, history[-1][0])
+    point = radar.points[0]
+    assert point.trackId == self.PID
+    assert point.yRel == pytest.approx(provider.sidepass_lateral.published_y[self.PID], abs=1e-5)
+    assert point.yRel < history[-1][1].y_rel - .3
+    assert point.vRel == pytest.approx(history[-1][1].v_rel)
+    assert provider.debug_snapshot == {} or 'sidepass_lateral_mode' in provider.debug_snapshot

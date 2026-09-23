@@ -368,6 +368,35 @@ BOSCH_BURST_MAX_MISSING_SCANS = 1
 BOSCH_BURST_MAX_GAP_NS = 320_000_000
 BOSCH_BURST_STATE_MAX = 16
 
+# Side-pass extended-body lateral estimate (publication only).  A Bosch raw
+# return is one scattering centre.  On a fixed point of a body its range changes
+# with the reported longitudinal relative velocity.  While ego overtakes a long
+# vehicle the dominant scatterer instead moves forward along that body: the
+# range closes more slowly than vRel ("slide") and the reported lateral drifts
+# toward the body's near side (route2bc S21/S23 trucks, whose LDWS camera
+# lateral stayed constant).  While that rigid-point model is violated the
+# lateral change is not evidence of vehicle motion, so the published lateral
+# keeps its physical anchor.  Raw tracks, members, PIDs and aliases are untouched.
+BOSCH_SIDEPASS_LATERAL_OFF = 0
+BOSCH_SIDEPASS_LATERAL_SHADOW = 1
+BOSCH_SIDEPASS_LATERAL_ACTIVE = 2
+BOSCH_SIDEPASS_LATERAL_MODE = BOSCH_SIDEPASS_LATERAL_ACTIVE
+BOSCH_SIDEPASS_WINDOW_NS = 800_000_000
+BOSCH_SIDEPASS_MIN_SCANS = 5
+BOSCH_SIDEPASS_MIN_SPAN_NS = 400_000_000
+BOSCH_SIDEPASS_SLIDE_ARM_MPS = 1.5
+BOSCH_SIDEPASS_SLIDE_RELEASE_MPS = .5
+BOSCH_SIDEPASS_RELEASE_SCANS = 3
+BOSCH_SIDEPASS_CLOSING_MPS = 1.5
+BOSCH_SIDEPASS_MIN_LEAD_SPEED_MPS = 3.0  # same-direction mover; cut-in needs vLead > 0.5
+BOSCH_SIDEPASS_CORRIDOR_M = 1.9          # downstream body-overlap half width (0.9 + 1.0)
+BOSCH_SIDEPASS_ZONE_M = 5.4              # downstream lateral motion scope
+BOSCH_SIDEPASS_MAX_D_M = 45.0            # downstream cut-in range
+BOSCH_SIDEPASS_MAX_OFFSET_M = 1.0        # beyond surface migration on one body
+BOSCH_SIDEPASS_REALIGN_MPS = .10         # below the downstream lateral motion floor
+BOSCH_SIDEPASS_MAX_GAP_NS = 320_000_000
+BOSCH_SIDEPASS_STATE_MAX = 64
+
 # Behavioural naming for the two 0x601 records. No proprietary signal name is
 # claimed. word1 (bytes 4..7) is bit-identical to exactly one raw record in
 # 63,819 of 63,822 active scans across 146 segments, and its activity equals
@@ -2352,12 +2381,15 @@ class BoschPublishedSurface:
   object, and the anchor has to stay there for identity while the published
   range does not.
 
-  One member's whole tuple, never a mix of two members' coordinates.
+  One member's whole tuple, never a mix of two members' coordinates.  The only
+  exception is `lateral_estimate`: the member's own range and speed with the
+  side-pass physical lateral estimate in place of its sliding lateral.
   """
   raw_track_id: int
   d_rel: float
   y_rel: float
   v_rel: float
+  lateral_estimate: bool = False
 
 
 @dataclass(frozen=True)
@@ -3911,6 +3943,243 @@ class _BoschBurstMultiReturnDefer:
     return tuple(obj for obj in objects if obj.physical_track_id not in suppressed)
 
 
+@dataclass(slots=True)
+class _BoschSidePassLateralState:
+  raw_track_id: int
+  samples: deque
+  armed: bool = False
+  anchor_y_m: float = 0.
+  offset_m: float = 0.
+  quiet_scans: int = 0
+  last_ns: int = 0
+
+
+@dataclass(frozen=True)
+class BoschSidePassLateralDecision:
+  timestamp_ns: int
+  physical_track_id: int
+  action: str
+  reason: str
+  slide_mps: float
+  raw_y_m: float
+  published_y_m: float
+
+
+class _BoschSidePassLateralEstimator:
+  """Measurement gating of a sliding scatterer's lateral position.
+
+  Arming reads present physics only: a singleton, same-direction object being
+  overtaken, outside the body-overlap corridor and inside the downstream cut-in
+  scope, whose representative raw track closed its range at least 1.5 m/s more
+  slowly than its own vRel over the last 0.4-0.8 s.  A rigid point cannot do
+  that; a scattering centre moving along a long body does.  Missing camera or
+  OEM support never arms it.
+
+  While armed the published lateral keeps the value already published at arm
+  time.  Every lane-entry signal releases it on the same scan: the raw return
+  inside the corridor, OEM selection (word1 member or validated word0), or a
+  gated displacement larger than migration on one body.  When the slide ends
+  the published lateral keeps following every later raw movement one-to-one and
+  only its residual offset re-aligns, at a rate below the downstream
+  lateral-motion floor, so re-alignment itself never looks like an entry.
+  State is keyed by physical ID and representative
+  raw track; a new ID, a representative change or a scan gap never inherits an
+  anchor, and only the scan's own objects are ever adjusted.  An anchored ID
+  that misses scans keeps its state for at most the scan-gap limit, so a
+  one-scan qualification drop is not published as an anchor-to-raw step.
+  """
+
+  def __init__(self, mode=BOSCH_SIDEPASS_LATERAL_MODE):
+    if mode not in (BOSCH_SIDEPASS_LATERAL_OFF, BOSCH_SIDEPASS_LATERAL_SHADOW,
+                    BOSCH_SIDEPASS_LATERAL_ACTIVE):
+      raise ValueError('invalid Bosch side-pass lateral mode')
+    self.mode = mode
+    self._states: dict[int, _BoschSidePassLateralState] = {}
+    self.last_ns = None
+    self.published_y: dict[int, float] = {}
+    self.last_decisions: tuple[BoschSidePassLateralDecision, ...] = ()
+    self.arms = self.releases = self.publication_adjusted = self.state_peak = 0
+
+  def reset(self, timestamp_ns, reason='STATE_RESET'):
+    self.last_decisions = tuple(
+      BoschSidePassLateralDecision(timestamp_ns, pid, 'RESET', reason, math.nan, math.nan, math.nan)
+      for pid, state in sorted(self._states.items()) if state.armed or state.offset_m)
+    self._states = {}
+    self.published_y = {}
+    self.last_ns = timestamp_ns
+
+  @staticmethod
+  def _slide(samples):
+    """Least-squares range rate minus mean vRel over the window, or None."""
+    n = len(samples)
+    if n < BOSCH_SIDEPASS_MIN_SCANS or samples[-1][0] - samples[0][0] < BOSCH_SIDEPASS_MIN_SPAN_NS:
+      return None
+    t0 = samples[0][0]
+    st = sd = stt = std = sv = 0.
+    for ns, d_rel, v_rel in samples:
+      t = (ns - t0) * 1e-9
+      st += t
+      sd += d_rel
+      stt += t * t
+      std += t * d_rel
+      sv += v_rel
+    denominator = n * stt - st * st
+    if denominator <= 0.:
+      return None
+    return (n * std - st * sd) / denominator - sv / n
+
+  def update(self, objects, timestamp_ns, v_ego, *, path=(), oem_pids=()):
+    self.last_decisions = ()
+    if self.mode == BOSCH_SIDEPASS_LATERAL_OFF:
+      self._states = {}
+      self.published_y = {}
+      self.last_ns = timestamp_ns
+      return self.published_y
+    decisions = []
+    if (self.last_ns is not None and
+        (timestamp_ns <= self.last_ns or timestamp_ns - self.last_ns > BOSCH_SIDEPASS_MAX_GAP_NS)):
+      self.reset(timestamp_ns, 'STATE_RESET' if timestamp_ns <= self.last_ns else 'SCAN_GAP')
+      decisions.extend(self.last_decisions)
+    self.last_ns = timestamp_ns
+    states = self._states
+    speed_known = math.isfinite(v_ego)
+    published = {}
+    live = set()
+    for obj in objects:
+      pid = obj.physical_track_id
+      state = states.get(pid)
+      members = obj.members
+      representative = obj.representative_raw_track_id
+      # A window is only kept where arming is reachable; an anchor is kept
+      # until it has been released or re-aligned.
+      reachable = (obj.v_rel < -.5 and speed_known and obj.v_rel + v_ego >= 1. and
+                   obj.d_rel <= BOSCH_SIDEPASS_MAX_D_M + 5. and abs(obj.y_rel) <= BOSCH_SIDEPASS_ZONE_M + 1.5)
+      if state is None or state.raw_track_id != representative:
+        if state is not None:
+          if state.armed or state.offset_m:
+            decisions.append(BoschSidePassLateralDecision(
+              timestamp_ns, pid, 'RESET', 'REPRESENTATIVE_CHANGE', math.nan, obj.y_rel, obj.y_rel))
+          del states[pid]
+        if len(members) != 1 or not reachable:
+          continue
+        state = states[pid] = _BoschSidePassLateralState(representative, deque())
+      elif not (reachable or state.armed or state.offset_m):
+        del states[pid]
+        continue
+      member = members[0] if len(members) == 1 else next(
+        m for m in members if m.raw_track_id == representative)
+      samples = state.samples
+      samples.append((member.timestamp_ns, obj.d_rel, obj.v_rel))
+      while timestamp_ns - samples[0][0] > BOSCH_SIDEPASS_WINDOW_NS:
+        samples.popleft()
+      state.last_ns = timestamp_ns
+      live.add(pid)
+      slide = self._slide(samples)
+      y_rel = obj.y_rel
+      published_y = y_rel + state.offset_m
+      closing = obj.v_rel <= -BOSCH_SIDEPASS_CLOSING_MPS
+      moving = speed_known and obj.v_rel + v_ego >= BOSCH_SIDEPASS_MIN_LEAD_SPEED_MPS
+      armable = (slide is not None and slide >= BOSCH_SIDEPASS_SLIDE_ARM_MPS and len(members) == 1 and
+                 closing and moving and obj.d_rel <= BOSCH_SIDEPASS_MAX_D_M)
+      if not (state.armed or state.offset_m or armable):
+        continue
+      offset = _BoschFamilyCompanionFilter._path_offset(obj, path)
+      release = None
+      if abs(offset) < BOSCH_SIDEPASS_CORRIDOR_M:
+        release = 'CORRIDOR_ENTRY'
+      elif pid in oem_pids or obj.oem_selected:
+        release = 'OEM_SELECTED'
+      elif abs(state.offset_m) > BOSCH_SIDEPASS_MAX_OFFSET_M:
+        release = 'BEYOND_BODY'
+      if release is not None:
+        if state.armed or state.offset_m:
+          decisions.append(BoschSidePassLateralDecision(
+            timestamp_ns, pid, 'RELEASE', release, math.nan if slide is None else slide, y_rel, y_rel))
+          self.releases += 1
+        state.armed = False
+        state.offset_m = 0.
+        state.quiet_scans = 0
+        continue
+      in_zone = abs(offset) <= BOSCH_SIDEPASS_ZONE_M and obj.d_rel <= BOSCH_SIDEPASS_MAX_D_M
+      if not state.armed:
+        if armable and in_zone:
+          state.armed = True
+          state.anchor_y_m = published_y
+          state.quiet_scans = 0
+          self.arms += 1
+          decisions.append(BoschSidePassLateralDecision(timestamp_ns, pid, 'ARM', 'SLIDE', slide, y_rel, published_y))
+      else:
+        quiet = (slide is None or slide < BOSCH_SIDEPASS_SLIDE_RELEASE_MPS or not closing or not moving or
+                 not in_zone or len(members) != 1)
+        state.quiet_scans = state.quiet_scans + 1 if quiet else 0
+        if state.quiet_scans >= BOSCH_SIDEPASS_RELEASE_SCANS:
+          state.armed = False
+          self.releases += 1
+          decisions.append(BoschSidePassLateralDecision(
+            timestamp_ns, pid, 'RELEASE', 'EVIDENCE_END', math.nan if slide is None else slide, y_rel, published_y))
+      if state.armed:
+        state.offset_m = state.anchor_y_m - y_rel
+        if abs(state.offset_m) > BOSCH_SIDEPASS_MAX_OFFSET_M:
+          state.armed = False
+          state.offset_m = 0.
+          self.releases += 1
+          decisions.append(BoschSidePassLateralDecision(
+            timestamp_ns, pid, 'RELEASE', 'BEYOND_BODY', slide, y_rel, y_rel))
+      elif state.offset_m:
+        step = BOSCH_SIDEPASS_REALIGN_MPS * BOSCH_OUTPUT_INTERVAL_NS * 1e-9
+        if abs(state.offset_m) <= step:
+          state.offset_m = 0.
+          decisions.append(BoschSidePassLateralDecision(
+            timestamp_ns, pid, 'REALIGNED', '', math.nan if slide is None else slide, y_rel, y_rel))
+        else:
+          state.offset_m -= math.copysign(step, state.offset_m)
+      if state.offset_m:
+        published[pid] = y_rel + state.offset_m
+    for pid in [pid for pid in states if pid not in live]:
+      state = states[pid]
+      # A pre-arm window only delays arming.  An anchor survives a short
+      # absence of the same ID and is dropped, with a decision, after that.
+      if state.armed or state.offset_m:
+        if timestamp_ns - state.last_ns <= BOSCH_SIDEPASS_MAX_GAP_NS:
+          continue
+        decisions.append(BoschSidePassLateralDecision(
+          timestamp_ns, pid, 'RESET', 'ABSENT', math.nan, math.nan, math.nan))
+      del states[pid]
+    if len(states) > BOSCH_SIDEPASS_STATE_MAX:
+      # An evicted pre-arm window only delays arming; anchors are kept first.
+      victims = sorted(states, key=lambda key: (bool(states[key].armed or states[key].offset_m),
+                                                states[key].last_ns, key))
+      for pid in victims[:len(states) - BOSCH_SIDEPASS_STATE_MAX]:
+        del states[pid]
+        published.pop(pid, None)
+    self.state_peak = max(self.state_peak, len(states))
+    self.published_y = published
+    self.last_decisions = tuple(decisions)
+    return published
+
+  def publication_view(self, objects):
+    if self.mode != BOSCH_SIDEPASS_LATERAL_ACTIVE or not self.published_y or not objects:
+      return objects
+    adjusted = None
+    for index, obj in enumerate(objects):
+      y_rel = self.published_y.get(obj.physical_track_id)
+      state = self._states.get(obj.physical_track_id)
+      # Only this scan's objects, and only when the tracked raw track is the
+      # member actually published (never another member's surface).
+      if (y_rel is None or state is None or obj.timestamp_ns != self.last_ns or
+          obj.published_surface is not None or obj.representative_raw_track_id != state.raw_track_id):
+        continue
+      if adjusted is None:
+        adjusted = list(objects)
+      adjusted[index] = BoschPhysicalObject(
+        obj.physical_track_id, obj.timestamp_ns, obj.members, obj.representative_raw_track_id,
+        obj.d_rel, obj.y_rel, obj.v_rel, obj.oem_selected, obj.vision_supported, obj.age_scans,
+        obj.grouping_evidence,
+        BoschPublishedSurface(state.raw_track_id, obj.d_rel, y_rel, obj.v_rel, lateral_estimate=True))
+      self.publication_adjusted += 1
+    return objects if adjusted is None else tuple(adjusted)
+
+
 @dataclass
 class _BoschP91PairState:
   parent_pid: int
@@ -5170,7 +5439,7 @@ class BoschRadarProvider:
                curve_reacquire_mode=BOSCH_CAMERA_CURVE_REACQUIRE_MODE,
                provisional_bundle=True, family_companion_mode=BOSCH_FAMILY_COMPANION_MODE,
                burst_multireturn_mode=BOSCH_BURST_MULTIRETURN_MODE,
-               b5_mode=BOSCH_B5_MODE):
+               b5_mode=BOSCH_B5_MODE, sidepass_lateral_mode=BOSCH_SIDEPASS_LATERAL_MODE):
     self.bus = bus
     self.camera_bus = camera_bus
     self.scc_bus = scc_bus
@@ -5181,6 +5450,7 @@ class BoschRadarProvider:
     self.family_companion = _BoschFamilyCompanionFilter(family_companion_mode)
     self.burst_multireturn = _BoschBurstMultiReturnDefer(burst_multireturn_mode)
     self.b5_birth_defer = BoschBirthB5Defer(b5_mode)
+    self.sidepass_lateral = _BoschSidePassLateralEstimator(sidepass_lateral_mode)
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
     self.oem_gate = _BoschOemValidationGate(oem_gate_mode)
     self.scc_obj_valid = None
@@ -5412,13 +5682,13 @@ class BoschRadarProvider:
       objects = tuple(obj for obj in objects if obj.physical_track_id not in withheld)
     ext = self.camera_extended
     if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
-      return self.b5_birth_defer.publication_view(
-        self._burst_view(self.family_companion.publication_view(self._final_view(objects))))
+      return self.sidepass_lateral.publication_view(self.b5_birth_defer.publication_view(
+        self._burst_view(self.family_companion.publication_view(self._final_view(objects)))))
     if not ext.mature_groups or not objects:
       self.test_last_suppressed = ()
       self.test_last_active_groups = 0
-      return self.b5_birth_defer.publication_view(
-        self._burst_view(self.family_companion.publication_view(self._final_view(objects))))
+      return self.sidepass_lateral.publication_view(self.b5_birth_defer.publication_view(
+        self._burst_view(self.family_companion.publication_view(self._final_view(objects)))))
     # 다른 scan의 tuple 또는 qualification에서 대표가 빠진 그룹은 baseline으로 연다.
     by_pid = {obj.physical_track_id: obj for obj in objects}
     suppressed = set()
@@ -5432,9 +5702,9 @@ class BoschRadarProvider:
       active_groups += 1
     self.test_last_suppressed = tuple(sorted(suppressed))
     self.test_last_active_groups = active_groups
-    return self.b5_birth_defer.publication_view(
+    return self.sidepass_lateral.publication_view(self.b5_birth_defer.publication_view(
       self._burst_view(self.family_companion.publication_view(self._final_view(
-        tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects))))
+        tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects)))))
 
   @property
   def slot_to_ids(self):
@@ -5478,6 +5748,9 @@ class BoschRadarProvider:
       'b5_suppressed': sorted(self.b5_birth_defer.would_suppress),
       'b5_decisions': [{name: getattr(decision, name) for name in decision.__dataclass_fields__}
                        for decision in self.b5_birth_defer.last_decisions],
+      'sidepass_lateral_mode': self.sidepass_lateral.mode,
+      'sidepass_lateral_published_y': dict(sorted(self.sidepass_lateral.published_y.items())),
+      'sidepass_lateral_decisions': [vars(decision) for decision in self.sidepass_lateral.last_decisions],
       'objects': [{'physicalTrackId': obj.physical_track_id,
                    'rawTrackIds': [member.raw_track_id for member in obj.members],
                    'slots': list(obj.member_slots),
@@ -5624,6 +5897,7 @@ class BoschRadarProvider:
       self.family_companion.reset(now_ns, 'STATE_RESET')
       self.burst_multireturn.reset(now_ns, 'STATE_RESET')
       self.b5_birth_defer.reset('PROVIDER_TIMEOUT')
+      self.sidepass_lateral.reset(now_ns, 'PROVIDER_TIMEOUT')
       self.p91.update((), now_ns, v_ego, yaw_rate=yaw_rate_left)
       self.oem_gate.update((), now_ns, v_ego, state=BOSCH_OEM_STATE_NONE)
       self._debug_gate_suppress = frozenset()
@@ -5759,6 +6033,16 @@ class BoschRadarProvider:
       oem_state=oem_state, word0_pids=processed_pids,
       live_pids=self.tracker.group_manager.states,
       live_raw_ids=self.tracker.raw_manager._states)
+    # Side-pass lateral estimate: same scan, same OEM evidence the other
+    # publication stages read; applied only by publication_view().
+    self.sidepass_lateral.update(
+      qualified, availability_ns, v_ego, path=path,
+      oem_pids=processed_pids if oem_state == BOSCH_OEM_STATE_VALIDATED else frozenset())
+    for decision in self.sidepass_lateral.last_decisions:
+      researchlog.debug(
+        f'BOSCH_SIDEPASS_LATERAL_{decision.action} ns={decision.timestamp_ns} '
+        f'reason={decision.reason} pid={decision.physical_track_id} slide={decision.slide_mps} '
+        f'raw_y={decision.raw_y_m} published_y={decision.published_y_m}')
     return qualified
 
 # End Bosch MRRevo14F passive radar
