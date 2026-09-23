@@ -1,0 +1,93 @@
+{
+  "study": "20260924_p1_pid_continuity",
+  "repository_root": "C:\\CarrotRadarResearch\\openpilot-p1-pid-continuity",
+  "branch": "heatagain/bosch-p1-pid-continuity",
+  "baseline_head": "581285fb7dbed511fec4ba9e0edd256f5b5aa96e",
+  "provider_raw_sha256": "fb756fb400b8408840c68b5ee32d6cae795ec939c9cdea634fb5836a235851a9",
+  "provider_normalized_lf_sha256": "eec1c34448534f11cd8cd479a7ceb8d59be83421224130d7bb74f9943ab67f75",
+  "provider_semantically_matches_validated_source": true,
+  "policy": {
+    "source_artifacts": "read-only",
+    "production_code_changed": false,
+    "shadow_implemented": false,
+    "future_information_used": false,
+    "moving_different_entry_gate": 0
+  },
+  "facts": {
+    "route269_exact_splits": 11,
+    "route269_rejoins": 11,
+    "route269_continuous_raw_scans": 255,
+    "confirmed_same": 4,
+    "confirmed_sequential_different": 4,
+    "strict_sequential_different": 3,
+    "moving_sequential_different": 0,
+    "moving_sequential_same": 1,
+    "simultaneous_different_pairs": 37,
+    "route280_s15_tracker_to_publication_ms": 0.0,
+    "route2bc_window_scans": 11,
+    "route2bc_pids": "1000845",
+    "route2bc_representative_changes": 0,
+    "route2bc_member_set_changes": 0,
+    "corpus_segments": 847,
+    "corpus_scans": 504673,
+    "corpus_split_births": 16526
+  },
+  "sources": [
+    {
+      "path": "C:\\CarrotRadarResearch\\openpilot-p1-pid-continuity\\opendbc_repo\\opendbc\\car\\hyundai\\radar_interface.py",
+      "sha256": "fb756fb400b8408840c68b5ee32d6cae795ec939c9cdea634fb5836a235851a9"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\20260923_MRRevo14F_group_owner_oscillation\\tables\\group_owner_transitions.csv",
+      "sha256": "ea874a5ad4b6480af70a5ed782c58f4a131b57b6815d5c65844e88c2699b71d2"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\20260923_MRRevo14F_group_owner_oscillation\\tables\\route269_raw482_timeline.csv",
+      "sha256": "4284df3fef1b4801e594b0ff22ab56e7fce96f29044e99542d8c8301d16ecdb0"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\20260923_MRRevo14F_group_owner_oscillation\\tables\\same_transition_controls.csv",
+      "sha256": "7a3cd6765c04b2ce7f99af843ba45555d2aa4dd33b9a7a34e361d6f89dd8d34e"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\20260923_MRRevo14F_group_owner_oscillation\\tables\\different_transition_controls.csv",
+      "sha256": "0f502d8144c7c69f6334c71f22ab316b5fc2fff9b12b4a9ab399aad94730a697"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\20260923_MRRevo14F_group_owner_oscillation\\tables\\cutin_controls.csv",
+      "sha256": "8d841b8f4603016b8b2f92a864df80590966deadb1880c55a118e0a102682f7e"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\20260923_MRRevo14F_group_owner_oscillation\\tables\\whole_corpus_prevalence.json",
+      "sha256": "63f8fd8da5d57f96bcd7decc7e8e05fd1c9a0a3ea54d0d100d0640cd5217afdb"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\20260923_MRRevo14F_opus55_endpoint_adjudication\\tables\\sequential_different_gt.csv",
+      "sha256": "dff8bb483bdc729a15b0424db71a2881bcb215744cf51833b55fcfe7a1cbcb9d"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\20260924_MRRevo14F_moving_identity_shadow\\tables\\moving_sequential_different_gt.csv",
+      "sha256": "77327566067e8da5c97c84db9b62620667508dc0b1d49194130c926498b8febf"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\20260924_MRRevo14F_moving_identity_shadow\\tables\\moving_sequential_same_gt.csv",
+      "sha256": "605024528ecec78aa1a25aedb1e66b1e24945252c48a1f3a1ca4eadea8673a5c"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\20260924_MRRevo14F_moving_identity_shadow\\tables\\shadow_safety_summary.csv",
+      "sha256": "71c5270643ce3c65e33b38701f30600dc8bee13cae663bd9215f4dc5e65e52f4"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\bosch_radar\\20260923_sidepass_reflection_migration\\tables\\route2bc_lateral_history.csv",
+      "sha256": "c2fedf3ecfa2a2c80fe37286ec0c2485a7d9ddab6fc1fb0997d6edf62baab04d"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\bosch_radar\\20260923_sidepass_reflection_migration\\manifests\\regression_manifest.json",
+      "sha256": "4972361e95aac213251c8c395beb31f378fb207e265d3f66f224d0b1c2c4637d"
+    },
+    {
+      "path": "C:\\CarrotRadarResearch\\analysis\\bosch_radar\\20260923_sidepass_reflection_migration\\tables\\prefix_invariance.csv",
+      "sha256": "7ecd4151b27cc1733f2cee342090eccbbef8eb5cea610f2cfca4837af4cba158"
+    }
+  ]
+}

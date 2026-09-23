@@ -1,0 +1,11 @@
+metric,baseline,final,unit,status
+Route269 exact group-to-singleton new PID births,11,11,events,UNCHANGED_NO_PRODUCTION_CANDIDATE
+Route269 returns to parent group,11,11,events,UNCHANGED_NO_PRODUCTION_CANDIDATE
+confirmed SAME transitions with distinct PID,4,4,events,NO_IMPROVEMENT
+confirmed sequential DIFFERENT baseline stitches,0,0,events/4,0 OBSERVED; NO CANDIDATE
+moving-to-moving DIFFERENT safety denominator,0,0,events,UNEVALUABLE
+whole-corpus mechanical split births,16526,16526,events/847 segments,UNLABELED_MECHANICS
+whole-corpus parent returns <=3s,5767,5767,events,NOT PHYSICAL SAME GT
+Route2bc S21 representative changes,0,0,changes/11 scans,IDENTITY_STABLE
+Route2bc S21 member-set changes,0,0,changes/11 scans,IDENTITY_STABLE
+Route280 S15 actual cut-in tracker-to-publication latency,0.0,0.0,ms,UNCHANGED_NO_CANDIDATE

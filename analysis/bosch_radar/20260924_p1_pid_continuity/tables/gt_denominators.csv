@@ -1,0 +1,8 @@
+denominator,count,routes,grade,use
+current-remap sequential SAME,4,2,CONFIRMED VIDEO GT,continuity positive
+exact O1 SAME raw482,3,1,CONFIRMED VIDEO GT,Route269 mechanism positive
+sequential DIFFERENT total,4,3,VIDEO GT,static/parked hard negative
+strict-order sequential DIFFERENT,3,2,VIDEO GT,strict hard negative
+moving-to-moving sequential DIFFERENT,0,0,EMPTY DENOMINATOR,moving stitch safety gate
+moving-to-moving sequential SAME,1,1,PROBABLE SAME VIDEO+RADAR,moving positive; not a DIFFERENT safety denominator
+simultaneous DIFFERENT vehicle pairs,37,16,VIDEO GT,concurrent false-merge controls; not sequential stitch GT

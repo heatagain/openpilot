@@ -1,0 +1,2 @@
+event,window_s,scans,raw_ids,physical_pids,member_sets,representatives,representative_changes,member_set_changes,publication_state_transitions,interpretation
+route2bc_S21_truck_side_body,20.8..21.9,11,822,1000845,822,822,0,0,2,P1_IDENTITY_STABLE_P0_INTERACTION_ONLY

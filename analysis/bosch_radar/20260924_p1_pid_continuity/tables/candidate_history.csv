@@ -1,0 +1,5 @@
+candidate,idea,root_case_capture,causal_result,safety_result,decision
+A_TIMEOUT_EXTENSION,extend raw/physical coast for short-gap reacquisition,0/11,Route269 raw482 was observed continuously for 255 scans; no gap to bridge,NOT_RUN,REJECTED_MECHANISM_MISS
+B_WIDEN_COMPLETE_LINK,widen distance/lateral diameter or growth gates,11/11 HYPOTHETICAL,would suppress the recorded boundary splits but changes grouping globally,actual-vehicle false merge denominator is incomplete; no global candidate replay,REJECTED_FALSE_MERGE_RISK
+C_REPRESENTATIVE_HYSTERESIS,hold the previous representative unless the replacement is materially better,0/11,parent representative raw436 already remained stable; the pair gate split happens first,NOT_RUN,REJECTED_MECHANISM_MISS
+D_BOUNDED_ANCESTRY_OWNER_VETO,diagnose recent absorbed-member lineage with active-owner ambiguity veto,11/11 FAMILY_LABEL_ONLY,can name the O1 family causally but cannot give one PID to two simultaneous children,SHADOW NOT RUN: moving-to-moving DIFFERENT denominator = 0,INCONCLUSIVE_NOT_IMPLEMENTED
