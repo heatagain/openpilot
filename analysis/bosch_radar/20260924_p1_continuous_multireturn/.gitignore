@@ -1,0 +1,7 @@
+scratch/*
+!scratch/.gitignore
+scripts/__pycache__/
+tables/group_lifetime.csv
+tables/mechanical_raw_events.csv
+tables/pid_births.csv
+tables/representative_changes.csv

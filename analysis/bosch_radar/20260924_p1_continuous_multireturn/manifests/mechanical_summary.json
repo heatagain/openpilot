@@ -1,0 +1,107 @@
+{
+  "total_group_splits": 21012,
+  "split_rejoin": 7861,
+  "oscillation_families": 2555,
+  "failure_causes": {
+    "DISTANCE_DIAMETER": 9114,
+    "DISTANCE_GROWTH": 2736,
+    "LATERAL_DIAMETER": 4461,
+    "LATERAL_GROWTH": 3993,
+    "OTHER_COMPLETE_LINK_ORDER": 15,
+    "OTHER_IMMATURE_PAIR": 14,
+    "OTHER_STATIONARY_MOVING": 433,
+    "VELOCITY_DIAMETER": 246
+  },
+  "route269_pair_family": {
+    "family_id": "00000269--4014745f93--7:436|482",
+    "key": "00000269--4014745f93--7",
+    "route": "00000269",
+    "segment": 7,
+    "raw_pair": "436|482",
+    "parent_member_sets": "436|482",
+    "split_count": 11,
+    "rejoin_count": 11,
+    "median_split_interval_s": 1.9395830135,
+    "max_split_interval_s": 4.290203918,
+    "median_rejoin_latency_s": 0.500351997,
+    "pid_births": 11,
+    "representative_retained": 11,
+    "boundary_causes": "{\"DISTANCE_DIAMETER\":6,\"LATERAL_DIAMETER\":1,\"LATERAL_GROWTH\":4}",
+    "publication_visible": 11,
+    "internal_only": 0
+  },
+  "threshold_distributions": [
+    {
+      "cause": "DISTANCE_DIAMETER",
+      "count": 9408,
+      "p50": 0.25,
+      "p90": 1.75,
+      "p95": 2.25,
+      "p99": 3.0,
+      "max": 5.75
+    },
+    {
+      "cause": "DISTANCE_GROWTH",
+      "count": 2985,
+      "p50": 0.25,
+      "p90": 1.0,
+      "p95": 1.25,
+      "p99": 1.75,
+      "max": 2.0
+    },
+    {
+      "cause": "LATERAL_DIAMETER",
+      "count": 4683,
+      "p50": 0.125,
+      "p90": 0.84375,
+      "p95": 1.28125,
+      "p99": 2.34375,
+      "max": 6.59375
+    },
+    {
+      "cause": "LATERAL_GROWTH",
+      "count": 4132,
+      "p50": 0.09375,
+      "p90": 0.34375,
+      "p95": 0.4375,
+      "p99": 0.625,
+      "max": 0.75
+    },
+    {
+      "cause": "OTHER_COMPLETE_LINK_ORDER",
+      "count": 2088,
+      "p50": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "max": 0.0
+    },
+    {
+      "cause": "OTHER_IMMATURE_PAIR",
+      "count": 0,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+    },
+    {
+      "cause": "OTHER_STATIONARY_MOVING",
+      "count": 478,
+      "p50": 0.10000000000000009,
+      "p90": 0.29472885131835946,
+      "p95": 0.41298143714666374,
+      "p99": 0.6347576141357423,
+      "max": 0.6977621078491212
+    },
+    {
+      "cause": "VELOCITY_DIAMETER",
+      "count": 259,
+      "p50": 0.25,
+      "p90": 0.5,
+      "p95": 0.75,
+      "p99": 1.25,
+      "max": 1.75
+    }
+  ]
+}

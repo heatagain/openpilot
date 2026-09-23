@@ -1,0 +1,123 @@
+{
+  "scope": "mechanical sensor-space only; no new actor identity adjudication",
+  "episodes": 89921,
+  "member_count_distribution": {
+    "2": 82124,
+    "3": 7426,
+    "4": 341,
+    "5": 23,
+    "6": 6,
+    "7": 1
+  },
+  "three_plus_member_episodes": 7797,
+  "representative_switch_episodes": 15326,
+  "geometry": {
+    "max_d_extent": {
+      "count": 89921,
+      "p50": 2.0,
+      "p95": 3.0,
+      "p99": 3.0,
+      "max": 3.0
+    },
+    "max_y_extent": {
+      "count": 89921,
+      "p50": 0.5,
+      "p95": 1.40625,
+      "p99": 1.5,
+      "max": 1.5
+    },
+    "max_v_spread": {
+      "count": 89921,
+      "p50": 0.25,
+      "p95": 0.75,
+      "p99": 1.25,
+      "max": 1.5
+    },
+    "duration_s": {
+      "count": 89921,
+      "p50": 0.300385896,
+      "p95": 2.699663294,
+      "p99": 5.3000382838,
+      "max": 59.719989493
+    }
+  },
+  "stable_controls": {
+    "episodes": 500,
+    "member_count_distribution": {
+      "2": 462,
+      "3": 37,
+      "4": 1
+    },
+    "geometry": {
+      "max_d_extent": {
+        "count": 500,
+        "p50": 2.25,
+        "p95": 3.0,
+        "p99": 3.0,
+        "max": 3.0
+      },
+      "max_y_extent": {
+        "count": 500,
+        "p50": 0.65625,
+        "p95": 1.34375,
+        "p99": 1.4690624999999997,
+        "max": 1.5
+      },
+      "max_v_spread": {
+        "count": 500,
+        "p50": 0.25,
+        "p95": 0.5,
+        "p99": 1.0,
+        "max": 1.25
+      },
+      "duration_s": {
+        "count": 500,
+        "p50": 8.904407452000001,
+        "p95": 42.04632402185,
+        "p99": 59.59923816297,
+        "max": 59.719989493
+      }
+    }
+  },
+  "frozen_same_controls": {
+    "controls": 41,
+    "multi_return_episode_matches": 0,
+    "geometry": {
+      "member_count": {
+        "count": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "max_d_extent": {
+        "count": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "max_y_extent": {
+        "count": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "max_v_spread": {
+        "count": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      },
+      "duration_s": {
+        "count": 0,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "max": null
+      }
+    }
+  }
+}

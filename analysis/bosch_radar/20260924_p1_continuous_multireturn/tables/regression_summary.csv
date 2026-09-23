@@ -1,0 +1,6 @@
+candidate,different_controls,different_evaluable,different_false_merges,same_controls,same_evaluable,same_regressions,control_scope,moving_sequential_different,new_actor_gt
+A_HYSTERESIS,37,37,0,41,41,0,frozen SAME plus simultaneous DIFFERENT only,NOT_USED,NO
+B_CONFIRMATION,37,37,0,41,41,0,frozen SAME plus simultaneous DIFFERENT only,NOT_USED,NO
+C_QUANTIZED,37,37,0,41,41,0,frozen SAME plus simultaneous DIFFERENT only,NOT_USED,NO
+D_STABLE_CORE,37,37,0,41,41,0,frozen SAME plus simultaneous DIFFERENT only,NOT_USED,NO
+E_REP_HOLD,37,37,0,41,41,0,frozen SAME plus simultaneous DIFFERENT only,NOT_USED,NO

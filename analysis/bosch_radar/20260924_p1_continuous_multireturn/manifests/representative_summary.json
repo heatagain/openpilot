@@ -1,0 +1,34 @@
+{
+  "transition_rows": 184486,
+  "representative_changes": 58505,
+  "categories": {
+    "A_GROUP_STABLE_REP_CHANGE": 26574,
+    "B_GROUP_SPLIT_REP_RETAINED": 48567,
+    "C_GROUP_SPLIT_REP_CHANGED": 22441,
+    "D_GROUP_MERGE_REP_CHANGED": 5576,
+    "OTHER_GROUP_MERGE_REP_RETAINED": 74994,
+    "OTHER_MEMBERSHIP_CHANGE_REP_CHANGED": 3914,
+    "OTHER_MEMBERSHIP_CHANGE_REP_RETAINED": 2420
+  },
+  "jump_abs": {
+    "abs_delta_d": {
+      "p50": 1.75,
+      "p95": 4.5,
+      "p99": 5.75,
+      "max": 9.25
+    },
+    "abs_delta_y": {
+      "p50": 0.15625,
+      "p95": 1.09375,
+      "p99": 1.65625,
+      "max": 5.625
+    },
+    "abs_delta_v": {
+      "p50": 0.0,
+      "p95": 0.5,
+      "p99": 1.0,
+      "max": 2.75
+    }
+  },
+  "published_before_and_after": 58496
+}

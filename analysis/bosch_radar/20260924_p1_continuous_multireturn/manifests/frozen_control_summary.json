@@ -1,0 +1,50 @@
+{
+  "segments": 71,
+  "summary": [
+    {
+      "candidate": "A_HYSTERESIS",
+      "different_controls": 37,
+      "different_evaluable": 37,
+      "different_false_merges": 0,
+      "same_controls": 41,
+      "same_evaluable": 41,
+      "same_regressions": 0
+    },
+    {
+      "candidate": "B_CONFIRMATION",
+      "different_controls": 37,
+      "different_evaluable": 37,
+      "different_false_merges": 0,
+      "same_controls": 41,
+      "same_evaluable": 41,
+      "same_regressions": 0
+    },
+    {
+      "candidate": "C_QUANTIZED",
+      "different_controls": 37,
+      "different_evaluable": 37,
+      "different_false_merges": 0,
+      "same_controls": 41,
+      "same_evaluable": 41,
+      "same_regressions": 0
+    },
+    {
+      "candidate": "D_STABLE_CORE",
+      "different_controls": 37,
+      "different_evaluable": 37,
+      "different_false_merges": 0,
+      "same_controls": 41,
+      "same_evaluable": 41,
+      "same_regressions": 0
+    },
+    {
+      "candidate": "E_REP_HOLD",
+      "different_controls": 37,
+      "different_evaluable": 37,
+      "different_false_merges": 0,
+      "same_controls": 41,
+      "same_evaluable": 41,
+      "same_regressions": 0
+    }
+  ]
+}

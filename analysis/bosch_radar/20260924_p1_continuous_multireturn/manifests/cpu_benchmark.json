@@ -1,0 +1,87 @@
+{
+  "keys": [
+    "00000259--f920fb6ddd--11",
+    "00000264--31b802e87a--22",
+    "00000269--4014745f93--7",
+    "00000280--91181081d4--15",
+    "0000028b--ca855432c0--33",
+    "0000028f--bc6e81a93a--32",
+    "0000028f--bc6e81a93a--37",
+    "00000294--307ed6c5e3--0"
+  ],
+  "repeats": 3,
+  "summary": [
+    {
+      "candidate": "BASELINE",
+      "segments": 24,
+      "updates": 144393,
+      "mean_us": 145.2619849992731,
+      "p50_us": 21.7,
+      "p95_us": 762.7,
+      "p99_us": 1564.7,
+      "max_us": 210915.9,
+      "wall_s": 66.63536680012476,
+      "A1M_CPU": "NOT MEASURED"
+    },
+    {
+      "candidate": "A_HYSTERESIS",
+      "segments": 24,
+      "updates": 144393,
+      "mean_us": 152.093612571245,
+      "p50_us": 22.0,
+      "p95_us": 784.0399999999995,
+      "p99_us": 1642.207999999999,
+      "max_us": 238647.8,
+      "wall_s": 66.53748739993898,
+      "A1M_CPU": "NOT MEASURED"
+    },
+    {
+      "candidate": "B_CONFIRMATION",
+      "segments": 24,
+      "updates": 144393,
+      "mean_us": 149.73154723567148,
+      "p50_us": 21.7,
+      "p95_us": 786.0,
+      "p99_us": 1604.3799999999871,
+      "max_us": 207962.7,
+      "wall_s": 66.6853746000561,
+      "A1M_CPU": "NOT MEASURED"
+    },
+    {
+      "candidate": "C_QUANTIZED",
+      "segments": 24,
+      "updates": 144393,
+      "mean_us": 150.27659304813704,
+      "p50_us": 21.9,
+      "p95_us": 795.3399999999993,
+      "p99_us": 1609.0159999999973,
+      "max_us": 192055.9,
+      "wall_s": 67.45331459998852,
+      "A1M_CPU": "NOT MEASURED"
+    },
+    {
+      "candidate": "D_STABLE_CORE",
+      "segments": 24,
+      "updates": 144393,
+      "mean_us": 146.18863102782151,
+      "p50_us": 21.6,
+      "p95_us": 767.1399999999994,
+      "p99_us": 1558.0079999999987,
+      "max_us": 217138.6,
+      "wall_s": 65.50945510005113,
+      "A1M_CPU": "NOT MEASURED"
+    },
+    {
+      "candidate": "E_REP_HOLD",
+      "segments": 24,
+      "updates": 144393,
+      "mean_us": 145.87750721987737,
+      "p50_us": 21.6,
+      "p95_us": 753.2,
+      "p99_us": 1601.8039999999835,
+      "max_us": 230887.1,
+      "wall_s": 65.26295450015459,
+      "A1M_CPU": "NOT MEASURED"
+    }
+  ]
+}

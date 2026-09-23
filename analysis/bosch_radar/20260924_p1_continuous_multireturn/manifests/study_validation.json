@@ -1,0 +1,24 @@
+{
+  "status": "PASS",
+  "source_sha256": "fb756fb400b8408840c68b5ee32d6cae795ec939c9cdea634fb5836a235851a9",
+  "corpus": {
+    "segments": 847,
+    "scans": 504673,
+    "routes": 34
+  },
+  "fractures": 21012,
+  "split_rejoins": 7861,
+  "route269": {
+    "splits": 11,
+    "rejoins": 11,
+    "raw482_continuous_scans": 255
+  },
+  "prefix": {
+    "checks": 25,
+    "passed": 25,
+    "failed": 0
+  },
+  "production_source_changed": false,
+  "new_actor_gt": false,
+  "moving_actor_identity_used": false
+}

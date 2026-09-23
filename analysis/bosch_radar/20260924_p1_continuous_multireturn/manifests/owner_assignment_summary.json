@@ -1,0 +1,13 @@
+{
+  "fracture_events_with_assignment_rows": 21012,
+  "parent_pid_to_representative_child": 18392,
+  "parent_pid_to_member_majority_child": 19064,
+  "majority_representative_conflicts": 1840,
+  "pid_birth_causes": {
+    "GROUP_FRACTURE_CHILD": 16612,
+    "RAW_OR_GROUP_BIRTH": 412498,
+    "SEGMENT_COLD_START": 12593
+  },
+  "score_formula": "10*overlap + 3*representative_retention + min(age,1000)*1e-5 + 1/(pid+1)",
+  "absorbed_cleanup": "same-scan removal of stolen raw ownership; empty non-output state retires"
+}

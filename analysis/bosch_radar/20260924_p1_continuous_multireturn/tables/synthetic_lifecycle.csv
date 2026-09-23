@@ -1,0 +1,7 @@
+candidate,timestamp_regression_refused,timestamp_regression_state_unchanged,stale_state_after_gap,provider_reset_fresh_state
+BASELINE,1,1,0,1
+A_HYSTERESIS,1,1,0,1
+B_CONFIRMATION,1,1,0,1
+C_QUANTIZED,1,1,0,1
+D_STABLE_CORE,1,1,0,1
+E_REP_HOLD,1,1,0,1

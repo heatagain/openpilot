@@ -1,0 +1,6 @@
+candidate,different_controls,different_evaluable,different_false_merges,same_controls,same_evaluable,same_regressions
+A_HYSTERESIS,37,37,0,41,41,0
+B_CONFIRMATION,37,37,0,41,41,0
+C_QUANTIZED,37,37,0,41,41,0
+D_STABLE_CORE,37,37,0,41,41,0
+E_REP_HOLD,37,37,0,41,41,0
