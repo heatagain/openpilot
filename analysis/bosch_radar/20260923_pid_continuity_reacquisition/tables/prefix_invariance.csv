@@ -1,0 +1,7 @@
+route,segment,state_limit,prefix_scans,full_scans,equal,valid_prefix
+route26d,15,400,40,600,1,1
+route26d,15,800,80,600,1,1
+route28f,32,400,40,600,1,1
+route28f,32,800,80,600,1,1
+route264,6,400,39,600,1,1
+route264,6,800,79,600,1,1

@@ -1,0 +1,11 @@
+case,route,segment,prior_gt,current_head_observation,type,confidence,source
+R269_S7_531256,route269,7,SAME_CONFIRMED_VIDEO,raw482 moves singleton PID1000618 to group PID1000462 then singleton PID1000634,TYPE5,LOG_BASED_INFERENCE,prior transition_ground_truth.csv plus current forensic_focus.csv
+R269_S7_540736,route269,7,SAME_CONFIRMED_VIDEO,raw482 moves between group and distinct singleton PIDs1000790/1000817,TYPE5,LOG_BASED_INFERENCE,prior transition_ground_truth.csv plus current sequential_head_remap.csv
+R269_S7_544125,route269,7,SAME_CONFIRMED_VIDEO,raw482 moves between group and distinct singleton PIDs1000832/1000849,TYPE5,LOG_BASED_INFERENCE,prior transition_ground_truth.csv plus current sequential_head_remap.csv
+R266_S16_TRUCK,route266,16,SAME_CONFIRMED_VIDEO,unique endpoint geometry maps to distinct PID1000384/1000394 and raw358/277,TYPE5,LOG_BASED_INFERENCE,prior video_review_labels.csv plus current sequential_head_remap.csv
+R264_S6_SPLIT,route264,6,SAME_OBJECT_FRAGMENT,PID1000000 and PID1000037 coexist after raw1 leaves group and keeps separate PID,TYPE5,CONFIRMED_FACT,prior typeA_gt_cumulative_v3.csv plus current forensic_focus.csv
+R28F_S32_TRUCK,route28f,32,SAME_OBJECT_FRAGMENT,PID1000539 and PID1000540 coexist for two scans then raw500 enters PID1000539,TYPE5,LOG_BASED_INFERENCE,prior typeA_gt_cumulative_v3.csv plus current forensic_focus.csv
+R259_S2_DIFFERENT,route259,2,DIFFERENT_OTHER,PID1000004 and PID1000106 coexist with separate raw members and no stitch,DIFFERENT_CONTROL,CONFIRMED_FACT,prior typeA_gt_cumulative_v3.csv plus current forensic_focus.csv
+R280_S7_FRAGMENT,route280,7,SAME_OBJECT_FRAGMENT,PID1000015 and PID1000227 coexist with 4.6 m lateral separation,TYPE5,LOG_BASED_INFERENCE,prior typeA_gt_cumulative_v3.csv plus current forensic_focus.csv
+R26D_S15_TRACK88,route26d,15,SAME_TRUCK_FRAGMENT_PRIOR_VIDEO,prior warm PID sequence did not remap to current warm replay IDs; current exact transition unresolved,TYPE4,UNVERIFIED,prior route26d_s14_s15_track_0_73_88_forensic.md plus current warm trace
+LEAD_AHEAD_REACQ_3,route259|route26d|route29b,2|96|0,AMBIGUOUS,prior broad candidate set has no direct same-vehicle video correspondence,TYPE4,UNVERIFIED,prior 20260921 lead-ahead report

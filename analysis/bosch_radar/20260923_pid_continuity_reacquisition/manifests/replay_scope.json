@@ -1,0 +1,28 @@
+{
+  "study_date": "2026-09-23",
+  "checkout_branch_at_start": "heatagain/bosch-radar-tracks",
+  "checkout_head_at_start": "d5c8b555351e6b38422446aecfb9fb20820d6432",
+  "provider_sha256": "76055c522059469f3bef686476bc9cb0b6fe1499960d4e68cff7a81bf982524d",
+  "input_kind": "existing decoded offline corpus plus historical frozen video GT",
+  "cold_priority_segments": 14,
+  "cold_priority_scans": 8398,
+  "cold_sequential_segments": 9,
+  "cold_sequential_scans": 5286,
+  "cold_total_unique_segments": 23,
+  "cold_total_scans": 13684,
+  "warm_sequences": [
+    ["route26d S14", "route26d S15"],
+    ["route28f S35", "route28f S36", "route28f S37"]
+  ],
+  "warm_scans_additional_runs": 3000,
+  "prior_same_confirmed_sequential_transitions": 12,
+  "unique_current_endpoint_remaps": 4,
+  "unresolved_current_endpoint_remaps": 8,
+  "confirmed_different_sequential_transitions": 0,
+  "event_prefix_checks_passed": 5,
+  "candidate": "NONE",
+  "production_provider_modified": false,
+  "a1m_cpu": "NOT MEASURED",
+  "downstream_replay": "NOT RUN",
+  "vehicle_applied": false
+}

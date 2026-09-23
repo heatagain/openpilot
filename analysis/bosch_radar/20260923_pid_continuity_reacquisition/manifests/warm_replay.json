@@ -1,0 +1,32 @@
+[
+  {
+    "name": "route26d_s14_s15",
+    "segments": [
+      "0000026d--2363789071--14",
+      "0000026d--2363789071--15"
+    ],
+    "boundaries_ns": [
+      943615958035,
+      1003576392341
+    ],
+    "scans": 1200,
+    "focused_rows": 569,
+    "trace": "C:\\CarrotRadarResearch\\openpilot\\analysis\\bosch_radar\\20260923_pid_continuity_reacquisition\\traces\\route26d_s14_s15.csv"
+  },
+  {
+    "name": "route28f_s35_s37",
+    "segments": [
+      "0000028f--bc6e81a93a--35",
+      "0000028f--bc6e81a93a--36",
+      "0000028f--bc6e81a93a--37"
+    ],
+    "boundaries_ns": [
+      6702111779605,
+      6761982067477,
+      6821903200587
+    ],
+    "scans": 1800,
+    "focused_rows": 632,
+    "trace": "C:\\CarrotRadarResearch\\openpilot\\analysis\\bosch_radar\\20260923_pid_continuity_reacquisition\\traces\\route28f_s35_s37.csv"
+  }
+]
