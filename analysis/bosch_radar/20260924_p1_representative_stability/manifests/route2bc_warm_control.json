@@ -1,0 +1,82 @@
+{
+  "segments": [
+    20,
+    21
+  ],
+  "window_ns": [
+    1347345050240,
+    1348345117576
+  ],
+  "baseline_scans": 11,
+  "baseline_raw": [
+    822
+  ],
+  "baseline_pids": [
+    1000845
+  ],
+  "baseline_representatives": [
+    822
+  ],
+  "candidates": [
+    {
+      "policy": "E",
+      "scans": 11,
+      "grouping_mismatch_scans": 0,
+      "pid_mismatch_scans": 0,
+      "member_mismatch_scans": 0,
+      "target_missing_scans": 0,
+      "target_regression_scans": 0,
+      "target_representative_changes": 0
+    },
+    {
+      "policy": "E1",
+      "scans": 11,
+      "grouping_mismatch_scans": 0,
+      "pid_mismatch_scans": 0,
+      "member_mismatch_scans": 0,
+      "target_missing_scans": 0,
+      "target_regression_scans": 0,
+      "target_representative_changes": 0
+    },
+    {
+      "policy": "E2",
+      "scans": 11,
+      "grouping_mismatch_scans": 0,
+      "pid_mismatch_scans": 0,
+      "member_mismatch_scans": 0,
+      "target_missing_scans": 0,
+      "target_regression_scans": 0,
+      "target_representative_changes": 0
+    },
+    {
+      "policy": "E3",
+      "scans": 11,
+      "grouping_mismatch_scans": 0,
+      "pid_mismatch_scans": 0,
+      "member_mismatch_scans": 0,
+      "target_missing_scans": 0,
+      "target_regression_scans": 0,
+      "target_representative_changes": 0
+    },
+    {
+      "policy": "E4",
+      "scans": 11,
+      "grouping_mismatch_scans": 0,
+      "pid_mismatch_scans": 0,
+      "member_mismatch_scans": 0,
+      "target_missing_scans": 0,
+      "target_regression_scans": 0,
+      "target_representative_changes": 0
+    },
+    {
+      "policy": "E5",
+      "scans": 11,
+      "grouping_mismatch_scans": 0,
+      "pid_mismatch_scans": 11,
+      "member_mismatch_scans": 11,
+      "target_missing_scans": 0,
+      "target_regression_scans": 11,
+      "target_representative_changes": 0
+    }
+  ]
+}

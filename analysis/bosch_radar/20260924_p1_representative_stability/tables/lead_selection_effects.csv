@@ -1,0 +1,7 @@
+policy,segments,scans,radarstate_changed_scans,lead_coordinate_only,lead_id_changed,lead_gain,lead_loss,lead1_lead2_change
+E,847,504673,5094,7,4352,2,2,0
+E1,847,504673,569,0,569,0,0,0
+E2,847,504673,3852,7,3585,2,2,0
+E3,847,504673,3857,7,3590,2,2,0
+E4,847,504673,746,0,720,0,0,0
+E5,847,504673,34205,180,18034,75,77,0

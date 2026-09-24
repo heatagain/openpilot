@@ -1,0 +1,114 @@
+{
+  "status": "PASS",
+  "failures": [],
+  "baseline_expected": {
+    "routes": 34,
+    "segments": 847,
+    "completed_scans": 504673,
+    "representative_changes": 58505,
+    "stable_group_representative_changes": 26574
+  },
+  "candidate_e_reproduction": {
+    "candidate_rep_changes_expected": 50553,
+    "candidate_rep_changes_actual": 50553,
+    "legacy_publication_changed_expected": 80770,
+    "legacy_publication_changed_actual": 80770
+  },
+  "candidate_e_exact_reproduction": true,
+  "prefix": {
+    "comparisons": 68,
+    "passed": 68,
+    "failed": 0
+  },
+  "synthetic": {
+    "policies": 7,
+    "cases": 13,
+    "rows": 231,
+    "stale_representatives": 0
+  },
+  "route2bc_warm_control": {
+    "segments": [
+      20,
+      21
+    ],
+    "window_ns": [
+      1347345050240,
+      1348345117576
+    ],
+    "baseline_scans": 11,
+    "baseline_raw": [
+      822
+    ],
+    "baseline_pids": [
+      1000845
+    ],
+    "baseline_representatives": [
+      822
+    ],
+    "candidates": [
+      {
+        "policy": "E",
+        "scans": 11,
+        "grouping_mismatch_scans": 0,
+        "pid_mismatch_scans": 0,
+        "member_mismatch_scans": 0,
+        "target_missing_scans": 0,
+        "target_regression_scans": 0,
+        "target_representative_changes": 0
+      },
+      {
+        "policy": "E1",
+        "scans": 11,
+        "grouping_mismatch_scans": 0,
+        "pid_mismatch_scans": 0,
+        "member_mismatch_scans": 0,
+        "target_missing_scans": 0,
+        "target_regression_scans": 0,
+        "target_representative_changes": 0
+      },
+      {
+        "policy": "E2",
+        "scans": 11,
+        "grouping_mismatch_scans": 0,
+        "pid_mismatch_scans": 0,
+        "member_mismatch_scans": 0,
+        "target_missing_scans": 0,
+        "target_regression_scans": 0,
+        "target_representative_changes": 0
+      },
+      {
+        "policy": "E3",
+        "scans": 11,
+        "grouping_mismatch_scans": 0,
+        "pid_mismatch_scans": 0,
+        "member_mismatch_scans": 0,
+        "target_missing_scans": 0,
+        "target_regression_scans": 0,
+        "target_representative_changes": 0
+      },
+      {
+        "policy": "E4",
+        "scans": 11,
+        "grouping_mismatch_scans": 0,
+        "pid_mismatch_scans": 0,
+        "member_mismatch_scans": 0,
+        "target_missing_scans": 0,
+        "target_regression_scans": 0,
+        "target_representative_changes": 0
+      },
+      {
+        "policy": "E5",
+        "scans": 11,
+        "grouping_mismatch_scans": 0,
+        "pid_mismatch_scans": 11,
+        "member_mismatch_scans": 11,
+        "target_missing_scans": 0,
+        "target_regression_scans": 11,
+        "target_representative_changes": 0
+      }
+    ]
+  },
+  "required_tables": 16,
+  "missing_tables": [],
+  "report_present": true
+}

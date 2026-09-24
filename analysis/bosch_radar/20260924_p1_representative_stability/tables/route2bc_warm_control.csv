@@ -1,0 +1,7 @@
+policy,scans,grouping_mismatch_scans,pid_mismatch_scans,member_mismatch_scans,target_missing_scans,target_regression_scans,target_representative_changes
+E,11,0,0,0,0,0,0
+E1,11,0,0,0,0,0,0
+E2,11,0,0,0,0,0,0
+E3,11,0,0,0,0,0,0
+E4,11,0,0,0,0,0,0
+E5,11,0,11,11,0,11,0
