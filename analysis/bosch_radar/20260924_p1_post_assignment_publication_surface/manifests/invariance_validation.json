@@ -1,0 +1,16 @@
+{
+  "status": "PASS",
+  "failures": [],
+  "baseline_parity": {
+    "scan": 0,
+    "qualification": 0,
+    "publication": 0,
+    "scan_count": 0
+  },
+  "candidate_rows": 63,
+  "live_replay": true,
+  "routes": 34,
+  "segments": 847,
+  "scans": 504673,
+  "aLead_signature": "complete debug snapshot including counters, lifecycle fields, and every PID state"
+}

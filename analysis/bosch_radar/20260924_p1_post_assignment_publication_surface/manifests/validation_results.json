@@ -1,0 +1,100 @@
+{
+  "status": "PASS",
+  "failures": [],
+  "corpus": {
+    "routes": 34,
+    "segments": 847,
+    "scans": 504673
+  },
+  "candidate_set": [
+    "P0",
+    "P1",
+    "P2",
+    "P3",
+    "P4",
+    "P5",
+    "P6"
+  ],
+  "prefix": {
+    "comparisons": 102,
+    "passed": 102,
+    "failed": 0
+  },
+  "synthetic": {
+    "policies": 7,
+    "cases": 15,
+    "rows": 217,
+    "tracking_mismatch": 0,
+    "stale_surface": 0,
+    "nonfresh_surface": 0
+  },
+  "route2bc": {
+    "baseline": {
+      "scans": 11,
+      "raw": 822,
+      "pid": 1000845,
+      "representative": 822
+    },
+    "candidates": [
+      {
+        "policy": "P0",
+        "scans": 11,
+        "publication_regression": 0,
+        "tracking_regression": 0,
+        "pid_regression": 0,
+        "member_regression": 0
+      },
+      {
+        "policy": "P1",
+        "scans": 11,
+        "publication_regression": 0,
+        "tracking_regression": 0,
+        "pid_regression": 0,
+        "member_regression": 0
+      },
+      {
+        "policy": "P2",
+        "scans": 11,
+        "publication_regression": 0,
+        "tracking_regression": 0,
+        "pid_regression": 0,
+        "member_regression": 0
+      },
+      {
+        "policy": "P3",
+        "scans": 11,
+        "publication_regression": 0,
+        "tracking_regression": 0,
+        "pid_regression": 0,
+        "member_regression": 0
+      },
+      {
+        "policy": "P4",
+        "scans": 11,
+        "publication_regression": 0,
+        "tracking_regression": 0,
+        "pid_regression": 0,
+        "member_regression": 0
+      },
+      {
+        "policy": "P5",
+        "scans": 11,
+        "publication_regression": 0,
+        "tracking_regression": 0,
+        "pid_regression": 0,
+        "member_regression": 0
+      },
+      {
+        "policy": "P6",
+        "scans": 11,
+        "publication_regression": 0,
+        "tracking_regression": 0,
+        "pid_regression": 0,
+        "member_regression": 0
+      }
+    ]
+  },
+  "required_tables": 16,
+  "missing_tables": [],
+  "report_present": true
+}

@@ -1,0 +1,87 @@
+{
+  "baseline_parity": {
+    "scan": 0,
+    "qualification": 0,
+    "publication": 0,
+    "scan_count": 0
+  },
+  "candidates": {
+    "P0": {
+      "raw": 0,
+      "group": 0,
+      "pid": 0,
+      "member": 0,
+      "tracking_representative": 0,
+      "qualification": 0,
+      "publication_set": 0,
+      "alias": 0,
+      "internal_aLead": 0
+    },
+    "P1": {
+      "raw": 0,
+      "group": 0,
+      "pid": 0,
+      "member": 0,
+      "tracking_representative": 0,
+      "qualification": 0,
+      "publication_set": 0,
+      "alias": 0,
+      "internal_aLead": 0
+    },
+    "P2": {
+      "raw": 0,
+      "group": 0,
+      "pid": 0,
+      "member": 0,
+      "tracking_representative": 0,
+      "qualification": 0,
+      "publication_set": 0,
+      "alias": 0,
+      "internal_aLead": 0
+    },
+    "P3": {
+      "raw": 0,
+      "group": 0,
+      "pid": 0,
+      "member": 0,
+      "tracking_representative": 0,
+      "qualification": 0,
+      "publication_set": 0,
+      "alias": 0,
+      "internal_aLead": 0
+    },
+    "P4": {
+      "raw": 0,
+      "group": 0,
+      "pid": 0,
+      "member": 0,
+      "tracking_representative": 0,
+      "qualification": 0,
+      "publication_set": 0,
+      "alias": 0,
+      "internal_aLead": 0
+    },
+    "P5": {
+      "raw": 0,
+      "group": 0,
+      "pid": 0,
+      "member": 0,
+      "tracking_representative": 0,
+      "qualification": 0,
+      "publication_set": 0,
+      "alias": 0,
+      "internal_aLead": 0
+    },
+    "P6": {
+      "raw": 0,
+      "group": 0,
+      "pid": 0,
+      "member": 0,
+      "tracking_representative": 0,
+      "qualification": 0,
+      "publication_set": 0,
+      "alias": 0,
+      "internal_aLead": 0
+    }
+  }
+}

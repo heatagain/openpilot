@@ -1,0 +1,66 @@
+{
+  "baseline": {
+    "scans": 11,
+    "raw": 822,
+    "pid": 1000845,
+    "representative": 822
+  },
+  "candidates": [
+    {
+      "policy": "P0",
+      "scans": 11,
+      "publication_regression": 0,
+      "tracking_regression": 0,
+      "pid_regression": 0,
+      "member_regression": 0
+    },
+    {
+      "policy": "P1",
+      "scans": 11,
+      "publication_regression": 0,
+      "tracking_regression": 0,
+      "pid_regression": 0,
+      "member_regression": 0
+    },
+    {
+      "policy": "P2",
+      "scans": 11,
+      "publication_regression": 0,
+      "tracking_regression": 0,
+      "pid_regression": 0,
+      "member_regression": 0
+    },
+    {
+      "policy": "P3",
+      "scans": 11,
+      "publication_regression": 0,
+      "tracking_regression": 0,
+      "pid_regression": 0,
+      "member_regression": 0
+    },
+    {
+      "policy": "P4",
+      "scans": 11,
+      "publication_regression": 0,
+      "tracking_regression": 0,
+      "pid_regression": 0,
+      "member_regression": 0
+    },
+    {
+      "policy": "P5",
+      "scans": 11,
+      "publication_regression": 0,
+      "tracking_regression": 0,
+      "pid_regression": 0,
+      "member_regression": 0
+    },
+    {
+      "policy": "P6",
+      "scans": 11,
+      "publication_regression": 0,
+      "tracking_regression": 0,
+      "pid_regression": 0,
+      "member_regression": 0
+    }
+  ]
+}
