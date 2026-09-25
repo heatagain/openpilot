@@ -1816,17 +1816,18 @@ class TestBoschCameraScaleCorrection:
   def test_new_constants_are_read_only_by_the_bosch_camera_path(self):
     from pathlib import Path
     import re
-    source = Path(module_path()).read_text(encoding='utf-8')
+    interface_path = Path(module_path())
+    interface_source = interface_path.read_text(encoding='utf-8')
+    bosch_source = interface_path.with_name('radar_bosch.py').read_text(encoding='utf-8')
     for name in ('BOSCH_CAMERA_RANGE_LSB', 'BOSCH_CAMERA_LONG_BASE_M',
                  'BOSCH_CAMERA_LONG_RANGE_K', 'BOSCH_CAMERA_LONG_POS_WIDTH_K',
                  'BOSCH_CAMERA_LONG_NEG_WIDTH_K', 'BOSCH_CAMERA_LONG_MAX_M',
                  'BOSCH_CAMERA_LAT_MAX_M'):
-      uses = [m.start() for m in re.finditer(name, source)]
+      uses = [m.start() for m in re.finditer(name, bosch_source)]
       assert uses, name
-      # 모든 사용처가 Bosch 영역 안에 있다: generic RadarInterface 이후에는
-      # 단 한 번도 나타나지 않는다
-      generic = source.index('class RadarInterface(')
-      assert all(pos < generic for pos in uses), name
+      # generic RadarInterface 경로에서는 이 상수들을 사용하지 않는다
+      generic = interface_source.index('class RadarInterface(')
+      assert not re.search(name, interface_source[generic:]), name
 
 
 def module_path():
