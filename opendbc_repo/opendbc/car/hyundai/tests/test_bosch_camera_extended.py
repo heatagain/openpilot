@@ -1437,7 +1437,7 @@ class TestBoschCompanionDeferral:
 
   def test_off_mode_is_exact_identity(self):
     provider = self.provider()
-    import opendbc.car.hyundai.radar_interface as module
+    import opendbc.car.hyundai.radar_bosch as module
     original = module.BOSCH_COMPANION_DEFER_MODE
     module.BOSCH_COMPANION_DEFER_MODE = module.BOSCH_COMPANION_DEFER_OFF
     try:
@@ -1539,7 +1539,7 @@ class TestBoschOemNearerPublication:
     assert published <= obj.d_rel
 
   def test_off_mode_is_exact_identity(self):
-    import opendbc.car.hyundai.radar_interface as module
+    import opendbc.car.hyundai.radar_bosch as module
     provider = self.provider()
     original = module.BOSCH_OEM_NEARER_PUBLICATION_MODE
     module.BOSCH_OEM_NEARER_PUBLICATION_MODE = module.BOSCH_OEM_NEARER_PUBLICATION_OFF
