@@ -60,6 +60,39 @@ BOSCH_B5_CORRIDOR_WIDTH_MAX_M = 5.5
 BOSCH_B5_EDGE_LANE_BAND_MAX_M = 7.0
 BOSCH_B5_DIVERGENCE_MIN_M = 0.75
 
+# M1 mirror-birth hold. The mirror geometry is an exact port of the frozen
+# FR-WALLHN shadow; only newly born physical IDs can start a publication hold.
+BOSCH_MIRROR_BIRTH_OFF = 0
+BOSCH_MIRROR_BIRTH_SHADOW = 1
+BOSCH_MIRROR_BIRTH_ACTIVE = 2
+BOSCH_MIRROR_BIRTH_MODE = BOSCH_MIRROR_BIRTH_SHADOW
+BOSCH_MIRROR_BIRTH_STAT_WORLD_MAX_MPS = 0.5
+BOSCH_MIRROR_BIRTH_STAT_Y_MIN_M = 1.0
+BOSCH_MIRROR_BIRTH_HIST_SCANS = 20
+BOSCH_MIRROR_BIRTH_GAP_NS = 300_000_000
+BOSCH_MIRROR_BIRTH_BAND_HALF_M = 0.5
+BOSCH_MIRROR_BIRTH_SUPPORT_MIN = 6
+BOSCH_MIRROR_BIRTH_COVER_HALF_M = 6.0
+BOSCH_MIRROR_BIRTH_COVER_MIN = 0.5
+BOSCH_MIRROR_BIRTH_DD_MAX_M = 1.5
+BOSCH_MIRROR_BIRTH_DV_MAX_MPS = 0.5
+BOSCH_MIRROR_BIRTH_RESID_MAX_M = 2.0
+BOSCH_MIRROR_BIRTH_BEYOND_MIN_M = 1.0
+BOSCH_MIRROR_BIRTH_INSIDE_MIN_M = 1.0
+BOSCH_MIRROR_BIRTH_PARENT_AGE_SCANS = 10
+BOSCH_MIRROR_BIRTH_MOVE_MIN_MPS = 2.0
+BOSCH_MIRROR_BIRTH_D_MAX_M = 80.0
+BOSCH_MIRROR_BIRTH_CURV_MAX_1PM = 0.01
+BOSCH_MIRROR_BIRTH_VEGO_MIN_MPS = 3.0
+BOSCH_MIRROR_BIRTH_CONFIRM_SCANS = 5
+BOSCH_MIRROR_BIRTH_HOLD_SCANS = 10
+BOSCH_MIRROR_BIRTH_Y_MIN_M = 4.5
+BOSCH_MIRROR_BIRTH_INSIDE_MARGIN_M = 0.5
+BOSCH_MIRROR_BIRTH_PARENT_MISS_SCANS = 2
+BOSCH_MIRROR_BIRTH_DIVERGE_DV_MPS = 1.5
+BOSCH_MIRROR_BIRTH_DIVERGE_DD_M = 5.0
+BOSCH_MIRROR_BIRTH_DIVERGE_SCANS = 3
+
 # Candidate P91 changes only the final Bosch publication view; raw detections,
 # grouping, physical IDs, qualification and alias bindings remain. SHADOW
 # diagnostics stay available for replay and on-device comparison.
@@ -5183,6 +5216,382 @@ def bosch_make_points(objects, v_ego=math.nan):
   return list(data.points)
 
 
+@dataclass
+class _BoschMirrorBirthShadowState:
+  parent: int | None = None
+  count: int = 0
+  confirmed: bool = False
+  parents: frozenset = frozenset()
+
+
+@dataclass(frozen=True)
+class BoschMirrorBirthDecision:
+  physical_track_id: int
+  action: str
+  reason: str
+  parent_pid: int | None = None
+  wall_y_m: float | None = None
+  residual_m: float | None = None
+  count: int = 0
+
+
+@dataclass
+class _BoschMirrorBirthHoldState:
+  physical_track_id: int
+  parent_pid: int
+  wall_y_m: float
+  residual_m: float
+  d_rel_m: float
+  y_rel_m: float
+  v_rel_mps: float
+  birth_ns: int
+  held_scans: int = 1
+  parent_miss_scans: int = 0
+  diverge_scans: int = 0
+
+
+class BoschMirrorBirthHold:
+  """Frozen wall-mirror birth decision with a bounded publication-only hold.
+
+  The v1 shadow runs on the same physical objects and raw observations as the
+  provider scan. Its result can start a hold only on the first qualified scan
+  for a PID. Holds never feed the tracker, grouping, camera/OEM, aliases or
+  any other provider filter.
+  """
+
+  def __init__(self, mode=BOSCH_MIRROR_BIRTH_MODE):
+    if mode not in (BOSCH_MIRROR_BIRTH_OFF, BOSCH_MIRROR_BIRTH_SHADOW,
+                    BOSCH_MIRROR_BIRTH_ACTIVE):
+      raise ValueError('invalid Bosch mirror-birth mode')
+    self.mode = mode
+    self.hist: list[tuple[int, list[tuple[float, float, int]]]] = []
+    self.shadow_states: dict[int, _BoschMirrorBirthShadowState] = {}
+    self.holds: dict[int, _BoschMirrorBirthHoldState] = {}
+    self.seen_births: set[int] = set()
+    self.last_ns: int | None = None
+    self.last_decisions: tuple[BoschMirrorBirthDecision, ...] = ()
+    self.last_events: tuple[dict, ...] = ()
+    self.would_suppress = frozenset()
+    self.reset_count = 0
+    self.hold_count = 0
+    self.release_count = 0
+    self.publication_suppressed = 0
+    self.peak_history_points = 0
+    self.peak_hold_count = 0
+
+  def _reset_shadow(self):
+    self.hist = []
+    self.shadow_states = {}
+    self.would_suppress = frozenset()
+    self.reset_count += 1
+
+  def _record_event(self, state, action, reason, timestamp_ns):
+    fields = dict(
+      action=action, ns=timestamp_ns, pid=state.physical_track_id,
+      parent=state.parent_pid, wall_y=state.wall_y_m, resid=state.residual_m,
+      d=state.d_rel_m, y=state.y_rel_m, v=state.v_rel_mps,
+      reason=reason, held_scans=state.held_scans)
+    self._pending_events.append(fields)
+    researchlog.debug(
+      f'BOSCH_MIRROR_BIRTH_{action} ns={timestamp_ns} pid={state.physical_track_id} '
+      f'parent={state.parent_pid} wall_y={state.wall_y_m} resid={state.residual_m} '
+      f'd={state.d_rel_m} y={state.y_rel_m} v={state.v_rel_mps} '
+      f'reason={reason} held_scans={state.held_scans}')
+
+  def reset(self, timestamp_ns=None, reason='STATE_RESET'):
+    """Release all holds and clear both hold and v1 history state."""
+    self._pending_events = []
+    release_ns = self.last_ns if timestamp_ns is None else timestamp_ns
+    for state in tuple(self.holds.values()):
+      self._record_event(state, 'RELEASE', reason, release_ns)
+      self.release_count += 1
+    self.holds.clear()
+    self.seen_births.clear()
+    self._reset_shadow()
+    self.last_ns = None
+    self.last_decisions = ()
+    self.last_events = tuple(self._pending_events)
+    self.would_suppress = frozenset()
+    del self._pending_events
+
+  def _wall(self, side, y_lo, y_hi, x_r_of, excluded):
+    pts = [(x, y) for _timestamp_ns, scan_points in self.hist
+           for x, y, raw_id in scan_points
+           if raw_id not in excluded and y_lo < side * y < y_hi]
+    if not pts:
+      return None, 'NO_WALL_SUPPORT', 0, 0.0
+    pts.sort(key=lambda point: side * point[1])
+    best_fail = ('NO_WALL_SUPPORT', 0, 0.0)
+    tried = set()
+    for x0, y0 in pts:
+      center = side * y0 + BOSCH_MIRROR_BIRTH_BAND_HALF_M
+      key = round(center, 1)
+      if key in tried:
+        continue
+      tried.add(key)
+      band = [(x, y) for x, y in pts
+              if abs(side * y - center) <= BOSCH_MIRROR_BIRTH_BAND_HALF_M + 1e-9]
+      if not band:
+        continue
+      wall_y = sorted(y for _x, y in band)[len(band) // 2]
+      x_r = x_r_of(wall_y)
+      if not math.isfinite(x_r):
+        continue
+      window = [x for x, _y in band if abs(x - x_r) <= BOSCH_MIRROR_BIRTH_COVER_HALF_M]
+      bin_count = int(2 * BOSCH_MIRROR_BIRTH_COVER_HALF_M / 2.0)
+      bins = {min(bin_count - 1, max(0, int(
+        (x - (x_r - BOSCH_MIRROR_BIRTH_COVER_HALF_M)) / 2.0))) for x in window}
+      cover = len(bins) / bin_count
+      if (len(window) >= BOSCH_MIRROR_BIRTH_SUPPORT_MIN and
+          cover >= BOSCH_MIRROR_BIRTH_COVER_MIN):
+        return wall_y, 'OK', len(window), cover
+      if len(window) > best_fail[1]:
+        best_fail = ('WALL_NOT_AT_SPECULAR_POINT', len(window), cover)
+    return None, best_fail[0], best_fail[1], best_fail[2]
+
+  def _mirror_decisions(self, timestamp_ns, v_ego, yaw_rate, raw_tracks, objects,
+                        camera_associations, word0_pids):
+    mirror = {}
+    for obj in objects:
+      mirror[obj.physical_track_id] = (
+        obj.d_rel, obj.y_rel, obj.v_rel, obj.age_scans,
+        tuple(member.raw_track_id for member in obj.members),
+        obj.representative_raw_track_id, obj.oem_selected, obj.vision_supported)
+    for pid in tuple(self.shadow_states):
+      if pid not in mirror:
+        del self.shadow_states[pid]
+    fresh_raw = {raw.raw_track_id for raw in raw_tracks}
+    if yaw_rate is not None and math.isfinite(yaw_rate):
+      stationary = [(raw.d_rel, raw.y_rel, raw.raw_track_id) for raw in raw_tracks
+                    if (abs(raw.v_rel + v_ego - yaw_rate * raw.y_rel) <=
+                        BOSCH_MIRROR_BIRTH_STAT_WORLD_MAX_MPS and
+                        abs(raw.y_rel) >= BOSCH_MIRROR_BIRTH_STAT_Y_MIN_M)]
+      self.hist.append((timestamp_ns, stationary))
+    else:
+      self.hist.append((timestamp_ns, []))
+    self.peak_history_points = max(self.peak_history_points,
+                                   sum(len(points) for _ns, points in self.hist))
+    context_ok = (yaw_rate is not None and math.isfinite(yaw_rate) and
+                  v_ego >= BOSCH_MIRROR_BIRTH_VEGO_MIN_MPS and
+                  abs(yaw_rate / max(v_ego, .1)) <= BOSCH_MIRROR_BIRTH_CURV_MAX_1PM)
+    yaw_for_world = yaw_rate if yaw_rate is not None and math.isfinite(yaw_rate) else 0.0
+    camera_associations = camera_associations or {}
+    word0_pids = set(word0_pids)
+
+    def world(obj):
+      return obj[2] + v_ego - yaw_for_world * obj[1]
+
+    def fresh(obj):
+      return any(member_id in fresh_raw for member_id in obj[4])
+
+    decisions = []
+    for pid, obj in mirror.items():
+      d_rel, y_rel, _v_rel, _age, _members, _rep, _oem, _vision = obj
+      shadow_state = self.shadow_states.get(pid)
+      reason = None
+      parent = wall_y = residual = None
+      support, cover = 0, 0.0
+      if (abs(y_rel) < BOSCH_MIRROR_BIRTH_BEYOND_MIN_M + BOSCH_MIRROR_BIRTH_INSIDE_MIN_M or
+          d_rel > BOSCH_MIRROR_BIRTH_D_MAX_M or world(obj) < BOSCH_MIRROR_BIRTH_MOVE_MIN_MPS):
+        reason = 'NOT_APPLICABLE'
+      elif not context_ok:
+        reason = 'CONTEXT_FAIL_OPEN'
+      elif not fresh(obj):
+        reason = 'X_NOT_FRESH'
+      elif (obj[7] or obj[6] or pid in word0_pids or
+            (camera_associations.get(pid, (0, -1))[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and
+             camera_associations.get(pid, (0, -1))[1] >= 0)):
+        reason = 'INDEPENDENT_IDENTITY_FAIL_OPEN'
+      else:
+        side = 1.0 if y_rel > 0 else -1.0
+        candidates = []
+        for candidate_pid, candidate in mirror.items():
+          if candidate_pid == pid:
+            continue
+          if (abs(candidate[0] - d_rel) <= BOSCH_MIRROR_BIRTH_DD_MAX_M and
+              abs(candidate[2] - obj[2]) <= BOSCH_MIRROR_BIRTH_DV_MAX_MPS and
+              side * candidate[1] < side * y_rel -
+              (BOSCH_MIRROR_BIRTH_BEYOND_MIN_M + BOSCH_MIRROR_BIRTH_INSIDE_MIN_M)):
+            candidates.append((candidate_pid, candidate))
+        if not candidates:
+          reason = 'NO_PARENT'
+        else:
+          passing = []
+          last_fail = 'PARENT_NOT_DIRECT'
+          for candidate_pid, candidate in candidates:
+            if (candidate[3] < BOSCH_MIRROR_BIRTH_PARENT_AGE_SCANS or not fresh(candidate) or
+                world(candidate) < BOSCH_MIRROR_BIRTH_MOVE_MIN_MPS):
+              continue
+            excluded = set(obj[4]) | set(candidate[4])
+            y_lo = side * candidate[1] + BOSCH_MIRROR_BIRTH_INSIDE_MIN_M
+            y_hi = side * y_rel - BOSCH_MIRROR_BIRTH_BEYOND_MIN_M
+            found_wall, wall_reason, support_count, cover_fraction = self._wall(
+              side, y_lo, y_hi,
+              lambda candidate_wall_y: d_rel * candidate_wall_y / y_rel if y_rel else math.nan,
+              excluded)
+            if found_wall is None:
+              last_fail = wall_reason
+              support, cover = max(support, support_count), max(cover, cover_fraction)
+              continue
+            found_residual = y_rel - (2 * found_wall - candidate[1])
+            if abs(found_residual) > BOSCH_MIRROR_BIRTH_RESID_MAX_M:
+              last_fail = 'MIRROR_RESIDUAL'
+              wall_y, residual, parent = found_wall, found_residual, candidate_pid
+              continue
+            passing.append((abs(found_residual), candidate_pid, found_wall,
+                            found_residual, support_count, cover_fraction))
+          if not passing:
+            reason = last_fail
+          else:
+            passing.sort()
+            _abs_resid, parent, wall_y, residual, support, cover = passing[0]
+            parents_ok = frozenset(candidate_pid for _resid, candidate_pid, *_rest in passing)
+      if reason is None:
+        if shadow_state is None or not (shadow_state.parents & parents_ok):
+          shadow_state = _BoschMirrorBirthShadowState(parent=parent, count=0,
+                                                       confirmed=False, parents=parents_ok)
+          self.shadow_states[pid] = shadow_state
+        else:
+          shadow_state.parents = shadow_state.parents & parents_ok
+          shadow_state.parent = parent
+        shadow_state.count += 1
+        if shadow_state.count >= BOSCH_MIRROR_BIRTH_CONFIRM_SCANS:
+          action = 'CONFIRMED'
+          shadow_state.confirmed = True
+        else:
+          action = 'QUALIFY'
+        decisions.append(BoschMirrorBirthDecision(pid, action, 'OK', parent,
+                                                    wall_y, residual, shadow_state.count))
+      else:
+        if shadow_state is not None:
+          if shadow_state.confirmed:
+            decisions.append(BoschMirrorBirthDecision(pid, 'RELEASE', reason, parent,
+                                                        wall_y, residual, shadow_state.count))
+          del self.shadow_states[pid]
+        if reason != 'NOT_APPLICABLE':
+          decisions.append(BoschMirrorBirthDecision(pid, 'NO_DECISION', reason,
+                                                      parent, wall_y, residual, 0))
+    self.peak_shadow_state_count = max(getattr(self, 'peak_shadow_state_count', 0),
+                                       len(self.shadow_states))
+    return mirror, {decision.physical_track_id: decision for decision in decisions}
+
+  def update(self, objects, raw_tracks, timestamp_ns, v_ego, yaw_rate_left,
+             *, camera_associations=(), word0_pids=()):
+    self._pending_events = []
+    self.last_decisions = ()
+    self.would_suppress = frozenset()
+    if self.mode == BOSCH_MIRROR_BIRTH_OFF:
+      self.holds.clear()
+      self.seen_births.clear()
+      self.hist.clear()
+      self.shadow_states.clear()
+      self.last_ns = timestamp_ns
+      self.last_events = ()
+      del self._pending_events
+      return self.would_suppress
+
+    if self.last_ns is not None:
+      delta_ns = timestamp_ns - self.last_ns
+      if delta_ns <= 0 or delta_ns >= BOSCH_MIRROR_BIRTH_GAP_NS:
+        for state in tuple(self.holds.values()):
+          self._record_event(state, 'RELEASE', 'GAP_RESET', timestamp_ns)
+          self.release_count += 1
+        self.holds.clear()
+        self.seen_births.clear()
+        self._reset_shadow()
+      else:
+        dt = delta_ns * 1e-9
+        theta = (yaw_rate_left or 0.0) * dt
+        cos_theta, sin_theta = math.cos(theta), math.sin(theta)
+        moved = []
+        for scan_ns, points in self.hist:
+          transformed = []
+          for x, y, raw_id in points:
+            x1 = x - v_ego * dt
+            transformed.append((cos_theta * x1 + sin_theta * y,
+                                -sin_theta * x1 + cos_theta * y, raw_id))
+          moved.append((scan_ns, transformed))
+        self.hist = (moved[-(BOSCH_MIRROR_BIRTH_HIST_SCANS - 1):]
+                     if BOSCH_MIRROR_BIRTH_HIST_SCANS > 1 else [])
+    self.last_ns = timestamp_ns
+
+    mirror, decisions = self._mirror_decisions(
+      timestamp_ns, v_ego, yaw_rate_left, raw_tracks, objects,
+      camera_associations, word0_pids)
+
+    # Existing holds are advanced before this scan's newborns, matching mbh_sim.py.
+    for pid in list(self.holds):
+      state = self.holds[pid]
+      obj = mirror.get(pid)
+      if obj is None:
+        self._record_event(state, 'RELEASE', 'PID_DEAD', timestamp_ns)
+        self.release_count += 1
+        del self.holds[pid]
+        continue
+      state.held_scans += 1
+      parent_obj = mirror.get(state.parent_pid)
+      side = 1 if state.wall_y_m > 0 else -1
+      release_reason = None
+      if (obj[7] or obj[6] or pid in set(word0_pids) or
+          (camera_associations or {}).get(pid, (0, -1))[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and
+          (camera_associations or {}).get(pid, (0, -1))[1] >= 0):
+        release_reason = 'INDEPENDENT_IDENTITY'
+      elif (side * obj[1] < side * state.wall_y_m + BOSCH_MIRROR_BIRTH_INSIDE_MARGIN_M or
+            abs(obj[1]) < BOSCH_MIRROR_BIRTH_Y_MIN_M):
+        release_reason = 'MOVED_INSIDE'
+      else:
+        state.parent_miss_scans = state.parent_miss_scans + 1 if parent_obj is None else 0
+        if state.parent_miss_scans >= BOSCH_MIRROR_BIRTH_PARENT_MISS_SCANS:
+          release_reason = 'PARENT_LOST'
+        elif parent_obj is not None:
+          diverged = (abs(obj[2] - parent_obj[2]) > BOSCH_MIRROR_BIRTH_DIVERGE_DV_MPS or
+                      abs(obj[0] - parent_obj[0]) > BOSCH_MIRROR_BIRTH_DIVERGE_DD_M)
+          state.diverge_scans = state.diverge_scans + 1 if diverged else 0
+          if state.diverge_scans >= BOSCH_MIRROR_BIRTH_DIVERGE_SCANS:
+            release_reason = 'DIVERGED'
+      if (release_reason is None and
+          state.held_scans > BOSCH_MIRROR_BIRTH_HOLD_SCANS):
+        release_reason = 'EXPIRED'
+      if release_reason is not None:
+        self._record_event(state, 'RELEASE', release_reason, timestamp_ns)
+        self.release_count += 1
+        del self.holds[pid]
+
+    seen = self.seen_births
+    for pid, obj in mirror.items():
+      if obj[3] != 1 or pid in seen:
+        continue
+      seen.add(pid)
+      decision = decisions.get(pid)
+      if (decision is None or decision.action != 'QUALIFY' or
+          abs(obj[1]) < BOSCH_MIRROR_BIRTH_Y_MIN_M):
+        continue
+      state = _BoschMirrorBirthHoldState(
+        pid, decision.parent_pid, decision.wall_y_m, decision.residual_m,
+        obj[0], obj[1], obj[2], timestamp_ns)
+      self.holds[pid] = state
+      self._record_event(state, 'HOLD', 'MIRROR_BIRTH_QUALIFIED', timestamp_ns)
+      self.hold_count += 1
+
+    self.would_suppress = frozenset(self.holds)
+    self.last_decisions = tuple(decisions.values())
+    self.last_events = tuple(self._pending_events)
+    self.peak_hold_count = max(self.peak_hold_count, len(self.holds))
+    del self._pending_events
+    return self.would_suppress
+
+  def publication_view(self, objects):
+    if (self.mode != BOSCH_MIRROR_BIRTH_ACTIVE or not objects or
+        not self.would_suppress):
+      return objects
+    suppressed = {obj.physical_track_id for obj in objects
+                  if obj.physical_track_id in self.would_suppress}
+    if not suppressed:
+      return objects
+    self.publication_suppressed += len(suppressed)
+    return tuple(obj for obj in objects if obj.physical_track_id not in suppressed)
+
+
 class BoschRadarProvider:
   def __init__(self, bus: int, *, qualification=True, camera_bus=1,
                camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE, p91_mode=BOSCH_P91_MODE,
@@ -5190,7 +5599,8 @@ class BoschRadarProvider:
                curve_reacquire_mode=BOSCH_CAMERA_CURVE_REACQUIRE_MODE,
                provisional_bundle=True, family_companion_mode=BOSCH_FAMILY_COMPANION_MODE,
                burst_multireturn_mode=BOSCH_BURST_MULTIRETURN_MODE,
-               b5_mode=BOSCH_B5_MODE, sidepass_lateral_mode=BOSCH_SIDEPASS_LATERAL_MODE):
+               b5_mode=BOSCH_B5_MODE, sidepass_lateral_mode=BOSCH_SIDEPASS_LATERAL_MODE,
+               mirror_birth_mode=BOSCH_MIRROR_BIRTH_MODE):
     self.bus = bus
     self.camera_bus = camera_bus
     self.scc_bus = scc_bus
@@ -5201,6 +5611,7 @@ class BoschRadarProvider:
     self.family_companion = _BoschFamilyCompanionFilter(family_companion_mode)
     self.burst_multireturn = _BoschBurstMultiReturnDefer(burst_multireturn_mode)
     self.b5_birth_defer = BoschBirthB5Defer(b5_mode)
+    self.mirror_birth_hold = BoschMirrorBirthHold(mirror_birth_mode)
     self.sidepass_lateral = _BoschSidePassLateralEstimator(sidepass_lateral_mode)
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
     self.oem_gate = _BoschOemValidationGate(oem_gate_mode)
@@ -5433,13 +5844,15 @@ class BoschRadarProvider:
       objects = tuple(obj for obj in objects if obj.physical_track_id not in withheld)
     ext = self.camera_extended
     if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
-      return self.sidepass_lateral.publication_view(self.b5_birth_defer.publication_view(
-        self._burst_view(self.family_companion.publication_view(self._final_view(objects)))))
+      return self.sidepass_lateral.publication_view(self.mirror_birth_hold.publication_view(
+        self.b5_birth_defer.publication_view(
+          self._burst_view(self.family_companion.publication_view(self._final_view(objects))))))
     if not ext.mature_groups or not objects:
       self.test_last_suppressed = ()
       self.test_last_active_groups = 0
-      return self.sidepass_lateral.publication_view(self.b5_birth_defer.publication_view(
-        self._burst_view(self.family_companion.publication_view(self._final_view(objects)))))
+      return self.sidepass_lateral.publication_view(self.mirror_birth_hold.publication_view(
+        self.b5_birth_defer.publication_view(
+          self._burst_view(self.family_companion.publication_view(self._final_view(objects))))))
     # 다른 scan의 tuple 또는 qualification에서 대표가 빠진 그룹은 baseline으로 연다.
     by_pid = {obj.physical_track_id: obj for obj in objects}
     suppressed = set()
@@ -5453,9 +5866,10 @@ class BoschRadarProvider:
       active_groups += 1
     self.test_last_suppressed = tuple(sorted(suppressed))
     self.test_last_active_groups = active_groups
-    return self.sidepass_lateral.publication_view(self.b5_birth_defer.publication_view(
-      self._burst_view(self.family_companion.publication_view(self._final_view(
-        tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects)))))
+    return self.sidepass_lateral.publication_view(self.mirror_birth_hold.publication_view(
+      self.b5_birth_defer.publication_view(
+        self._burst_view(self.family_companion.publication_view(self._final_view(
+          tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects))))))
 
   @property
   def slot_to_ids(self):
@@ -5648,6 +6062,7 @@ class BoschRadarProvider:
       self.family_companion.reset(now_ns, 'STATE_RESET')
       self.burst_multireturn.reset(now_ns, 'STATE_RESET')
       self.b5_birth_defer.reset('PROVIDER_TIMEOUT')
+      self.mirror_birth_hold.reset(now_ns, 'PROVIDER_TIMEOUT')
       self.sidepass_lateral.reset(now_ns, 'PROVIDER_TIMEOUT')
       self.p91.update((), now_ns, v_ego, yaw_rate=yaw_rate_left)
       self.oem_gate.update((), now_ns, v_ego, state=BOSCH_OEM_STATE_NONE)
@@ -5784,6 +6199,12 @@ class BoschRadarProvider:
       oem_state=oem_state, word0_pids=processed_pids,
       live_pids=self.tracker.group_manager.states,
       live_raw_ids=self.tracker.raw_manager._states)
+    # M1 reads the exact qualified tuple and scan evidence already seen by B5.
+    # Its publication hold is independent and cannot feed back into B5 or tracking.
+    self.mirror_birth_hold.update(
+      qualified, self.tracker.last_raw_tracks, availability_ns, v_ego, yaw_rate_left,
+      camera_associations=self.camera_extended.last_associations,
+      word0_pids=processed_pids)
     # Side-pass lateral estimate: same scan, same OEM evidence the other
     # publication stages read; applied only by publication_view().
     self.sidepass_lateral.update(
