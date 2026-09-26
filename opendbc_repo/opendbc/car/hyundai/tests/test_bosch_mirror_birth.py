@@ -54,8 +54,8 @@ def start_hold():
 
 
 class TestBoschMirrorBirthHold:
-  def test_default_mode_is_shadow(self):
-    assert BoschMirrorBirthHold().mode == BOSCH_MIRROR_BIRTH_SHADOW
+  def test_default_mode_is_active(self):
+    assert BoschMirrorBirthHold().mode == BOSCH_MIRROR_BIRTH_ACTIVE
 
   def test_nonbirth_objects_skip_wall_search(self, monkeypatch):
     hold = BoschMirrorBirthHold(BOSCH_MIRROR_BIRTH_SHADOW)
