@@ -526,26 +526,46 @@ class BoschCameraCycleCache:
     self.completed_cycles += 1
 
   def ingest(self, timestamp_ns, address, payload):
+    # About a thousand camera frames a second arrive here, so the common paths
+    # avoid helper calls. Each shortcut below only skips work whose result the
+    # original helper would have discarded.
     if len(payload) != 8:
       self.fault_ns = timestamp_ns
       return False
-    word = int.from_bytes(payload, 'little')
     if address == BOSCH_CAMERA_HEADER:
+      word = int.from_bytes(payload, 'little')
       n_objects = word & 0xf
       if n_objects > BOSCH_CAMERA_SLOTS:
         self.fault_ns = timestamp_ns
         self.rejected_cycles += 1
         return False
-      return self._start_cycle(self._counter_of(word), n_objects, timestamp_ns)
+      return self._start_cycle((word >> 52) & 0xf, n_objects, timestamp_ns)
     if not BOSCH_CAMERA_FIRST_OBJECT <= address <= BOSCH_CAMERA_LAST_OBJECT:
       return False
-    offset = address - BOSCH_CAMERA_FIRST_OBJECT
-    slot, kind = divmod(offset, 3)
-    counter = self._counter_of(word)
-    if (counter == self._counter and self._header_ns >= 0 and
-        abs(timestamp_ns - self._header_ns) <= BOSCH_CAMERA_FRAME_TOLERANCE_NS):
-      self._store(kind, slot, word, timestamp_ns)
-      self._try_complete()
+    word = int.from_bytes(payload, 'little')
+    slot, kind = divmod(address - BOSCH_CAMERA_FIRST_OBJECT, 3)
+    counter = (word >> 52) & 0xf
+    header_ns = self._header_ns
+    if (counter == self._counter and header_ns >= 0 and
+        abs(timestamp_ns - header_ns) <= BOSCH_CAMERA_FRAME_TOLERANCE_NS):
+      if kind == 0:
+        self._a[slot] = word
+        self._a_ns[slot] = timestamp_ns
+      elif kind == 1:
+        self._b[slot] = word
+        self._b_ns[slot] = timestamp_ns
+      else:
+        self._c[slot] = word
+        self._c_ns[slot] = timestamp_ns
+      masks = self._masks
+      mask = masks[kind] | (1 << slot)
+      masks[kind] = mask
+      # _try_complete acts only on a complete cycle that has no snapshot yet.
+      required = (1 << self._n_objects) - 1
+      if (mask & required == required and masks[0] & required == required and
+          masks[1] & required == required and masks[2] & required == required and
+          self._cycle_index not in self._snapshot_cycle):
+        self._try_complete()
     else:
       self._pending_store(counter, kind, slot, word, timestamp_ns)
     return True
