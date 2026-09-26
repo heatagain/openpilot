@@ -54,6 +54,24 @@ def start_hold():
 
 
 class TestBoschMirrorBirthHold:
+  def test_default_mode_is_shadow(self):
+    assert BoschMirrorBirthHold().mode == BOSCH_MIRROR_BIRTH_SHADOW
+
+  def test_nonbirth_objects_skip_wall_search(self, monkeypatch):
+    hold = BoschMirrorBirthHold(BOSCH_MIRROR_BIRTH_SHADOW)
+    objects, raws = mirror_scan(candidate_age=2)
+    calls = 0
+    wall = hold._wall
+
+    def count_wall_calls(*args, **kwargs):
+      nonlocal calls
+      calls += 1
+      return wall(*args, **kwargs)
+
+    monkeypatch.setattr(hold, '_wall', count_wall_calls)
+    hold.update(objects, raws, 1_000_000_000, 20.0, 0.0)
+    assert calls == 0
+
   def test_mirror_birth_holds_but_nonbirth_does_not(self):
     hold = BoschMirrorBirthHold()
     objects, raws = mirror_scan(candidate_age=1)
@@ -161,7 +179,6 @@ class TestBoschMirrorBirthHold:
     assert not hold.holds
     assert not hold.seen_births
     assert not hold.hist
-    assert not hold.shadow_states
 
   def test_pid_death_releases_and_same_pid_is_not_reheld(self):
     hold = start_hold()

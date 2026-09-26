@@ -5216,14 +5216,6 @@ def bosch_make_points(objects, v_ego=math.nan):
   return list(data.points)
 
 
-@dataclass
-class _BoschMirrorBirthShadowState:
-  parent: int | None = None
-  count: int = 0
-  confirmed: bool = False
-  parents: frozenset = frozenset()
-
-
 @dataclass(frozen=True)
 class BoschMirrorBirthDecision:
   physical_track_id: int
@@ -5265,7 +5257,6 @@ class BoschMirrorBirthHold:
       raise ValueError('invalid Bosch mirror-birth mode')
     self.mode = mode
     self.hist: list[tuple[int, list[tuple[float, float, int]]]] = []
-    self.shadow_states: dict[int, _BoschMirrorBirthShadowState] = {}
     self.holds: dict[int, _BoschMirrorBirthHoldState] = {}
     self.seen_births: set[int] = set()
     self.last_ns: int | None = None
@@ -5281,7 +5272,6 @@ class BoschMirrorBirthHold:
 
   def _reset_shadow(self):
     self.hist = []
-    self.shadow_states = {}
     self.would_suppress = frozenset()
     self.reset_count += 1
 
@@ -5357,9 +5347,6 @@ class BoschMirrorBirthHold:
         obj.d_rel, obj.y_rel, obj.v_rel, obj.age_scans,
         tuple(member.raw_track_id for member in obj.members),
         obj.representative_raw_track_id, obj.oem_selected, obj.vision_supported)
-    for pid in tuple(self.shadow_states):
-      if pid not in mirror:
-        del self.shadow_states[pid]
     fresh_raw = {raw.raw_track_id for raw in raw_tracks}
     if yaw_rate is not None and math.isfinite(yaw_rate):
       stationary = [(raw.d_rel, raw.y_rel, raw.raw_track_id) for raw in raw_tracks
@@ -5386,8 +5373,9 @@ class BoschMirrorBirthHold:
 
     decisions = []
     for pid, obj in mirror.items():
-      d_rel, y_rel, _v_rel, _age, _members, _rep, _oem, _vision = obj
-      shadow_state = self.shadow_states.get(pid)
+      d_rel, y_rel, _v_rel, age_scans, _members, _rep, _oem, _vision = obj
+      if age_scans != 1 or pid in self.seen_births:
+        continue
       reason = None
       parent = wall_y = residual = None
       support, cover = 0, 0.0
@@ -5445,34 +5433,12 @@ class BoschMirrorBirthHold:
           else:
             passing.sort()
             _abs_resid, parent, wall_y, residual, support, cover = passing[0]
-            parents_ok = frozenset(candidate_pid for _resid, candidate_pid, *_rest in passing)
       if reason is None:
-        if shadow_state is None or not (shadow_state.parents & parents_ok):
-          shadow_state = _BoschMirrorBirthShadowState(parent=parent, count=0,
-                                                       confirmed=False, parents=parents_ok)
-          self.shadow_states[pid] = shadow_state
-        else:
-          shadow_state.parents = shadow_state.parents & parents_ok
-          shadow_state.parent = parent
-        shadow_state.count += 1
-        if shadow_state.count >= BOSCH_MIRROR_BIRTH_CONFIRM_SCANS:
-          action = 'CONFIRMED'
-          shadow_state.confirmed = True
-        else:
-          action = 'QUALIFY'
-        decisions.append(BoschMirrorBirthDecision(pid, action, 'OK', parent,
-                                                    wall_y, residual, shadow_state.count))
-      else:
-        if shadow_state is not None:
-          if shadow_state.confirmed:
-            decisions.append(BoschMirrorBirthDecision(pid, 'RELEASE', reason, parent,
-                                                        wall_y, residual, shadow_state.count))
-          del self.shadow_states[pid]
-        if reason != 'NOT_APPLICABLE':
-          decisions.append(BoschMirrorBirthDecision(pid, 'NO_DECISION', reason,
-                                                      parent, wall_y, residual, 0))
-    self.peak_shadow_state_count = max(getattr(self, 'peak_shadow_state_count', 0),
-                                       len(self.shadow_states))
+        decisions.append(BoschMirrorBirthDecision(pid, 'QUALIFY', 'OK', parent,
+                                                    wall_y, residual, 1))
+      elif reason != 'NOT_APPLICABLE':
+        decisions.append(BoschMirrorBirthDecision(pid, 'NO_DECISION', reason,
+                                                    parent, wall_y, residual, 0))
     return mirror, {decision.physical_track_id: decision for decision in decisions}
 
   def update(self, objects, raw_tracks, timestamp_ns, v_ego, yaw_rate_left,
@@ -5484,7 +5450,6 @@ class BoschMirrorBirthHold:
       self.holds.clear()
       self.seen_births.clear()
       self.hist.clear()
-      self.shadow_states.clear()
       self.last_ns = timestamp_ns
       self.last_events = ()
       del self._pending_events
