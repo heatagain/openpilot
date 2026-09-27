@@ -695,6 +695,7 @@ class RadarInterface(RadarInterfaceBase):
     source_ns = 0
     if model is not None and 0 <= now_ns - model_ns <= 200_000_000:
       self.bosch.b5_birth_defer.ingest_model(model, int(model_ns))
+      self.bosch.mirror_m3_shadow.ingest_model(model, int(model_ns))
       if model.leadsV3:
         lead = model.leadsV3[0]
         if lead.x and lead.y:

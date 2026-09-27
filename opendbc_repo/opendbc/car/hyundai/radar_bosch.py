@@ -93,6 +93,38 @@ BOSCH_MIRROR_BIRTH_DIVERGE_DV_MPS = 1.5
 BOSCH_MIRROR_BIRTH_DIVERGE_DD_M = 5.0
 BOSCH_MIRROR_BIRTH_DIVERGE_SCANS = 3
 
+# M3 is a read-only SHADOW extension of M1: left road-edge birth fallback and
+# bounded coupled extension. Its state is deliberately separate from M1.
+BOSCH_MIRROR_M3_OFF = 0
+BOSCH_MIRROR_M3_SHADOW = 1
+BOSCH_MIRROR_M3_MODE = BOSCH_MIRROR_M3_SHADOW
+BOSCH_MIRROR_M3_HOLD_SCANS = 10
+BOSCH_MIRROR_M3_Y_MIN_M = 4.5
+BOSCH_MIRROR_M3_INSIDE_MARGIN_M = 0.5
+BOSCH_MIRROR_M3_PARENT_MISS_SCANS = 2
+BOSCH_MIRROR_M3_DIVERGE_DV_MPS = 1.5
+BOSCH_MIRROR_M3_DIVERGE_DD_M = 5.0
+BOSCH_MIRROR_M3_DIVERGE_SCANS = 3
+BOSCH_MIRROR_M3_EXT_MAX_SCANS = 50
+BOSCH_MIRROR_M3_EXT_DD_M = 3.0
+BOSCH_MIRROR_M3_EXT_DV_MPS = 1.0
+BOSCH_MIRROR_M3_EXT_RESID_M = 3.0
+BOSCH_MIRROR_M3_EDGE = 1
+BOSCH_MIRROR_M3_EDGE_LEFT_ONLY = 1
+BOSCH_MIRROR_M3_VEGO_MIN_MPS = 10.0
+BOSCH_MIRROR_M3_EDGE_FRESH_NS = 200_000_000
+BOSCH_MIRROR_M3_EDGE_SIDE_MIN_M = 0.5
+BOSCH_MIRROR_M3_BEYOND_MIN_M = 1.0
+BOSCH_MIRROR_M3_PARENT_AGE_SCANS = 10
+BOSCH_MIRROR_M3_PARENT_VABS_MIN_MPS = 2.0
+BOSCH_MIRROR_M3_PARENT_INSIDE_MIN_M = 1.0
+BOSCH_MIRROR_M3_PARENT_DD_MAX_M = 1.5
+BOSCH_MIRROR_M3_PARENT_DV_MAX_MPS = 0.5
+BOSCH_MIRROR_M3_RESID_MAX_M = 2.0
+BOSCH_MIRROR_M3_D_MAX_M = 80.0
+BOSCH_MIRROR_M3_RADAR_TO_CAMERA_M = 1.52
+BOSCH_MIRROR_M3_GAP_NS = 300_000_000
+
 # Candidate P91 changes only the final Bosch publication view; raw detections,
 # grouping, physical IDs, qualification and alias bindings remain. SHADOW
 # diagnostics stay available for replay and on-device comparison.
@@ -5281,6 +5313,8 @@ class BoschMirrorBirthHold:
     self.seen_births: set[int] = set()
     self.last_ns: int | None = None
     self.last_decisions: tuple[BoschMirrorBirthDecision, ...] = ()
+    self.last_mirror_objects: dict[int, tuple] = {}
+    self.last_decisions_by_pid: dict[int, BoschMirrorBirthDecision] = {}
     self.last_events: tuple[dict, ...] = ()
     self.would_suppress = frozenset()
     self.reset_count = 0
@@ -5320,6 +5354,8 @@ class BoschMirrorBirthHold:
     self._reset_shadow()
     self.last_ns = None
     self.last_decisions = ()
+    self.last_mirror_objects = {}
+    self.last_decisions_by_pid = {}
     self.last_events = tuple(self._pending_events)
     self.would_suppress = frozenset()
     del self._pending_events
@@ -5472,6 +5508,8 @@ class BoschMirrorBirthHold:
       self.hist.clear()
       self.last_ns = timestamp_ns
       self.last_events = ()
+      self.last_mirror_objects = {}
+      self.last_decisions_by_pid = {}
       del self._pending_events
       return self.would_suppress
 
@@ -5503,6 +5541,10 @@ class BoschMirrorBirthHold:
     mirror, decisions = self._mirror_decisions(
       timestamp_ns, v_ego, yaw_rate_left, raw_tracks, objects,
       camera_associations, word0_pids)
+    # M3 reads these exact per-scan v1 objects and decisions. It never asks M1
+    # to recompute and does not mutate either mapping.
+    self.last_mirror_objects = mirror
+    self.last_decisions_by_pid = decisions
 
     # Existing holds are advanced before this scan's newborns, matching mbh_sim.py.
     for pid in list(self.holds):
@@ -5577,6 +5619,243 @@ class BoschMirrorBirthHold:
     return tuple(obj for obj in objects if obj.physical_track_id not in suppressed)
 
 
+@dataclass
+class _BoschMirrorM3HoldState:
+  physical_track_id: int
+  path: str
+  parent_pid: int
+  wall_y_m: float
+  residual_m: float
+  d_rel_m: float
+  y_rel_m: float
+  v_rel_mps: float
+  v_ego_mps: float
+  birth_ns: int
+  held_scans: int = 1
+  parent_miss_scans: int = 0
+  diverge_scans: int = 0
+  extension_scans: int = 0
+
+
+class BoschMirrorM3Shadow:
+  """M3 edge-birth and coupled-extension research state, isolated from publication."""
+
+  def __init__(self, mode=BOSCH_MIRROR_M3_MODE):
+    if mode not in (BOSCH_MIRROR_M3_OFF, BOSCH_MIRROR_M3_SHADOW):
+      raise ValueError('invalid Bosch mirror M3 mode')
+    self.mode = mode
+    self.model_edges: list[tuple[int, tuple, tuple, tuple]] = []
+    self.holds: dict[int, _BoschMirrorM3HoldState] = {}
+    self.seen_births: set[int] = set()
+    self.last_ns: int | None = None
+    self.last_edge_sample: tuple[int, tuple, tuple, tuple] | None = None
+    self.last_events: tuple[dict, ...] = ()
+    self.reset_count = 0
+
+  def ingest_model(self, model, model_ns):
+    """Keep the newest four road-edge samples from fresh, valid modelV2 input."""
+    if self.mode != BOSCH_MIRROR_M3_SHADOW or model is None:
+      return
+    edges = getattr(model, 'roadEdges', ())
+    if len(edges) < 2:
+      return
+    model_ns = int(model_ns)
+    if any(sample[0] == model_ns for sample in self.model_edges):
+      return
+    xs = tuple(float(x) for x in edges[0].x)
+    y_left = tuple(-float(y) for y in edges[0].y)
+    y_right = tuple(-float(y) for y in edges[1].y)
+    sample = (model_ns, xs, y_left, y_right)
+    self.model_edges.append(sample)
+    self.model_edges.sort(key=lambda item: item[0])
+    self.model_edges = self.model_edges[-4:]
+
+  def _edge_at(self, scan_ns):
+    for sample in reversed(self.model_edges):
+      if sample[0] <= scan_ns:
+        if scan_ns - sample[0] <= BOSCH_MIRROR_M3_EDGE_FRESH_NS:
+          return sample
+        return None
+    return None
+
+  def _record_event(self, state, action, reason, timestamp_ns):
+    fields = dict(
+      action=action, ns=int(timestamp_ns), pid=state.physical_track_id,
+      birth_ns=state.birth_ns,
+      path=state.path, parent=state.parent_pid, wall_y=state.wall_y_m,
+      resid=state.residual_m, d=state.d_rel_m, y=state.y_rel_m,
+      v=state.v_rel_mps, v_ego=state.v_ego_mps)
+    if action == 'RELEASE':
+      fields.update(reason=reason, held_scans=state.held_scans,
+                    ext_scans=state.extension_scans)
+    self._pending_events.append(fields)
+    if action == 'HOLD':
+      researchlog.debug(
+        f'BOSCH_MIRROR_M3_HOLD ns={timestamp_ns} pid={state.physical_track_id} '
+        f'path={state.path} parent={state.parent_pid} wall_y={state.wall_y_m} '
+        f'resid={state.residual_m} d={state.d_rel_m} y={state.y_rel_m} '
+        f'v={state.v_rel_mps} v_ego={state.v_ego_mps}')
+    else:
+      researchlog.debug(
+        f'BOSCH_MIRROR_M3_RELEASE ns={timestamp_ns} pid={state.physical_track_id} '
+        f'path={state.path} parent={state.parent_pid} wall_y={state.wall_y_m} '
+        f'resid={state.residual_m} d={state.d_rel_m} y={state.y_rel_m} '
+        f'v={state.v_rel_mps} v_ego={state.v_ego_mps} reason={reason} '
+        f'held_scans={state.held_scans} ext_scans={state.extension_scans}')
+
+  def reset(self, timestamp_ns=None, reason='STATE_RESET'):
+    self._pending_events = []
+    release_ns = self.last_ns if timestamp_ns is None else int(timestamp_ns)
+    for state in tuple(self.holds.values()):
+      if release_ns is not None:
+        self._record_event(state, 'RELEASE', reason, release_ns)
+    self.holds.clear()
+    self.seen_births.clear()
+    self.last_ns = None
+    self.last_edge_sample = None
+    self.reset_count += 1
+    self.last_events = tuple(self._pending_events)
+    del self._pending_events
+
+  @staticmethod
+  def _independent(pid, obj, camera_associations, word0_pids):
+    association = (camera_associations or {}).get(pid, (0, -1))
+    return bool(obj[7] or obj[6] or pid in set(word0_pids or ()) or
+                (association[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and association[1] >= 0))
+
+  def _edge_birth(self, pid, obj, mirror, edge, v_ego):
+    if edge is None or v_ego < BOSCH_MIRROR_M3_VEGO_MIN_MPS or obj[0] > BOSCH_MIRROR_M3_D_MAX_M:
+      return None
+    side = 1 if obj[1] > 0 else -1
+    if BOSCH_MIRROR_M3_EDGE_LEFT_ONLY and side < 0:
+      return None
+    _edge_ns, xs, y_left, y_right = edge
+    ys = y_left if side > 0 else y_right
+    if not xs or len(xs) != len(ys):
+      return None
+    wall_y = float(np.interp(obj[0] + BOSCH_MIRROR_M3_RADAR_TO_CAMERA_M, xs, ys))
+    if not math.isfinite(wall_y):
+      return None
+    if (side * wall_y <= BOSCH_MIRROR_M3_EDGE_SIDE_MIN_M or
+        side * obj[1] < side * wall_y + BOSCH_MIRROR_M3_BEYOND_MIN_M):
+      return None
+
+    best = None
+    for parent_pid, parent in mirror.items():
+      if parent_pid == pid or parent[3] < BOSCH_MIRROR_M3_PARENT_AGE_SCANS:
+        continue
+      if abs(parent[2] + v_ego) < BOSCH_MIRROR_M3_PARENT_VABS_MIN_MPS:
+        continue
+      if side * parent[1] > side * wall_y - BOSCH_MIRROR_M3_PARENT_INSIDE_MIN_M:
+        continue
+      if (abs(obj[0] - parent[0]) > BOSCH_MIRROR_M3_PARENT_DD_MAX_M or
+          abs(obj[2] - parent[2]) > BOSCH_MIRROR_M3_PARENT_DV_MAX_MPS):
+        continue
+      residual = abs(obj[1] - (2 * wall_y - parent[1]))
+      if residual <= BOSCH_MIRROR_M3_RESID_MAX_M and (best is None or residual < best[2]):
+        best = (parent_pid, wall_y, residual)
+    return best
+
+  def update(self, timestamp_ns, v_ego, mirror_objects, mirror_decisions, *,
+             camera_associations=None, word0_pids=(), mirror_enabled=True):
+    """Read M1's current scan result and make an independent SHADOW decision."""
+    timestamp_ns = int(timestamp_ns)
+    self._pending_events = []
+    self.last_edge_sample = None
+    if self.mode != BOSCH_MIRROR_M3_SHADOW or not mirror_enabled:
+      if self.holds or self.seen_births:
+        self.reset(timestamp_ns, 'M3_OFF' if self.mode == BOSCH_MIRROR_M3_OFF else 'M1_OFF')
+      else:
+        self.last_events = ()
+      return frozenset()
+
+    mirror = mirror_objects or {}
+    decisions = mirror_decisions or {}
+    word0 = set(word0_pids or ())
+    edge = self._edge_at(timestamp_ns)
+    self.last_edge_sample = edge
+    if self.last_ns is not None:
+      delta_ns = timestamp_ns - self.last_ns
+      if delta_ns <= 0 or delta_ns >= BOSCH_MIRROR_M3_GAP_NS:
+        for state in tuple(self.holds.values()):
+          self._record_event(state, 'RELEASE', 'GAP_RESET', timestamp_ns)
+        self.holds.clear()
+        self.seen_births.clear()
+        self.reset_count += 1
+    self.last_ns = timestamp_ns
+
+    for pid in list(self.holds):
+      state = self.holds[pid]
+      obj = mirror.get(pid)
+      if obj is None:
+        self._record_event(state, 'RELEASE', 'PID_DEAD', timestamp_ns)
+        del self.holds[pid]
+        continue
+      state.held_scans += 1
+      parent = mirror.get(state.parent_pid)
+      side = 1 if state.wall_y_m > 0 else -1
+      reason = None
+      if self._independent(pid, obj, camera_associations, word0):
+        reason = 'INDEPENDENT_IDENTITY'
+      elif (side * obj[1] < side * state.wall_y_m + BOSCH_MIRROR_M3_INSIDE_MARGIN_M or
+            abs(obj[1]) < BOSCH_MIRROR_M3_Y_MIN_M):
+        reason = 'MOVED_INSIDE'
+      else:
+        state.parent_miss_scans = state.parent_miss_scans + 1 if parent is None else 0
+        if state.parent_miss_scans >= BOSCH_MIRROR_M3_PARENT_MISS_SCANS:
+          reason = 'PARENT_LOST'
+        elif parent is not None:
+          diverged = (abs(obj[2] - parent[2]) > BOSCH_MIRROR_M3_DIVERGE_DV_MPS or
+                      abs(obj[0] - parent[0]) > BOSCH_MIRROR_M3_DIVERGE_DD_M)
+          state.diverge_scans = state.diverge_scans + 1 if diverged else 0
+          if state.diverge_scans >= BOSCH_MIRROR_M3_DIVERGE_SCANS:
+            reason = 'DIVERGED'
+      if reason is None and state.held_scans > BOSCH_MIRROR_M3_HOLD_SCANS:
+        coupled = (parent is not None and
+                   abs(obj[0] - parent[0]) <= BOSCH_MIRROR_M3_EXT_DD_M and
+                   abs(obj[2] - parent[2]) <= BOSCH_MIRROR_M3_EXT_DV_MPS and
+                   abs(obj[1] - (2 * state.wall_y_m - parent[1])) <= BOSCH_MIRROR_M3_EXT_RESID_M)
+        if not coupled:
+          reason = 'EXPIRED'
+        elif state.held_scans > BOSCH_MIRROR_M3_EXT_MAX_SCANS:
+          reason = 'EXT_CAP'
+        else:
+          state.extension_scans += 1
+      if reason is not None:
+        self._record_event(state, 'RELEASE', reason, timestamp_ns)
+        del self.holds[pid]
+
+    for pid, obj in mirror.items():
+      if obj[3] != 1 or pid in self.seen_births:
+        continue
+      self.seen_births.add(pid)
+      if abs(obj[1]) < BOSCH_MIRROR_M3_Y_MIN_M:
+        continue
+      decision = decisions.get(pid)
+      path = None
+      parent_pid = wall_y = residual = None
+      if decision is not None and decision.action == 'QUALIFY':
+        path = 'V1'
+        parent_pid, wall_y, residual = decision.parent_pid, decision.wall_y_m, decision.residual_m
+      elif (BOSCH_MIRROR_M3_EDGE and
+            not self._independent(pid, obj, camera_associations, word0)):
+        edge_result = self._edge_birth(pid, obj, mirror, edge, v_ego)
+        if edge_result is not None:
+          path = 'EDGE'
+          parent_pid, wall_y, residual = edge_result
+      if path is None:
+        continue
+      state = _BoschMirrorM3HoldState(
+        pid, path, parent_pid, float(round(wall_y, 3)), float(round(residual, 3)), float(obj[0]),
+        float(obj[1]), float(obj[2]), float(v_ego), timestamp_ns)
+      self.holds[pid] = state
+      self._record_event(state, 'HOLD', 'MIRROR_BIRTH_QUALIFIED', timestamp_ns)
+
+    self.last_events = tuple(self._pending_events)
+    del self._pending_events
+    return frozenset(self.holds)
+
+
 class BoschRadarProvider:
   def __init__(self, bus: int, *, qualification=True, camera_bus=1,
                camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE, p91_mode=BOSCH_P91_MODE,
@@ -5597,6 +5876,7 @@ class BoschRadarProvider:
     self.burst_multireturn = _BoschBurstMultiReturnDefer(burst_multireturn_mode)
     self.b5_birth_defer = BoschBirthB5Defer(b5_mode)
     self.mirror_birth_hold = BoschMirrorBirthHold(mirror_birth_mode)
+    self.mirror_m3_shadow = BoschMirrorM3Shadow()
     self.sidepass_lateral = _BoschSidePassLateralEstimator(sidepass_lateral_mode)
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
     self.oem_gate = _BoschOemValidationGate(oem_gate_mode)
@@ -6048,6 +6328,7 @@ class BoschRadarProvider:
       self.burst_multireturn.reset(now_ns, 'STATE_RESET')
       self.b5_birth_defer.reset('PROVIDER_TIMEOUT')
       self.mirror_birth_hold.reset(now_ns, 'PROVIDER_TIMEOUT')
+      self.mirror_m3_shadow.reset(now_ns, 'PROVIDER_TIMEOUT')
       self.sidepass_lateral.reset(now_ns, 'PROVIDER_TIMEOUT')
       self.p91.update((), now_ns, v_ego, yaw_rate=yaw_rate_left)
       self.oem_gate.update((), now_ns, v_ego, state=BOSCH_OEM_STATE_NONE)
@@ -6190,6 +6471,12 @@ class BoschRadarProvider:
       qualified, self.tracker.last_raw_tracks, availability_ns, v_ego, yaw_rate_left,
       camera_associations=self.camera_extended.last_associations,
       word0_pids=processed_pids)
+    self.mirror_m3_shadow.update(
+      availability_ns, v_ego, self.mirror_birth_hold.last_mirror_objects,
+      self.mirror_birth_hold.last_decisions_by_pid,
+      camera_associations=self.camera_extended.last_associations,
+      word0_pids=processed_pids,
+      mirror_enabled=self.mirror_birth_hold.mode != BOSCH_MIRROR_BIRTH_OFF)
     # Side-pass lateral estimate: same scan, same OEM evidence the other
     # publication stages read; applied only by publication_view().
     self.sidepass_lateral.update(
