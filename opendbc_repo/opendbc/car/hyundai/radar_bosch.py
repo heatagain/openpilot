@@ -97,7 +97,8 @@ BOSCH_MIRROR_BIRTH_DIVERGE_SCANS = 3
 # bounded coupled extension. Its state is deliberately separate from M1.
 BOSCH_MIRROR_M3_OFF = 0
 BOSCH_MIRROR_M3_SHADOW = 1
-BOSCH_MIRROR_M3_MODE = BOSCH_MIRROR_M3_SHADOW
+BOSCH_MIRROR_M3_ACTIVE = 2
+BOSCH_MIRROR_M3_MODE = BOSCH_MIRROR_M3_ACTIVE
 BOSCH_MIRROR_M3_HOLD_SCANS = 10
 BOSCH_MIRROR_M3_Y_MIN_M = 4.5
 BOSCH_MIRROR_M3_INSIDE_MARGIN_M = 0.5
@@ -5638,10 +5639,10 @@ class _BoschMirrorM3HoldState:
 
 
 class BoschMirrorM3Shadow:
-  """M3 edge-birth and coupled-extension research state, isolated from publication."""
+  """M3 edge-birth/coupled-extension state with an optional publication-only ACTIVE view."""
 
   def __init__(self, mode=BOSCH_MIRROR_M3_MODE):
-    if mode not in (BOSCH_MIRROR_M3_OFF, BOSCH_MIRROR_M3_SHADOW):
+    if mode not in (BOSCH_MIRROR_M3_OFF, BOSCH_MIRROR_M3_SHADOW, BOSCH_MIRROR_M3_ACTIVE):
       raise ValueError('invalid Bosch mirror M3 mode')
     self.mode = mode
     self.model_edges: list[tuple[int, tuple, tuple, tuple]] = []
@@ -5650,11 +5651,13 @@ class BoschMirrorM3Shadow:
     self.last_ns: int | None = None
     self.last_edge_sample: tuple[int, tuple, tuple, tuple] | None = None
     self.last_events: tuple[dict, ...] = ()
+    self.publication_suppressed = 0
+    self.last_publication_suppressed: frozenset[int] = frozenset()
     self.reset_count = 0
 
   def ingest_model(self, model, model_ns):
     """Keep the newest four road-edge samples from fresh, valid modelV2 input."""
-    if self.mode != BOSCH_MIRROR_M3_SHADOW or model is None:
+    if self.mode not in (BOSCH_MIRROR_M3_SHADOW, BOSCH_MIRROR_M3_ACTIVE) or model is None:
       return
     edges = getattr(model, 'roadEdges', ())
     if len(edges) < 2:
@@ -5724,7 +5727,8 @@ class BoschMirrorM3Shadow:
                 (association[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and association[1] >= 0))
 
   def _edge_birth(self, pid, obj, mirror, edge, v_ego):
-    if edge is None or v_ego < BOSCH_MIRROR_M3_VEGO_MIN_MPS or obj[0] > BOSCH_MIRROR_M3_D_MAX_M:
+    if (edge is None or not math.isfinite(v_ego) or v_ego < BOSCH_MIRROR_M3_VEGO_MIN_MPS or
+        obj[0] > BOSCH_MIRROR_M3_D_MAX_M):
       return None
     side = 1 if obj[1] > 0 else -1
     if BOSCH_MIRROR_M3_EDGE_LEFT_ONLY and side < 0:
@@ -5762,7 +5766,7 @@ class BoschMirrorM3Shadow:
     timestamp_ns = int(timestamp_ns)
     self._pending_events = []
     self.last_edge_sample = None
-    if self.mode != BOSCH_MIRROR_M3_SHADOW or not mirror_enabled:
+    if self.mode not in (BOSCH_MIRROR_M3_SHADOW, BOSCH_MIRROR_M3_ACTIVE) or not mirror_enabled:
       if self.holds or self.seen_births:
         self.reset(timestamp_ns, 'M3_OFF' if self.mode == BOSCH_MIRROR_M3_OFF else 'M1_OFF')
       else:
@@ -5854,6 +5858,19 @@ class BoschMirrorM3Shadow:
     self.last_events = tuple(self._pending_events)
     del self._pending_events
     return frozenset(self.holds)
+
+  def publication_view(self, objects):
+    """In ACTIVE, remove M3-held physical PIDs after the independent M1 view."""
+    self.last_publication_suppressed = frozenset()
+    if self.mode != BOSCH_MIRROR_M3_ACTIVE or not objects or not self.holds:
+      return objects
+    suppressed = frozenset(obj.physical_track_id for obj in objects
+                            if obj.physical_track_id in self.holds)
+    if not suppressed:
+      return objects
+    self.publication_suppressed += len(suppressed)
+    self.last_publication_suppressed = suppressed
+    return tuple(obj for obj in objects if obj.physical_track_id not in suppressed)
 
 
 class BoschRadarProvider:
@@ -6109,15 +6126,19 @@ class BoschRadarProvider:
       objects = tuple(obj for obj in objects if obj.physical_track_id not in withheld)
     ext = self.camera_extended
     if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
-      return self.sidepass_lateral.publication_view(self.mirror_birth_hold.publication_view(
-        self.b5_birth_defer.publication_view(
-          self._burst_view(self.family_companion.publication_view(self._final_view(objects))))))
+      return self.sidepass_lateral.publication_view(
+        self.mirror_m3_shadow.publication_view(
+          self.mirror_birth_hold.publication_view(
+            self.b5_birth_defer.publication_view(
+              self._burst_view(self.family_companion.publication_view(self._final_view(objects)))))))
     if not ext.mature_groups or not objects:
       self.test_last_suppressed = ()
       self.test_last_active_groups = 0
-      return self.sidepass_lateral.publication_view(self.mirror_birth_hold.publication_view(
-        self.b5_birth_defer.publication_view(
-          self._burst_view(self.family_companion.publication_view(self._final_view(objects))))))
+      return self.sidepass_lateral.publication_view(
+        self.mirror_m3_shadow.publication_view(
+          self.mirror_birth_hold.publication_view(
+            self.b5_birth_defer.publication_view(
+              self._burst_view(self.family_companion.publication_view(self._final_view(objects)))))))
     # 다른 scan의 tuple 또는 qualification에서 대표가 빠진 그룹은 baseline으로 연다.
     by_pid = {obj.physical_track_id: obj for obj in objects}
     suppressed = set()
@@ -6131,10 +6152,12 @@ class BoschRadarProvider:
       active_groups += 1
     self.test_last_suppressed = tuple(sorted(suppressed))
     self.test_last_active_groups = active_groups
-    return self.sidepass_lateral.publication_view(self.mirror_birth_hold.publication_view(
-      self.b5_birth_defer.publication_view(
-        self._burst_view(self.family_companion.publication_view(self._final_view(
-          tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects))))))
+    return self.sidepass_lateral.publication_view(
+      self.mirror_m3_shadow.publication_view(
+        self.mirror_birth_hold.publication_view(
+          self.b5_birth_defer.publication_view(
+            self._burst_view(self.family_companion.publication_view(self._final_view(
+              tuple(obj for obj in objects if obj.physical_track_id not in suppressed) if suppressed else objects)))))))
 
   @property
   def slot_to_ids(self):

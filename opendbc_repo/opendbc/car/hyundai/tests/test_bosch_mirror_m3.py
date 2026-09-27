@@ -5,8 +5,11 @@ import pytest
 
 from opendbc.car.hyundai.radar_bosch import (
   BOSCH_CAMERA_ASSOC_ASSIGNED,
+  BOSCH_MIRROR_BIRTH_ACTIVE,
+  BOSCH_MIRROR_M3_ACTIVE,
   BOSCH_MIRROR_M3_OFF,
   BOSCH_MIRROR_M3_SHADOW,
+  BoschMirrorBirthHold,
   BoschMirrorM3Shadow,
 )
 
@@ -34,10 +37,16 @@ def edge_birth(shadow=None, *, ns=1_000_000_000, candidate=None, parent=None,
 
 
 class TestBoschMirrorM3Shadow:
-  def test_default_is_shadow_and_other_mode_is_rejected(self):
-    assert BoschMirrorM3Shadow().mode == BOSCH_MIRROR_M3_SHADOW
+  def test_default_is_active_and_other_mode_is_rejected(self):
+    assert BoschMirrorM3Shadow().mode == BOSCH_MIRROR_M3_ACTIVE
     with pytest.raises(ValueError):
-      BoschMirrorM3Shadow(2)
+      BoschMirrorM3Shadow(3)
+
+  def test_active_and_shadow_decisions_and_events_are_identical(self):
+    shadow = edge_birth(BoschMirrorM3Shadow(BOSCH_MIRROR_M3_SHADOW))
+    active = edge_birth(BoschMirrorM3Shadow(BOSCH_MIRROR_M3_ACTIVE))
+    assert shadow.holds == active.holds
+    assert shadow.last_events == active.last_events
 
   def test_left_edge_birth_starts_hold_with_reference_fields(self):
     shadow = edge_birth()
@@ -62,6 +71,10 @@ class TestBoschMirrorM3Shadow:
     shadow.update(1_100_000_000, 12.0,
                   {1001: obj(y=9.125, age=2), 2001: obj(y=-4.46875, age=11)}, {})
     assert 1001 in shadow.holds
+
+  def test_edge_birth_fails_closed_for_nonfinite_ego_speed(self):
+    shadow = edge_birth(v_ego=float('nan'))
+    assert not shadow.holds
 
   @pytest.mark.parametrize(('candidate', 'v_ego', 'edge', 'parent'), [
     (obj(y=-5.0), 12.0, edge_sample(right=(2.0, 2.0)), obj(y=0.0)),  # right side is disabled
@@ -193,3 +206,29 @@ class TestBoschMirrorM3Shadow:
       shadow.model_edges = [edge_sample()]
       shadow.update(1_000_000_000, 12.0, {1001: candidate, 2001: parent}, {}, mirror_enabled=enabled)
       assert not shadow.holds
+
+  def test_active_publication_view_suppresses_only_held_physical_pids(self):
+    shadow = edge_birth(BoschMirrorM3Shadow(BOSCH_MIRROR_M3_ACTIVE))
+    points = (SimpleNamespace(physical_track_id=1001), SimpleNamespace(physical_track_id=2001))
+    result = shadow.publication_view(points)
+    assert tuple(point.physical_track_id for point in result) == (2001,)
+    assert shadow.publication_suppressed == 1
+
+  def test_shadow_and_off_publication_views_are_noops_even_with_holds(self):
+    points = (SimpleNamespace(physical_track_id=1001), SimpleNamespace(physical_track_id=2001))
+    for mode in (BOSCH_MIRROR_M3_SHADOW, BOSCH_MIRROR_M3_OFF):
+      shadow = edge_birth(BoschMirrorM3Shadow(BOSCH_MIRROR_M3_SHADOW))
+      shadow.mode = mode
+      assert shadow.publication_view(points) is points
+      assert shadow.publication_suppressed == 0
+
+  def test_m1_and_m3_overlap_is_suppressed_once_in_nested_publication_views(self):
+    m1 = BoschMirrorBirthHold(BOSCH_MIRROR_BIRTH_ACTIVE)
+    m1.would_suppress = frozenset({1001})
+    m3 = edge_birth(BoschMirrorM3Shadow(BOSCH_MIRROR_M3_ACTIVE))
+    points = (SimpleNamespace(physical_track_id=1001), SimpleNamespace(physical_track_id=2001))
+    after_m1 = m1.publication_view(points)
+    after_m3 = m3.publication_view(after_m1)
+    assert tuple(point.physical_track_id for point in after_m3) == (2001,)
+    assert m1.publication_suppressed == 1
+    assert m3.publication_suppressed == 0
