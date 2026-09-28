@@ -9,7 +9,7 @@ from openpilot.common.realtime import DT_DMON, Ratekeeper, config_realtime_proce
 from openpilot.selfdrive.monitoring.config import experimental_mode
 from openpilot.selfdrive.carrot.bluetooth.model import CommandReader
 from openpilot.selfdrive.monitoring.dm2 import DriverMonitoring2
-from openpilot.selfdrive.monitoring.dm2_context import CameraAvailability, InteractionEdges, ObjectObservation, TrafficContext
+from openpilot.selfdrive.monitoring.dm2_context import CameraAvailability, InteractionEdges, ObjectObservation, SteeringTouchEvidence, TrafficContext
 
 
 def traffic_observations(radar):
@@ -46,7 +46,10 @@ def camera_sample_usable(sm, rhd, demo=False):
 
 def run_dm2(params, experimental):
   services = ['carState', 'selfdriveState', 'modelV2', 'radarState', 'liveCalibration', 'carParams', 'driverStateV2']
-  sm = messaging.SubMaster(services, poll='driverStateV2', frequency=int(1 / DT_DMON))
+  # Like stock DM, use the polled service's frequency (20 Hz). SubMaster
+  # forbids specifying both poll and frequency. The bounded update timeout
+  # below still lets the interaction fallback run when the camera is absent.
+  sm = messaging.SubMaster(services, poll='driverStateV2')
   pm = messaging.PubMaster(['driverMonitoringState'])
   # carState is 100 Hz; conflating it to 20 Hz can lose a complete button press.
   input_sock = messaging.sub_sock('carState', conflate=False)
@@ -55,6 +58,7 @@ def run_dm2(params, experimental):
   traffic, inputs = TrafficContext(), InteractionEdges()
   bluetooth = CommandReader('attention')
   camera_health = CameraAvailability()
+  touch_evidence = SteeringTouchEvidence()
   rk = Ratekeeper(int(1 / DT_DMON), print_delay_threshold=None)
   strict, clear = True, False
   covered = False
@@ -91,6 +95,10 @@ def run_dm2(params, experimental):
       strict, clear = traffic.update(now, traffic_observations(sm['radarState']), road_ok, straight, covered)
     camera_ok = camera_health.update(now, camera_sample_usable(sm, dm.wheel_on_right, demo_mode) and
                                      0 <= now - sm.logMonoTime['driverStateV2'] / 1e9 < 0.5)
+    touch_held, touch_edge = touch_evidence.update(now, cs.steeringTouch, valid)
+    if touch_edge:
+      inputs.last_response = max(inputs.last_response, cs.steeringTouch.sampleMonoTime / 1e9)
+      response = True
     dm.configure_context(now, camera_ok, strict, clear)
     if valid:
       dm.record_interaction(inputs.last_response)
@@ -98,7 +106,7 @@ def run_dm2(params, experimental):
       if sm.updated['driverStateV2'] and (valid or demo_mode):
         dm.run_step(sm, demo=demo_mode)
     elif valid:
-      dm.run_without_camera(response and valid, sm['selfdriveState'].enabled,
+      dm.run_without_camera((response or touch_held) and valid, sm['selfdriveState'].enabled,
                             cs.vEgo < dm.settings._ALERT_MIN_SPEED,
                             cs.gearShifter not in (car.CarState.GearShifter.drive, car.CarState.GearShifter.low))
     packet = dm.get_state_packet(valid=valid or (demo_mode and camera_ok))
