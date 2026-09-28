@@ -30,6 +30,24 @@ def test_reject_os_upgrade_or_untrusted_host():
       update.checked_url(url)
 
 
+def test_protected_image_rejects_old_comma_release_before_download(tmp_path, monkeypatch):
+  marker = tmp_path / 'protected.json'
+  marker.write_text('{"format":1}')
+  monkeypatch.setattr(update, 'PROTECTED_MARKER', marker)
+  monkeypatch.setattr(update, 'verify_signature', lambda _: None)
+  monkeypatch.setattr(update, 'fetch', lambda *_: pytest.fail('Incompatible release downloaded'))
+  value = manifest()
+  with pytest.raises(ValueError, match='protected storage'):
+    update.stage_manifest(value)
+  value['storage_format'] = 1
+  update.validate_storage_compatibility(value)
+  value['storage_format'] = 2
+  with pytest.raises(ValueError):
+    update.validate_storage_compatibility(value)
+  marker.unlink()
+  update.validate_storage_compatibility(manifest())
+
+
 def test_carrot_selected_release_takes_precedence_and_failure_does_not_fallback(monkeypatch):
   import hud_protocol
   selected = manifest()
@@ -98,6 +116,40 @@ def test_no_telemetry_does_not_authorize_automatic_download(monkeypatch):
   monkeypatch.setattr(hud_protocol, 'read_snapshot', lambda: None)
   monkeypatch.setattr(update, 'stage', lambda: pytest.fail('must not download'))
   update.automatic_stage()
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='Linux service/symlink semantics')
+def test_power_loss_during_failed_candidate_rollback_keeps_recovery_record(tmp_path, monkeypatch):
+  monkeypatch.setattr(update, 'ROOT', tmp_path)
+  monkeypatch.setattr(update, 'verify_signature', lambda _: None)
+  old = tmp_path / 'releases' / ('d' * 40)
+  candidate = tmp_path / 'releases' / ('a' * 40)
+  old.mkdir(parents=True); candidate.mkdir()
+  (tmp_path / 'current').symlink_to(old)
+  (tmp_path / 'cache').mkdir()
+  (tmp_path / 'cache/last-loaded.json').write_text('old')
+  update.atomic_json(tmp_path / 'updates/pending.json', manifest())
+  monkeypatch.setattr(update.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=3))
+  def reject(release):
+    (tmp_path / 'cache/last-loaded.json').write_text('candidate')
+    raise RuntimeError('synthetic rejected candidate')
+  monkeypatch.setattr(update, 'probe_release', reject)
+  class PowerCut(BaseException):
+    pass
+  syncs = []
+  def interrupted_sync():
+    syncs.append(1)
+    if len(syncs) == 2:
+      raise PowerCut()
+  monkeypatch.setattr(update.os, 'sync', interrupted_sync)
+  with pytest.raises(PowerCut):
+    update.activate()
+  assert (tmp_path / 'updates/transaction.json').exists()
+  monkeypatch.setattr(update.os, 'sync', lambda: None)
+  update.activate()
+  assert (tmp_path / 'current').resolve() == old
+  assert (tmp_path / 'cache/last-loaded.json').read_text() == 'old'
+  assert not (tmp_path / 'updates/transaction.json').exists()
 
 
 def test_unsigned_release_is_rejected():

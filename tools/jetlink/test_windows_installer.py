@@ -83,3 +83,57 @@ def test_wrong_decompression_never_prepares(package):
   with pytest.raises(RuntimeError):
     prepare.prepare(root, lambda *_: io.BytesIO(b'wrong'))
   assert not (root / 'prepared.img').exists()
+
+
+def test_integrated_image_requires_no_hotfix_and_keeps_full_verification(package):
+  root, original, _ = package
+  manifest = root / 'support/release.json'
+  release = json.loads(manifest.read_text())
+  release.update(preparation='integrated', prepared_sha256=sha(original))
+  release.pop('patch_sha256')
+  manifest.write_text(json.dumps(release))
+  (root / 'support/offline-usbc.json').unlink()
+  prepare.prepare(root, open)
+  assert (root / 'prepared.img').read_bytes() == original
+  prepare.prepare(root, lambda *_: pytest.fail('Valid image decompressed again'))
+  (root / 'prepared.img').unlink()
+  (root / 'support/carrot-jetson.img.zst').write_bytes(b'corrupt')
+  with pytest.raises(RuntimeError):
+    prepare.prepare(root, open)
+  assert not (root / 'prepared.img').exists()
+
+
+@pytest.mark.parametrize('mode', ['integrated', 'unknown'])
+def test_invalid_preparation_metadata_refuses_before_writing(package, mode):
+  root, *_ = package
+  manifest = root / 'support/release.json'
+  release = json.loads(manifest.read_text())
+  release['preparation'] = mode
+  manifest.write_text(json.dumps(release))
+  with pytest.raises(RuntimeError):
+    prepare.prepare(root, open)
+  assert not (root / 'prepared.img.partial').exists()
+
+
+def test_public_integrated_package_requires_checks_for_exact_image(tmp_path, monkeypatch):
+  import build_windows_installer as publisher
+  from types import SimpleNamespace
+  image = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=40 * (1 << 30)))
+  compressed = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=100))
+  monkeypatch.setattr(publisher, 'digest', lambda path: 'a' * 64 if path is image else 'b' * 64)
+  metadata = tmp_path / 'candidate.json'
+  metadata.write_text(json.dumps(dict(storage_format=1, data_partition=17, image_bytes=40 * (1 << 30),
+    source_commit='c' * 40, state='PROTECTED_CANDIDATE_NOT_BOOT_TESTED', image_sha256='a' * 64,
+    compressed_bytes=100, compressed_sha256='b' * 64)))
+  private = publisher.integrated_release(image, compressed, metadata)
+  assert private['version'] == 'v0.4.0-storage-candidate'
+  validation = tmp_path / 'validation.json'
+  evidence = dict(image_sha256='a' * 64, card_readback=True, protected_boot=True, model_ready=True,
+                  wifi_reconnect=True, ssh_persistence=True, data_update=True, power_cut_cycles=0)
+  validation.write_text(json.dumps(evidence))
+  released = publisher.integrated_release(image, compressed, metadata, validation)
+  assert released['version'] == 'v0.4.0-protected-preview' and released['power_cut_cycles'] == 0
+  for changes in ({'image_sha256': 'd' * 64}, {'protected_boot': False}, {'data_update': False}, {'power_cut_cycles': -1}):
+    validation.write_text(json.dumps(evidence | changes))
+    with pytest.raises(ValueError, match='Physical validation'):
+      publisher.integrated_release(image, compressed, metadata, validation)

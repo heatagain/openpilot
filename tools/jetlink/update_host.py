@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 
 ROOT = Path('/opt/carrot-jetlink')
+PROTECTED_MARKER = Path('/etc/carrot-jetlink-protected.json')
 DEFAULT_MANIFEST = 'https://upload.shind0.synology.me/models/jetlink-host-stable/manifest.json'
 
 
@@ -92,6 +93,13 @@ def validate_manifest(manifest):
   checked_url(manifest['model']['url'])
 
 
+def validate_storage_compatibility(manifest):
+  # An older comma may still select the last writable-image release. Never
+  # silently replace a protected runtime with code predating its storage contract.
+  if PROTECTED_MARKER.exists() and manifest.get('storage_format') != 1:
+    raise ValueError('Selected release does not support protected storage; keeping current runtime')
+
+
 def probe_release(release):
   command = ['runuser', '-u', 'jetlink', '--', str(ROOT / 'venv/bin/python'),
              str(release / 'tools/jetlink/probe_release.py'), str(ROOT / 'cache')]
@@ -123,6 +131,7 @@ def stage_manifest(manifest):
   from finalize_sd_image import extract_bundle
   validate_manifest(manifest)
   verify_signature(manifest)
+  validate_storage_compatibility(manifest)
   commit = manifest['source_commit']
   if (ROOT / 'current/SOURCE_COMMIT').read_text().strip() == commit:
     return
@@ -186,6 +195,7 @@ def activate():
       (ROOT / 'cache/last-loaded.json').write_text(saved['last_loaded'])
     if pending.exists():
       os.replace(pending, pending.with_name('interrupted.json'))
+    os.sync()  # Recovery must be durable before its retry record disappears.
     transaction.unlink()
     atomic_json(ROOT / 'updates/status.json', {'state': 'recovered', 'updated': time.time()})
     os.sync()
@@ -193,6 +203,7 @@ def activate():
   manifest = json.loads(pending.read_text())
   validate_manifest(manifest)
   verify_signature(manifest)
+  validate_storage_compatibility(manifest)
   release = ROOT / 'releases' / manifest['source_commit']
   if release.is_symlink() or release.resolve().parent != (ROOT / 'releases').resolve():
     raise ValueError('Invalid release directory')
@@ -216,6 +227,16 @@ def activate():
     os.sync()
     transaction.unlink()
     os.sync()
+    # Legacy images migrate networking independently of inference. Protected
+    # images keep their immutable recovery worker and never write the base OS.
+    installer = release / 'tools/jetlink/install_wifi.py'
+    if not Path('/etc/carrot-jetlink-protected.json').exists() and installer.is_file():
+      try:
+        subprocess.run(['/usr/bin/python3', str(installer)], check=True, timeout=30,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(['systemctl', 'daemon-reload'], check=True, timeout=10)
+      except (OSError, subprocess.SubprocessError):
+        print('Network helper refresh deferred; existing worker retained', flush=True)
   except Exception as error:
     if (ROOT / 'current').resolve() != previous:
       link = ROOT / 'current.rollback'
@@ -227,7 +248,9 @@ def activate():
     atomic_json(ROOT / 'updates/status.json', {'state': 'rejected', 'error': str(error)[:240], 'updated': time.time()})
     if pending.exists():
       os.replace(pending, pending.with_name('rejected.json'))
+    os.sync()
     transaction.unlink(missing_ok=True)
+    os.sync()
     print('Candidate rejected; retaining previous release:', error, flush=True)
 
 
@@ -267,7 +290,12 @@ def main():
   args = parser.parse_args()
   if os.geteuid() != 0:
     raise PermissionError('Run through the installed update service (root)')
-  with (ROOT / 'update.lock').open('w') as lock:
+  if Path('/etc/carrot-jetlink-protected.json').exists():
+    status = json.loads(Path('/run/carrot-storage.json').read_text())
+    if status.get('state') != 'protected':
+      print('DATA unavailable; keeping immutable recovery runtime', flush=True)
+      return
+  with Path('/run/carrot-jetlink-update.lock').open('w') as lock:
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     if args.action == 'activate':
       activate()
