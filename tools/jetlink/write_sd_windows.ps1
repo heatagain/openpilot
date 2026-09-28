@@ -1,9 +1,10 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 param(
   [Parameter(Mandatory=$true)][string]$Image,
   [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$Sha256,
   [Parameter(Mandatory=$true)][int]$DiskNumber,
-  [Parameter(Mandatory=$true)][string]$SerialNumber,
+  [Parameter(Mandatory=$true)][AllowEmptyString()][string]$SerialNumber,
+  [string]$UniqueId,
   [Parameter(Mandatory=$true)][long]$DiskBytes,
   [switch]$VerifyOnly,
   [string]$SetupJson,
@@ -18,6 +19,7 @@ try {
   $imagePath = (Resolve-Path -LiteralPath $Image).Path
   $imageFile = Get-Item -LiteralPath $imagePath
   if ($imageFile.Length -lt 1GB -or $imageFile.Length % 512 -ne 0) { throw 'Invalid image size' }
+  Write-Output "설치 이미지 검사 중`n  Checking installation image..."
   if ((Get-FileHash -LiteralPath $imagePath -Algorithm SHA256).Hash -ne $Sha256) { throw 'Image checksum mismatch' }
   $setupBytes = $null
   if ($SetupJson) {
@@ -26,11 +28,13 @@ try {
     $null = [System.Text.Encoding]::UTF8.GetString($setupBytes) | ConvertFrom-Json
   }
   $disk = Get-Disk -Number $DiskNumber
+  if ([string]::IsNullOrWhiteSpace($SerialNumber) -and [string]::IsNullOrWhiteSpace($UniqueId)) { throw 'A stable disk identity is required' }
   if ($disk.IsBoot -or $disk.IsSystem -or $disk.IsReadOnly -or $disk.BusType -ne 'USB' -or
-      $disk.SerialNumber.Trim() -ne $SerialNumber.Trim() -or $disk.Size -ne $DiskBytes -or $imageFile.Length -gt $disk.Size) {
+      ([string]$disk.SerialNumber).Trim() -ne $SerialNumber.Trim() -or ($UniqueId -and $disk.UniqueId -ne $UniqueId) -or
+      $disk.Size -ne $DiskBytes -or $imageFile.Length -gt $disk.Size) {
     throw 'Disk identity, capacity or system-disk guard failed'
   }
-  Write-Output "Verified USB target disk $DiskNumber serial $SerialNumber size $DiskBytes"
+  Write-Output "USB 대상 확인`n  Verified USB target: disk $DiskNumber serial $SerialNumber size $DiskBytes"
   Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -66,7 +70,9 @@ public static class CarrotSdNative {
   }
   # Recheck identity immediately before the first destructive write.
   $disk = Get-Disk -Number $DiskNumber
-  if ($disk.IsBoot -or $disk.IsSystem -or $disk.Size -ne $DiskBytes -or $disk.SerialNumber.Trim() -ne $SerialNumber.Trim()) {
+  if ($disk.IsBoot -or $disk.IsSystem -or $disk.IsReadOnly -or $disk.BusType -ne 'USB' -or
+      $disk.Size -ne $DiskBytes -or ([string]$disk.SerialNumber).Trim() -ne $SerialNumber.Trim() -or
+      ($UniqueId -and $disk.UniqueId -ne $UniqueId)) {
     throw 'Disk identity changed before write'
   }
   $handle = [CarrotSdNative]::Open("\\.\PhysicalDrive$DiskNumber")
@@ -79,7 +85,7 @@ public static class CarrotSdNative {
     while (($count = $inputImage.Read($buffer, 0, $buffer.Length)) -gt 0) {
       $device.Write($buffer, 0, $count)
       $total += $count
-      if ($total -ge $nextReport) { Write-Output "WRITE $total / $($imageFile.Length)"; $nextReport += 1GB }
+      if ($total -ge $nextReport) { Write-Output "기록 중`n  WRITE $total / $($imageFile.Length)"; $nextReport += 1GB }
     }
     $device.Flush($true)
     $inputImage.Dispose(); $inputImage = $null
@@ -97,7 +103,7 @@ public static class CarrotSdNative {
     $null = $hash.TransformBlock($buffer, 0, $count, $null, 0)
     $remaining -= $count
     $verified = $imageFile.Length - $remaining
-    if ($verified -ge $nextReport) { Write-Output "VERIFY $verified / $($imageFile.Length)"; $nextReport += 1GB }
+    if ($verified -ge $nextReport) { Write-Output "검증 중`n  VERIFY $verified / $($imageFile.Length)"; $nextReport += 1GB }
   }
   $null = $hash.TransformFinalBlock([byte[]]::new(0), 0, 0)
   $readbackHash = ([BitConverter]::ToString($hash.Hash)).Replace('-', '').ToLowerInvariant()
@@ -131,7 +137,7 @@ public static class CarrotSdNative {
     finally { $setupStream.Dispose() }
     Write-Output 'PRIVATE_SETUP_WRITTEN (contents intentionally omitted)'
   }
-  Write-Output 'SD_WRITE_COMPLETE_AND_VERIFIED'
+  Write-Output "기록·검증 완료`n  SD_WRITE_COMPLETE_AND_VERIFIED - Write and verification complete"
   Set-Content -LiteralPath ($Log + '.success') -Value $readbackHash -Encoding ASCII
 } catch {
   Write-Output ('SD_WRITE_FAILED: ' + $_.Exception.Message)

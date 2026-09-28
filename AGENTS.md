@@ -1,5 +1,30 @@
 # Repository memory
 
+- On 2026-09-28, the user approved C3/C3X main UI onroad affinity cores0,1,2,3,6
+  with SCHED_OTHER/nice19, superseding core6-only for tici/tizi. C4/mici stays
+  core6. Apply to all UI threads; offroad returns to little cores, and onroad
+  C3 keeps nice19 during big-core unavailability. Cluster/core7, camera/control/
+  model/radar and IRQ policies are unchanged. Casper logs on a3278c04 measured
+  UI15.54/14.68Hz with camera20Hz and substantial UI runnable wait; this is
+  pre-change evidence, not validation of the new mask. Affinity does not pin
+  one whole frame or guarantee little-first placement. See docs/camera_core5_trial.md.
+
+- On 2026-09-28, the user requested a single Windows installation ZIP and a
+  minimal Korean guide: extract, run 01, run 02, insert the finished card.
+  Follow-up requires bilingual stage introductions, approximate durations,
+  exact response instructions and brief safety guidance; brevity must not
+  remove backup/write-in-progress cautions or Jetson shutdown and power
+  disconnection before card insertion. Label the link "설치파일 받기".
+  Present Korean first with English underneath on a separate, visually secondary
+  line. Use clear stage headings, spacing and a styled offline HTML guide; never
+  interleave Korean and English with slash-separated sentences.
+  Keep hashes, portable dependencies, USB-C patching and readback automatic;
+  do not restore manual Python/Etcher/hash/hotfix steps to the default guide.
+  The package prepares a patched file before writing, preserves the published
+  base image/runtime/model and confirms the selected USB card before erasing.
+  PC preparation and disk-guard tests do not establish physical-card writing
+  or first-boot validation. See docs/jetson_windows_installer_20260928.md.
+
 - On 2026-09-27, the user requested full integration of `carrot-jetlink` into
   `carrot-wip` and Korean-first public installation/release instructions. The
   complete Jetlink history through b9950442ca is merged; do not treat it as an
