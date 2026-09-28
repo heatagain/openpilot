@@ -8,7 +8,8 @@ debt exclusion, 1.5x forward recovery and ten-second traffic window. The user
 explicitly selected delaying camera warnings for the unavailable-camera mode-1
 allowance after input, rather than immediately resuming camera evaluation.
 
-- Camera mode 0: stock comma policy, including stock internal face-loss fallback.
+- Camera mode 0: stock comma monitoring criteria and internal face-loss fallback,
+  with the explicitly requested confirmed-parking reset below.
 - Unavailable-camera mode 0: 15/30/45-second interaction alerts.
 - Unavailable-camera mode 1: same timing, doubled only with verified empty-road
   conditions; eligible input resets the entire allowance before terminal alert.
@@ -27,10 +28,38 @@ allowance after input, rather than immediately resuming camera evaluation.
 
 ## Stock boundary and state transitions
 
+### Confirmed parking reset (2026-09-28 follow-up)
+
+The user authorized a reset after parking. All four camera/mode combinations
+reset accumulated terminal/no-response counts, lockout, alert level and awareness
+after one continuous second of Park, reported standstill, raw speed exactly zero,
+finite filtered speed below 0.01 m/s in magnitude, and both enabled/active false.
+The tiny filtered-speed tolerance only accommodates Kalman settling; it cannot
+replace the raw-zero/standstill/Park checks. Both carState and selfdriveState
+must pass validity, liveness and frequency checks and have ages in [0, 0.25) s;
+CAN must be valid. Demo mode is excluded. Failed checks, backwards time and loop
+gaps over 0.25 s restart confirmation. No speed-only or engage-cycle reset is
+added, and no automatic engagement occurs.
+
+One reset is emitted per confirmed parking interval. Stored DriverTooDistracted
+is synchronized by its existing selfdrived owner from fresh healthy DM packets
+on both transitions; restarting DM cannot resurrect a cleared stored flag once
+the release has been received. A crash before that acknowledgement remains
+conservative. Renewed lockout can be persisted again. Existing thirty-minute
+recovery also benefits from this symmetric persistence instead of keeping a
+stale true flag. The policy.py implementation and running warning thresholds
+remain unchanged; mode-0 equivalence excludes this parking reset.
+
+Tests cover all modes/camera availability with and without AlwaysOnDM, moving or
+non-P gears, invalid/stale/future data, partial parking/gaps, saved-state recovery
+and repeated locking, and daemon publication. 146 adapted tests pass; real cereal
+types are used, with native IPC/Params/hardware adapted on Windows. This does not
+establish physical vehicle parking or on-device restart behavior.
+
 Stock monitoring/policy.py and monitoring/dmonitoringd.py remain unchanged. The
 manager runs the separate dm2d dispatcher at the existing scheduling placement.
 DriverMonitoring2 modifies its own settings instance, retaining normal camera
-mode-0 equivalence. Models, artifacts and inference behavior do not change.
+mode-0 equivalence outside the parking reset. Models, artifacts and inference behavior do not change.
 
 Camera absence, failure, malformed probabilities/vectors and stale output select
 automatic interaction fallback. Two continuous seconds of healthy samples restore
@@ -77,12 +106,19 @@ not count. Automatic ego/set-speed changes are never driver interactions.
 
 ### Original steering touch input (2026-09-28)
 
-Ioniq 5 PE alone enables the received `STEER_TOUCH_2AF` profile. `CarState.steeringTouch`
+The later user request removes the initial Ioniq 5 PE-only whitelist. All
+Hyundai/Kia/Genesis CAN-FD vehicle configurations now admit the same received
+`STEER_TOUCH_2AF` profile. `CarState.steeringTouch`
 records availability, validity, contact, original CAN timestamp and raw status /
 TOUCH1 / TOUCH2. It reads the existing ECAN parser's raw bytes, never the mutable
 forwarding cache, CAM input or Panda transmit receipts. Existing ADAS transmit
-code, safety rules, message registration and global torque-based steeringPressed
-remain unchanged. This bus distinction does not authenticate a sensor against
+code, safety rules and global torque-based steeringPressed remain unchanged.
+After an original frame is seen, an unregistered named message is registered
+with optional frequency so late arrivals work after startup fingerprinting.
+Absent hardware or later dropout cannot create a new CAN-liveness requirement.
+The decoder does not populate the ADAS forwarding cache. The DBC message name,
+address and size must match; numeric address 0x2AF alone cannot enable touch.
+This bus distinction does not authenticate a sensor against
 another device injecting frames onto ECAN.
 
 Six one-minute historical segments yielded 3,597 original 10 Hz frames. All fit
@@ -106,6 +142,13 @@ consecutive valid frames; malformed, repeated-counter, unknown-layout or stale
 input grants no contact. Replay accepted 3,591 frames after the six initial
 counter baselines, including 1,015 contacts. No new mandatory CAN checks are added.
 
+The profile-based follow-up passes 184 adapted policy/parser/dispatcher tests,
+including real CAN parsers for all 37 configured CAN-FD platforms, discovery
+after startup, wrong-bus/TX receipt rejection, an unrelated DBC and optional
+message dropout. These are synthetic platform checks. Physical/log-derived
+touch evidence remains the six Ioniq 5 PE segments above, not a fleet-wide
+verification that every vehicle uses the same profile.
+
 Without a usable camera, fresh continuous contact maintains wheel awareness
 before terminal alert in both modes. In camera mode 1 only a valid release-to-
 contact transition grants the existing interaction grace. Held contact and
@@ -114,7 +157,7 @@ this added signal, and terminal/lockout handling remains unchanged. No claim
 of gaze, sleep detection, legal certification or new-vehicle validation follows
 from capacitive contact or these desktop/log checks.
 
-DriverMonitoringMode is latched at startup: only value 1 is experimental. Old
+DriverMonitoringMode is read live every 0.5 seconds: only value 1 is experimental. Old
 DisableDM never opts users into mode 1; only its old video choice migrates once to
 independent CarrotVisionEnabled. The experimental-use confirmation remains.
 
@@ -149,3 +192,28 @@ are retained locally under .analysis/archive/2026-09-28/dm2-revision/.
 
 Public guides: [Korean](user/ko/driver-monitoring.md),
 [English](user/en/driver-monitoring.md).
+
+
+## Live mode switching (2026-09-28)
+
+The running dispatcher polls the typed mode parameter every 0.5 seconds before
+configuring the current camera/traffic context. The retired CARROT_DM_MODE
+environment latch is ignored and removed at manager initialization. The existing
+monitor, calibration, interaction-edge history, traffic hold, elapsed awareness,
+terminal counters and lockout are retained. The published dm2Experimental reports
+the applied mode, not the initial startup choice.
+
+Actual mode changes expire old interaction grace and the forward-attention streak;
+re-reading an unchanged setting leaves these intact. configure_context remaps the
+active budget by elapsed seconds, so shortening a budget can cause a warning
+immediately. Existing orange/terminal alerts cannot be erased by increasing the
+budget. Repeated toggles neither reset accumulated time nor resurrect old inputs.
+This does not change either mode's thresholds, existing attention recovery,
+confirmed-parking reset, or the experimental-use confirmation.
+
+Validation uses real policy/cereal with desktop adapters for native IPC/Params;
+device polling latency and physical driving behavior remain unvalidated.
+All 208 focused monitoring/touch tests and 25 Wiki generator/validator tests
+passed. Four native typed-Params migration cases were skipped on Windows; the
+strict fake-Params migration tests passed. Local evidence is retained under
+`.analysis/archive/2026-09-28/dm-live/`.
