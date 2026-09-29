@@ -1,5 +1,3 @@
-import math
-
 from openpilot.cereal import log
 from openpilot.selfdrive.selfdrived.events import Events, ET
 from openpilot.common.realtime import DT_CTRL
@@ -16,9 +14,7 @@ class StateMachine:
     self.state = State.disabled
     self.soft_disable_timer = 0
 
-  def update(self, events: Events, soft_disable_elapsed: float = 0.0):
-    # A deferred steering warning cannot restart the full three-second budget.
-    initial_timer = max(0, int(SOFT_DISABLE_TIME / DT_CTRL) - math.ceil(max(0.0, soft_disable_elapsed) / DT_CTRL))
+  def update(self, events: Events):
     # decrement the soft disable timer at every step, as it's reset on
     # entrance in SOFT_DISABLING state
     self.soft_disable_timer = max(0, self.soft_disable_timer - 1)
@@ -44,7 +40,7 @@ class StateMachine:
           if events.contains(ET.SOFT_DISABLE):
             print("#######State.enabled => softDisabling", events.events)
             self.state = State.softDisabling
-            self.soft_disable_timer = initial_timer
+            self.soft_disable_timer = int(SOFT_DISABLE_TIME / DT_CTRL)
             self.current_alert_types.append(ET.SOFT_DISABLE)
 
           elif events.contains(ET.OVERRIDE_LATERAL) or events.contains(ET.OVERRIDE_LONGITUDINAL):
@@ -54,8 +50,6 @@ class StateMachine:
 
         # SOFT DISABLING
         elif self.state == State.softDisabling:
-          if soft_disable_elapsed > 0:
-            self.soft_disable_timer = min(self.soft_disable_timer, initial_timer)
           if not events.contains(ET.SOFT_DISABLE):
             print("#######State.softDisabling => enabled", events.events)
             # no more soft disabling condition, so go back to ENABLED
@@ -82,7 +76,7 @@ class StateMachine:
           if events.contains(ET.SOFT_DISABLE):
             print("#######State.overriding => softDisabling", events.events)
             self.state = State.softDisabling
-            self.soft_disable_timer = initial_timer
+            self.soft_disable_timer = int(SOFT_DISABLE_TIME / DT_CTRL)
             self.current_alert_types.append(ET.SOFT_DISABLE)
           elif not (events.contains(ET.OVERRIDE_LATERAL) or events.contains(ET.OVERRIDE_LONGITUDINAL)):
             print("#######State.overriding => enabled")
@@ -109,9 +103,6 @@ class StateMachine:
             print("#######State.disabled => enabled")
             self.state = State.enabled
           self.current_alert_types.append(ET.ENABLE)
-
-    if soft_disable_elapsed > 0 and self.state == State.softDisabling and self.soft_disable_timer <= 0:
-      self.state = State.disabled
 
     # Check if openpilot is engaged and actuators are enabled
     enabled = self.state in ENABLED_STATES

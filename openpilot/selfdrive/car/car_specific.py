@@ -1,5 +1,4 @@
 from collections import deque
-import time
 from openpilot.cereal import car, log
 import openpilot.cereal.messaging as messaging
 from opendbc.car import DT_CTRL, structs
@@ -10,7 +9,6 @@ from opendbc.car.hyundai.carstate import PREV_BUTTON_SAMPLES as HYUNDAI_PREV_BUT
 
 from openpilot.selfdrive.selfdrived.events import Events, ET
 from openpilot.selfdrive.carrot.bluetooth.model import BLUETOOTH_CANCEL
-from openpilot.selfdrive.car.hyundai_mdps_recovery import supported as mdps_recovery_supported, warning_decision, WarningDecision
 
 from openpilot.common.params import Params
 
@@ -43,8 +41,6 @@ class CarSpecificEvents:
     self.low_speed_alert = False
     self.no_steer_warning = False
     self.silent_steer_warning = 1
-    self.mdps_recovery_supported = mdps_recovery_supported(CP)
-    self.steer_fault_elapsed = 0.0
 
     self.cruise_buttons: deque = deque([], maxlen=HYUNDAI_PREV_BUTTON_SAMPLES)
 
@@ -261,16 +257,8 @@ class CarSpecificEvents:
           self.params.put_bool("DoShutdown", True)
 
     # Handle permanent and temporary steering faults
-    recovery = warning_decision(CS, time.monotonic_ns()) if self.mdps_recovery_supported else WarningDecision()
-    self.steer_fault_elapsed = recovery.elapsed if recovery.force_fault else 0.0
     self.steering_unpressed = 0 if CS.steeringPressed else self.steering_unpressed + 1
-    if recovery.pending:
-      # Keep engagement blocked; no driving warning or soft-disable promotion yet.
-      events.add(EventName.steerTempUnavailablePending)
-    elif recovery.force_fault:
-      # Once grace fails, driver override/silent-warning history must not hide it.
-      events.add(EventName.steerTempUnavailable)
-    elif CS.steerFaultTemporary:
+    if CS.steerFaultTemporary:
       if CS.steeringPressed and (not CS_prev.steerFaultTemporary or self.no_steer_warning):
         self.no_steer_warning = True
       else:

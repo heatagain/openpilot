@@ -273,18 +273,6 @@ struct CarState {
   vehicleNaviAvailable @92 :Bool; # stock-navigation 0x4BE has been observed during this drive
   radarInput @93 :RadarInput;
   steeringTouch @94 :SteeringTouch;
-  hyundaiMdpsRecovery @95 :HyundaiMdpsRecovery;
-
-  # Warning-only qualification; never a replacement for steerFaultTemporary.
-  struct HyundaiMdpsRecovery {
-    available @0 :Bool;
-    pending @1 :Bool;
-    warning @2 :Bool;
-    faultStartMonoTime @3 :UInt64;
-    sampleMonoTime @4 :UInt64;
-    delayed @5 :Bool;
-    forceWarning @6 :Bool; # expired grace or severe/integrity fault; not a protection-only bypass
-  }
 
   # Optional original vehicle receive signal. Separate from torque/override.
   struct SteeringTouch {

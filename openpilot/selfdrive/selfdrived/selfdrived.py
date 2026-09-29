@@ -17,7 +17,6 @@ from openpilot.common.runtime_diagnostics import communication_snapshot
 from openpilot.common.gps import get_gps_location_service
 
 from openpilot.selfdrive.car.car_specific import CarSpecificEvents
-from openpilot.selfdrive.car.hyundai_mdps_recovery import warning_decision
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.selfdrived.camera_config import get_camera_packets
 from openpilot.selfdrive.selfdrived.events import Events, ET, EmptyAlert
@@ -707,12 +706,7 @@ class SelfdriveD:
     if self.impact_dashcam.committed:
       self.events.add(EventName.impactDashcamReboot)
     if not self.CP.passive and self.initialized:
-      steer_elapsed = 0.0
-      if self.car_events.mdps_recovery_supported and self.events.contains(ET.SOFT_DISABLE):
-        # CAN-invalid skips car event generation. Preserve the raw onset budget
-        # even when a communication fault replaces the pending steering event.
-        steer_elapsed = warning_decision(CS, time.monotonic_ns()).elapsed
-      self.enabled, self.active = self.state_machine.update(self.events, soft_disable_elapsed=steer_elapsed)
+      self.enabled, self.active = self.state_machine.update(self.events)
     self.update_alerts(CS)
 
     self.update_system_ready_alert(CS)
