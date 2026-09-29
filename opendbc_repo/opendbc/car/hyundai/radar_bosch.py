@@ -4690,8 +4690,9 @@ class BoschBirthB5Defer:
   def _interp(points, x):
     if len(points) < 2 or x < points[0][0] or x > points[-1][0]:
       return math.nan
-    xs = [point[0] for point in points]
-    index = bisect.bisect_left(xs, x)
+    # Search the sorted geometry directly instead of allocating its x list
+    # for every edge/lane interpolation.
+    index = bisect.bisect_left(points, x, key=lambda point: point[0])
     if index <= 0:
       return points[0][1]
     if index >= len(points):
@@ -4787,7 +4788,16 @@ class BoschBirthB5Defer:
     mean = sum(values) / len(values)
     return math.sqrt(sum((value - mean) ** 2 for value in values) / len(values))
 
-  def _corridor_clear(self, obj, scan_ns, now_ns):
+  def _scan_geometry(self, context, scan_ns, scan_cache):
+    if scan_cache is None:
+      return self._geometry(context, scan_ns)
+    geometries = scan_cache.setdefault('geometries', {})
+    key = id(context)
+    if key not in geometries:
+      geometries[key] = self._geometry(context, scan_ns)
+    return geometries[key]
+
+  def _corridor_clear(self, obj, scan_ns, now_ns, scan_cache=None):
     latest = self._latest_context(scan_ns, now_ns)
     if latest is None:
       return False
@@ -4796,7 +4806,7 @@ class BoschBirthB5Defer:
       if (context.publication_ns > now_ns or context.source_ns > scan_ns or
           context.source_ns < scan_ns - BOSCH_B5_HISTORY_NS):
         continue
-      geometry = self._geometry(context, scan_ns)
+      geometry = self._scan_geometry(context, scan_ns, scan_cache)
       if geometry is None:
         continue
       instant = self._instant_lane(obj, geometry)
@@ -4824,7 +4834,7 @@ class BoschBirthB5Defer:
     return None if member is None else (member.detection.raw_word >> 21) & 0x3ff
 
   def _n4_parent(self, target, objects, scan_ns, now_ns, v_ego, yaw_rate_left,
-                 camera_associations, oem_state, word0_pids, prior_raw_owners):
+                 camera_associations, oem_state, word0_pids, prior_raw_owners, scan_cache=None):
     if not math.isfinite(v_ego) or v_ego < BOSCH_B5_MIN_VEGO_MPS:
       return None, 'LOW_SPEED_FAIL_OPEN'
     if yaw_rate_left is None or not math.isfinite(yaw_rate_left):
@@ -4834,10 +4844,14 @@ class BoschBirthB5Defer:
     context = self._latest_context(scan_ns, now_ns)
     if context is None:
       return None, 'MODEL_STALE_FAIL_OPEN'
-    geometry = self._geometry(context, scan_ns)
+    geometry = self._scan_geometry(context, scan_ns, scan_cache)
     if geometry is None:
       return None, 'POSE_UNAVAILABLE_FAIL_OPEN'
-    aligned = {obj.physical_track_id: self._align(obj, geometry) for obj in objects}
+    aligned = scan_cache.get('aligned') if scan_cache is not None else None
+    if aligned is None:
+      aligned = {obj.physical_track_id: self._align(obj, geometry) for obj in objects}
+      if scan_cache is not None:
+        scan_cache['aligned'] = aligned
     target_alignment = aligned.get(target.physical_track_id)
     if (target_alignment is None or not target_alignment['path_inside'] or
         not BOSCH_B5_EDGE_WIDTH_MIN_M <= target_alignment['width'] <= BOSCH_B5_EDGE_WIDTH_MAX_M or
@@ -4849,7 +4863,7 @@ class BoschBirthB5Defer:
     target_world = target.v_rel + v_ego - yaw_rate_left * target.y_rel
     if target_world <= BOSCH_B5_MIN_WORLD_SPEED_MPS:
       return None, 'TARGET_DIRECTION_FAIL_OPEN'
-    if not self._corridor_clear(target, scan_ns, now_ns):
+    if not self._corridor_clear(target, scan_ns, now_ns, scan_cache):
       return None, 'CORRIDOR_UNKNOWN_OR_POSITIVE_FAIL_OPEN'
 
     candidates = []
@@ -4929,11 +4943,14 @@ class BoschBirthB5Defer:
     word0_pids = frozenset(word0_pids)
     decisions = []
     suppressed = set()
+    # Contexts, motion samples, and objects are fixed throughout this update.
+    # Keep reuse local: even a repeated timestamp must read fresh input state.
+    scan_cache = {}
     for target in newborns:
       singleton = len(target.members) == 1
       parent, reason = self._n4_parent(
         target, objects, timestamp_ns, now_ns, v_ego, yaw_rate_left,
-        camera_associations, oem_state, word0_pids, prior_raw_owners)
+        camera_associations, oem_state, word0_pids, prior_raw_owners, scan_cache)
       n4 = parent is not None
       parent_state = self.states.get(parent.physical_track_id) if parent is not None else None
       stable_scans = parent_state.stable_scans if parent_state is not None else 0
@@ -5676,7 +5693,10 @@ class BoschRoadEdgePublicationFilter:
       if all(len(xs) >= 2 and len(xs) == len(ys) and
              all(math.isfinite(v) for v in xs + ys) and
              all(a < b for a, b in zip(xs, xs[1:])) for xs, ys in lines):
-        sample = (lines, stds)
+        # np.interp otherwise converts both tuples for every edge/object pair.
+        # Own the float arrays once per sample and reuse them without changing
+        # validation, interpolation arithmetic, or model freshness decisions.
+        sample = (tuple((np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)) for xs, ys in lines), stds)
     self.model_edges = [(ns, value) for ns, value in self.model_edges if ns != model_ns]
     self.model_edges.append((int(model_ns), sample))
     self.model_edges.sort(key=lambda item: item[0])

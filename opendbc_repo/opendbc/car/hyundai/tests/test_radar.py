@@ -1366,6 +1366,55 @@ class TestBoschB5BirthDefer:
     _, _, decision = self.birth(self.prime(), v_ego=v_ego, yaw=yaw, context=context, edge_std=edge_std)
     assert not decision.decision and decision.reason == reason
 
+  def test_multiple_births_share_geometry_without_sharing_decisions(self, monkeypatch):
+    b5 = self.prime()
+    ns = self.START_NS + 249 * self.STEP_NS
+    extra_track = self.track(30, 30, ns, 1, d_rel=46., y_rel=-4.5)
+    extra = self.obj(1_000_200, ns, (extra_track,), 1)
+    geometries, alignments = [], []
+    geometry, align = b5._geometry, b5._align
+
+    def counted_geometry(context, scan_ns):
+      geometries.append(id(context))
+      return geometry(context, scan_ns)
+
+    def counted_align(obj, shape):
+      alignments.append(obj.physical_track_id)
+      return align(obj, shape)
+
+    monkeypatch.setattr(b5, '_geometry', counted_geometry)
+    monkeypatch.setattr(b5, '_align', counted_align)
+    self.birth(b5, extra_objects=(extra,), extra_raw=(extra_track,))
+    assert len(geometries) == len(set(geometries)) == 3
+    assert sorted(alignments) == [self.PARENT_PID, self.TARGET_PID, 1_000_200]
+    assert len(b5.last_decisions) == 2
+    assert all(d.n4_eligible and not d.decision and d.reason == 'NEW_RAW_COUNT_FAIL_OPEN'
+               for d in b5.last_decisions)
+
+  def test_geometry_reuse_does_not_survive_context_replacement(self):
+    b5 = self.prime()
+    _, _, first = self.birth(b5)
+    assert first.decision
+    _, _, next_scan = self.birth(b5, scan_index=251, edge_std=.6)
+    assert not next_scan.decision and next_scan.reason == 'ROAD_EDGE_UNSTABLE_FAIL_OPEN'
+
+  def test_direct_parent_query_reads_replaced_same_timestamp_context(self):
+    b5 = self.prime()
+    prior = {rid: frozenset(pids) for rid, pids in b5.raw_prior_owners.items()}
+    parent, target, _ = self.birth(b5)
+    ns = target.timestamp_ns
+    args = (target, (parent, target), ns, ns + 5_000_000, 10., 0., {}, BOSCH_OEM_STATE_NONE, (), prior)
+    assert b5._n4_parent(*args)[0] is parent
+    self.add_context(b5, ns, edge_std=.6)
+    assert b5._n4_parent(*args) == (None, 'ROAD_EDGE_UNSTABLE_FAIL_OPEN')
+
+  @pytest.mark.parametrize(('x', 'expected'), ((0., 10.), (.5, 15.), (1., 20.), (1.5, 35.), (2., 40.)))
+  def test_geometry_interpolation_preserves_duplicate_and_endpoint_values(self, x, expected):
+    points = ((0., 10.), (1., 20.), (1., 30.), (2., 40.))
+    assert BoschBirthB5Defer._interp(points, x) == expected
+    assert math.isnan(BoschBirthB5Defer._interp(points, -.01))
+    assert math.isnan(BoschBirthB5Defer._interp(points, 2.01))
+
   def test_independent_camera_and_ambiguous_parent_fail_open(self):
     camera = {
       self.TARGET_PID: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1),
