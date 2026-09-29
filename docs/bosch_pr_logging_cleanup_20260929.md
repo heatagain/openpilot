@@ -49,3 +49,20 @@
 - 소스 구문 검사와 `git diff --check` 수행. 제거한 연구 로거/임시 event의 production Python 참조가 남지 않는지 확인.
 - 수정 전 다섯 소스와 정리/비교 스크립트: `C:/CarrotRadarResearch/analysis/20260929_bosch_pr_log_cleanup/`. 로컬 보관이며 원격 백업은 아니다.
 - 로그 출력만 정리했으며 실차 적용, NAS 배포, commit/push/PR 생성은 이 작업에 포함하지 않았다.
+
+## 후속: Group3 OBJECT_ID 실패 해결 (2026-09-29)
+
+검증 대상 HEAD는 `1a408073937fcb2a20b1c49086921fda999fb10e`다. 위의 561 passed / 2 failed는 당시 결과로 보존한다. 이후 확인 결과 두 실패의 원인은 로컬의 오래된 생성 DBC였다.
+
+- 실제 파서는 이 checkout의 `opendbc_repo/opendbc/can/parser.py`이며, `opendbc.DBC_PATH` 아래 `hyundai_canfd_radar_generated.dbc`를 읽었다.
+- 추적 중인 `opendbc/dbc/generator/hyundai/hyundai_canfd_radar.py`에는 이미 `OBJECT_ID : 24|7@1+`가 있다. 그러나 로컬 생성 파일의 `RADAR_TRACK_406`에는 OBJECT_LENGTH/LONG_DIST/LAT_DIST/REL_SPEED만 있었다.
+- 현재 generator를 임시 디렉터리에 복사해 실행한 뒤, 저장소의 `create_dbc()`로 결합하여 해당 생성 DBC 하나만 갱신했다. 다른 DBC, decoder, 테스트 assertion, production 동작은 수정하지 않았다.
+- 갱신 전 SHA256: `0df9f11dd541f66d80b941dfaf5078c98576af7b1a96f4358e2a2c4b8246d6a8`.
+- 갱신 후 SHA256: `dab9c671f4f355ce20d2f1c43146de9f3a5226092049c202748cc0fa21d12939`.
+- DBC 캐시를 비우고 OBJECT_ID가 파싱되는 것을 확인했다. 새 프로세스에서 기존 Windows Params 대체 runner로 `test_radar.py`, `test_bosch_camera_extended.py`, `test_bosch_mirror_birth.py`, `test_bosch_mirror_m3.py`, `test_bosch_road_edge.py`를 제외 조건 없이 실행하여 **563 passed**를 확인했다. Group3 ID/주소 이동 검증도 포함한다.
+
+재현 시 generator 원본과 실제 `opendbc.DBC_PATH`를 확인하고 해당 생성 파일을 갱신한 뒤 새 테스트 프로세스를 시작한다. 장시간 실행 중인 Python 프로세스에서는 `DBC`가 캐시되므로 파일 갱신만으로 기존 파서가 바뀌지 않는다. 누락된 ID를 기본값으로 채우거나 테스트를 제외할 필요는 없다.
+
+이 생성 파일은 Git ignored build artifact이므로 원격에 강제 추가하지 않는다. 커밋은 해결 기록만 포함하며, 다른 checkout은 그 환경의 DBC 생성 절차를 수행해야 한다. 수정 전 파일과 경로/해시 근거는 로컬 `C:/CarrotRadarResearch/analysis/20260929_group3_dbc_refresh/`에 보존했다.
+
+이 결과는 위 다섯 테스트 파일의 Windows 실행 결과다. 별도의 `msgq` 부재로 실행되지 않은 radarcan/radard 프로세스 테스트나 NAS/실차 검증을 통과시킨 결과는 아니다.
