@@ -844,8 +844,6 @@ class TestBoschActiveTestPublication:
       result.points = [dict(trackId=0, dRel=80., vRel=0., radarSource='scc', measured=True)]
       return result
     monkeypatch.setattr(module.RadarInterfaceBase, 'update_carrot', baseline)
-    messages = []
-    monkeypatch.setattr(module.researchlog, 'debug', messages.append)
     interfaces = []
     for mode in (BOSCH_CAMERA_EXTENDED_OFF, BOSCH_CAMERA_EXTENDED_ACTIVE_TEST):
       ri = RadarInterface.__new__(RadarInterface)
@@ -879,7 +877,6 @@ class TestBoschActiveTestPublication:
         assert result.points[0].to_dict() == baseline().points[0].to_dict()
       assert target not in b.free_aliases
     assert visible == [True, True, False, False, False, True, True, True, False]
-    assert messages == []
 
   def test_route254_original_policy_keeps_24m_lateral_member(self):
     p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_ACTIVE_TEST)

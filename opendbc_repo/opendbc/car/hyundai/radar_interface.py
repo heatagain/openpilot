@@ -13,7 +13,6 @@ import numpy as np
 from opendbc import DBC_PATH
 from opendbc.can import CANParser
 from opendbc.car import Bus, structs
-from opendbc.car.carlog import researchlog
 from opendbc.car.interfaces import RadarInterfaceBase
 from opendbc.car.radar_lead_filter import RadarLeadFilter
 from opendbc.car.hyundai.values import DBC, HyundaiFlags, HyundaiExtFlags

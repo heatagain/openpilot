@@ -10,7 +10,6 @@ from typing import Sequence
 import numpy as np
 
 from opendbc.car import structs
-from opendbc.car.carlog import researchlog
 from opendbc.car.radar_lead_filter import RadarLeadFilter
 
 # Bosch MRRevo14F passive radar
@@ -5357,11 +5356,6 @@ class BoschMirrorBirthHold:
       d=state.d_rel_m, y=state.y_rel_m, v=state.v_rel_mps,
       reason=reason, held_scans=state.held_scans)
     self._pending_events.append(fields)
-    researchlog.debug(
-      f'BOSCH_MIRROR_BIRTH_{action} ns={timestamp_ns} pid={state.physical_track_id} '
-      f'parent={state.parent_pid} wall_y={state.wall_y_m} resid={state.residual_m} '
-      f'd={state.d_rel_m} y={state.y_rel_m} v={state.v_rel_mps} '
-      f'reason={reason} held_scans={state.held_scans}')
 
   def reset(self, timestamp_ns=None, reason='STATE_RESET'):
     """Release all holds and clear both hold and v1 history state."""
@@ -5716,7 +5710,6 @@ class BoschRoadEdgePublicationFilter:
       self.would_suppress = frozenset()
 
   def update(self, objects, timestamp_ns, *, valid=True, camera_associations=None, word0_pids=()):
-    previous = self.would_suppress
     self.would_suppress = frozenset()
     self.source_model_ns = None
     if self.last_ns is not None and timestamp_ns < self.last_ns:
@@ -5751,8 +5744,6 @@ class BoschRoadEdgePublicationFilter:
       if right < left_edge - 1.0 - 2.0 * stds[0] or right > right_edge + 1.0 + 2.0 * stds[1]:
         hidden.add(obj.physical_track_id)
     self.would_suppress = frozenset(hidden)
-    if self.would_suppress != previous:
-      researchlog.debug(f'BOSCH_ROAD_EDGE ns={timestamp_ns} model_ns={model_ns} pids={sorted(hidden)}')
 
   def publication_view(self, objects, timestamp_ns):
     if (not self.enabled or not self.would_suppress or timestamp_ns is None or
@@ -5820,19 +5811,6 @@ class BoschMirrorM3Shadow:
       fields.update(reason=reason, held_scans=state.held_scans,
                     ext_scans=state.extension_scans)
     self._pending_events.append(fields)
-    if action == 'HOLD':
-      researchlog.debug(
-        f'BOSCH_MIRROR_M3_HOLD ns={timestamp_ns} pid={state.physical_track_id} '
-        f'path={state.path} parent={state.parent_pid} wall_y={state.wall_y_m} '
-        f'resid={state.residual_m} d={state.d_rel_m} y={state.y_rel_m} '
-        f'v={state.v_rel_mps} v_ego={state.v_ego_mps}')
-    else:
-      researchlog.debug(
-        f'BOSCH_MIRROR_M3_RELEASE ns={timestamp_ns} pid={state.physical_track_id} '
-        f'path={state.path} parent={state.parent_pid} wall_y={state.wall_y_m} '
-        f'resid={state.residual_m} d={state.d_rel_m} y={state.y_rel_m} '
-        f'v={state.v_rel_mps} v_ego={state.v_ego_mps} reason={reason} '
-        f'held_scans={state.held_scans} ext_scans={state.extension_scans}')
 
   def reset(self, timestamp_ns=None, reason='STATE_RESET'):
     self._pending_events = []
@@ -6573,20 +6551,6 @@ class BoschRadarProvider:
     self.family_companion.update(
       qualified, availability_ns, v_ego, yaw_rate=yaw_rate_left,
       strict_associations=strict, oem_pids=family_oem_pids, excluded_pids=s32_pids, path=path)
-    for decision in self.family_companion.last_decisions:
-      event = f'B1_COMPANION_{decision.action}'
-      researchlog.debug(
-        f'{event} ns={decision.timestamp_ns} reason={decision.release_reason or "PROOF_COMPLETE"} '
-        f'newborn_pid={decision.newborn_pid} newborn_raw={decision.newborn_raw_id} '
-        f'anchor_pid={decision.anchor_pid} anchor_raw={",".join(map(str, decision.anchor_raw_ids))} '
-        f'delta_d_scan1={decision.delta_d_scan1_m} delta_d_scan2={decision.delta_d_scan2_m} '
-        f'delta_y_scan1={decision.delta_y_scan1_m} delta_y_scan2={decision.delta_y_scan2_m} '
-        f'delta_vrel={decision.delta_vrel_mps} delta_world_speed={decision.delta_world_speed_mps} '
-        f'delta_bearing={decision.delta_bearing_deg} newborn_age={decision.newborn_age} '
-        f'anchor_age={decision.anchor_age} anchor_members={decision.anchor_member_count} '
-        f'camera_coarse={int(decision.camera_coarse)} camera_strict={int(decision.camera_strict)} '
-        f'oem={int(decision.oem_identity)} dPath={decision.d_path_m} '
-        f'public_suppressed={int(decision.public_suppressed)}')
     # Burst multi-return defer reads the same scan the B1 family filter just read.
     # Only a word0 record the OEM also validated counts as identity evidence here,
     # for the reason P91 uses below: word0 alone has been observed on a clone.
@@ -6594,15 +6558,6 @@ class BoschRadarProvider:
       qualified, availability_ns, v_ego, yaw_rate=yaw_rate_left,
       word0_validated_pids=processed_pids if oem_state == BOSCH_OEM_STATE_VALIDATED
       else frozenset())
-    for decision in self.burst_multireturn.last_decisions:
-      researchlog.debug(
-        f'BOSCH_BURST_MULTIRETURN_{decision.action} ns={decision.timestamp_ns} '
-        f'reason={decision.release_reason or "BURST_PROVEN"} child_pid={decision.child_pid} '
-        f'anchor_pid={decision.anchor_pid} anchor_age={decision.anchor_age} '
-        f'burst_n={decision.burst_members} d_span={decision.burst_d_span_m} '
-        f'y_span={decision.burst_y_span_m} world_mean={decision.burst_world_mean_mps} '
-        f'child_d={decision.child_d_rel_m} child_y={decision.child_y_rel_m} '
-        f'held_scans={decision.held_scans}')
     self.oem_gate.update(qualified, availability_ns, v_ego, state=oem_state,
                          word0_pids=processed_pids, oem_valid=scc_valid)
     self._debug_gate_suppress = self.oem_gate.would_withhold
@@ -6642,11 +6597,6 @@ class BoschRadarProvider:
     self.sidepass_lateral.update(
       qualified, availability_ns, v_ego, path=path,
       oem_pids=processed_pids if oem_state == BOSCH_OEM_STATE_VALIDATED else frozenset())
-    for decision in self.sidepass_lateral.last_decisions:
-      researchlog.debug(
-        f'BOSCH_SIDEPASS_LATERAL_{decision.action} ns={decision.timestamp_ns} '
-        f'reason={decision.reason} pid={decision.physical_track_id} slide={decision.slide_mps} '
-        f'raw_y={decision.raw_y_m} published_y={decision.published_y_m}')
     return qualified
 
 # End Bosch MRRevo14F passive radar

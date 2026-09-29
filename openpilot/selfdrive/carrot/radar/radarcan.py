@@ -7,17 +7,11 @@ from openpilot.cereal import car, messaging
 from openpilot.common.params import Params
 from openpilot.common.realtime import Priority, config_realtime_process
 from openpilot.common.runtime_diagnostics import RuntimeDiagnostics
-from openpilot.common.swaglog import cloudlog, ipchandler
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.carrot.radar.can_batch import MAX_INPUT_AGE_NS, RadarCanBatches, RadarEgoSample
 from openpilot.selfdrive.carrot.radar.lateral import set_radar_track_flip
 from openpilot.selfdrive.pandad import can_capnp_to_list
-from opendbc.car.carlog import researchlog
 from opendbc.car.car_helpers import interfaces
-
-
-# Bosch research records belong to the process that owns RadarInterface. Send
-# them to logMessage without adding a stderr/tmux handler.
-researchlog.addHandler(ipchandler)
 
 
 def _set_bosch_context(radar, sm, now_ns):
