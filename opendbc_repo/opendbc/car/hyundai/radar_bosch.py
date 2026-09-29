@@ -276,16 +276,15 @@ BOSCH_SCC12_AREQ_RAW_BIT = 24       # SCC12.aReqRaw, 11 bits, (0.01, -10.23)
 BOSCH_SCC_ADDRESSES = frozenset((BOSCH_SCC11_ADDR, BOSCH_SCC12_ADDR))
 BOSCH_SCC_STALE_NS = 300_000_000
 
-# Frozen Bosch <-> OEM-camera extended grouping candidate.  Keep production
-# disabled until the on-device SHADOW timing pass is complete; tests and replay
-# may opt into SHADOW/ACTIVE explicitly when constructing BoschRadarProvider.
+# Bosch <-> OEM-camera extended grouping. General distribution was authorized
+# on 2026-09-29. Preserve the existing mode values and publication behavior.
 BOSCH_CAMERA_EXTENDED_OFF = 0
 BOSCH_CAMERA_EXTENDED_SHADOW = 1
-BOSCH_CAMERA_EXTENDED_ACTIVE = 2
-BOSCH_CAMERA_EXTENDED_ACTIVE_TEST = 3
-# EXPERIMENTAL / TEST 전용: 실제 RadarData를 변경한다. UI 전용 overlay가 아니다.
-# 감독하 테스트카 로그 수집에만 사용하며 longitudinal control engagement는 승인되지 않았다.
-# 원복은 아래 MODE 한 줄을 OFF 또는 SHADOW로 변경하고 card를 재시작한다.
+BOSCH_CAMERA_EXTENDED_ACTIVE = 2  # Legacy observation-preserving mode
+BOSCH_CAMERA_EXTENDED_PUBLICATION = 3
+BOSCH_CAMERA_EXTENDED_ACTIVE_TEST = BOSCH_CAMERA_EXTENDED_PUBLICATION  # Legacy replay compatibility
+# PUBLICATION changes actual RadarData, including downstream lead-selection input.
+# OFF/SHADOW preserve baseline publication; mode changes require restarting radarcan.
 BOSCH_CAMERA_EXTENDED_TEST_INTERVALS = 2
 # A scan that keeps an extended group alive through the E2 coast but has no
 # strict camera edge used to throw the accumulated maturity away, so a single
@@ -298,7 +297,7 @@ BOSCH_CAMERA_MATURITY_HOLD_NS = 200_000_000
 # which is independent evidence that the set is one vehicle. Shorten the
 # interval requirement for that case only; the geometry checks are unchanged.
 BOSCH_CAMERA_MATURITY_WORD1_INTERVALS = 1
-BOSCH_CAMERA_EXTENDED_MODE = BOSCH_CAMERA_EXTENDED_ACTIVE_TEST
+BOSCH_CAMERA_EXTENDED_MODE = BOSCH_CAMERA_EXTENDED_PUBLICATION
 BOSCH_CAMERA_HEADER = 0x738
 BOSCH_CAMERA_FIRST_OBJECT = 0x739
 BOSCH_CAMERA_LAST_OBJECT = 0x756
@@ -667,16 +666,16 @@ class _BoschExtendedRepresentative:
 
 
 class BoschCameraExtendedGrouping:
-  """A0/P2/G0/E2 그룹과 테스트 전용 M2 eligibility를 계산한다.
+  """Compute A0/P2/G0/E2 groups and M2 publication eligibility.
 
-  OFF/SHADOW/안전용 ACTIVE는 baseline 관측을 보존한다. ACTIVE_TEST만
-  allocator 이후 실제 publication을 축소한다. 별도 PID의 소실된 운동 이력을
-  대표점이 이전하지 못하므로 longitudinal control 사용은 NO-GO다.
+  OFF/SHADOW/legacy ACTIVE preserve baseline observations. PUBLICATION reduces
+  the output after alias allocation. Each representative retains its own PID
+  history; histories from other members are not transferred to it.
   """
   def __init__(self, mode=BOSCH_CAMERA_EXTENDED_MODE,
                curve_reacquire_mode=BOSCH_CAMERA_CURVE_REACQUIRE_MODE):
     if mode not in (BOSCH_CAMERA_EXTENDED_OFF, BOSCH_CAMERA_EXTENDED_SHADOW,
-                    BOSCH_CAMERA_EXTENDED_ACTIVE, BOSCH_CAMERA_EXTENDED_ACTIVE_TEST):
+                    BOSCH_CAMERA_EXTENDED_ACTIVE, BOSCH_CAMERA_EXTENDED_PUBLICATION):
       raise ValueError('invalid Bosch camera extended-grouping mode')
     if curve_reacquire_mode not in (BOSCH_CAMERA_CURVE_REACQUIRE_OFF,
                                     BOSCH_CAMERA_CURVE_REACQUIRE_SHADOW,
@@ -1225,7 +1224,7 @@ class BoschCameraExtendedGrouping:
         fresh = (self.last_camera_ns is not None and
                  0 <= timestamp_ns - self.last_camera_ns <= BOSCH_CAMERA_OBSERVATION_GAP_NS and
                  all(by_pid[p].timestamp_ns == timestamp_ns for p in members))
-        if self.mode == BOSCH_CAMERA_EXTENDED_ACTIVE_TEST and fresh:
+        if self.mode == BOSCH_CAMERA_EXTENDED_PUBLICATION and fresh:
           state = self._maturity(members, episode, class_code, timestamp_ns, by_pid, yaw_rate)
           next_history[members] = state
           prior = self.histories.get(members)
@@ -1244,7 +1243,7 @@ class BoschCameraExtendedGrouping:
         # 성립하면 누적 interval을 보존한다. coast 중에는 mature에 넣지 않으므로
         # publication은 축소되지 않는다(camera 재확인 전에는 두 contact 유지).
         state = next_history[members]
-        if (self.mode == BOSCH_CAMERA_EXTENDED_ACTIVE_TEST and state.observations and
+        if (self.mode == BOSCH_CAMERA_EXTENDED_PUBLICATION and state.observations and
             state.stable_intervals > 0 and
             timestamp_ns - state.last_confirm_ns <= BOSCH_CAMERA_MATURITY_HOLD_NS):
           next_history[members] = self._maturity(
@@ -6216,12 +6215,10 @@ class BoschRadarProvider:
     return self.road_edge_filter.publication_view(result, timestamp_ns)
 
   def _publication_view_without_road_edge(self, objects, timestamp_ns=None):
-    # Candidate P91 ACTIVE is the Bosch research-branch production path. The
-    # independent camera-extended ACTIVE_TEST path below remains experimental.
     """Apply Bosch-only final-publication filters after alias allocation.
 
-    P91 ACTIVE is enabled for this Bosch research branch. Camera-extended
-    ACTIVE_TEST remains supervised-test-only and independently gated.
+    Camera-extended PUBLICATION keeps the existing representative-only output
+    when its maturity and current-member conditions are satisfied.
     """
     objects = self._provisional_birth_view(objects)
     p91_suppressed = (self.p91.would_suppress if self.p91.mode == BOSCH_P91_ACTIVE and
@@ -6236,7 +6233,7 @@ class BoschRadarProvider:
       gate.publication_withheld += len(withheld)
       objects = tuple(obj for obj in objects if obj.physical_track_id not in withheld)
     ext = self.camera_extended
-    if ext.mode != BOSCH_CAMERA_EXTENDED_ACTIVE_TEST:
+    if ext.mode != BOSCH_CAMERA_EXTENDED_PUBLICATION:
       return self.sidepass_lateral.publication_view(
         self.mirror_m3_shadow.publication_view(
           self.mirror_birth_hold.publication_view(
