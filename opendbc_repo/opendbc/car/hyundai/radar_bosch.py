@@ -5638,6 +5638,103 @@ class _BoschMirrorM3HoldState:
   extension_scans: int = 0
 
 
+class BoschRoadEdgePublicationFilter:
+  """Bosch-only current-edge exclusion; never changes tracking or measured data.
+
+  Model publication time is the freshness basis, as in M3. No prior-edge
+  fallback, motion correction, pair inference, or suppression hold is used.
+  """
+
+  FRESH_NS = 200_000_000
+  RADAR_TO_CAMERA_M = 1.52
+
+  def __init__(self, enabled=True):
+    self.enabled = enabled
+    self.model_edges = []
+    self.last_ns = None
+    self.source_model_ns = None
+    self.would_suppress = frozenset()
+    self.publication_suppressed = 0
+
+  def invalidate_model(self):
+    self.model_edges.clear()
+    self.source_model_ns = None
+    self.would_suppress = frozenset()
+
+  def reset(self):
+    self.invalidate_model()
+    self.last_ns = None
+
+  def ingest_model(self, model, model_ns):
+    # Keep invalid samples too: an uncertain current edge must not silently
+    # fall back to a previously confident one.
+    sample = None
+    edges = getattr(model, 'roadEdges', ())
+    stds = tuple(getattr(model, 'roadEdgeStds', ()))
+    if len(edges) == 2 and len(stds) == 2 and all(math.isfinite(s) and 0 <= s <= 1 for s in stds):
+      lines = tuple((tuple(e.x), tuple(e.y)) for e in edges)
+      if all(len(xs) >= 2 and len(xs) == len(ys) and
+             all(math.isfinite(v) for v in xs + ys) and
+             all(a < b for a, b in zip(xs, xs[1:])) for xs, ys in lines):
+        sample = (lines, stds)
+    self.model_edges = [(ns, value) for ns, value in self.model_edges if ns != model_ns]
+    self.model_edges.append((int(model_ns), sample))
+    self.model_edges.sort(key=lambda item: item[0])
+    self.model_edges = self.model_edges[-4:]
+    if sample is None:
+      self.would_suppress = frozenset()
+
+  def update(self, objects, timestamp_ns, *, valid=True, camera_associations=None, word0_pids=()):
+    previous = self.would_suppress
+    self.would_suppress = frozenset()
+    self.source_model_ns = None
+    if self.last_ns is not None and timestamp_ns < self.last_ns:
+      self.reset()
+    self.last_ns = timestamp_ns
+    if not self.enabled or not valid:
+      return
+    current = next(((ns, sample) for ns, sample in reversed(self.model_edges) if ns <= timestamp_ns), None)
+    if current is None:
+      return
+    model_ns, sample = current
+    if sample is None or not 0 <= timestamp_ns - model_ns <= self.FRESH_NS:
+      return
+    self.source_model_ns = model_ns
+    lines, stds = sample
+    protected = set(word0_pids)
+    camera_associations = camera_associations or {}
+    hidden = set()
+    for obj in objects:
+      association = camera_associations.get(obj.physical_track_id)
+      if (obj.timestamp_ns != timestamp_ns or obj.oem_selected or obj.vision_supported or
+          obj.physical_track_id in protected or
+          (association is not None and association[0] == BOSCH_CAMERA_ASSOC_ASSIGNED and association[1] >= 0)):
+        continue
+      # roadEdges use the model/camera longitudinal origin, as in M3.
+      d, right = obj.d_rel + self.RADAR_TO_CAMERA_M, -obj.y_rel
+      if not math.isfinite(d) or not math.isfinite(right) or not all(xs[0] <= d <= xs[-1] for xs, _ in lines):
+        continue
+      left_edge, right_edge = (float(np.interp(d, xs, ys)) for xs, ys in lines)
+      if left_edge >= right_edge:
+        continue
+      if right < left_edge - 1.0 - 2.0 * stds[0] or right > right_edge + 1.0 + 2.0 * stds[1]:
+        hidden.add(obj.physical_track_id)
+    self.would_suppress = frozenset(hidden)
+    if self.would_suppress != previous:
+      researchlog.debug(f'BOSCH_ROAD_EDGE ns={timestamp_ns} model_ns={model_ns} pids={sorted(hidden)}')
+
+  def publication_view(self, objects, timestamp_ns):
+    if (not self.enabled or not self.would_suppress or timestamp_ns is None or
+        self.last_ns is None or self.source_model_ns is None or
+        not 0 <= timestamp_ns - self.last_ns <= self.FRESH_NS or
+        not 0 <= timestamp_ns - self.source_model_ns <= self.FRESH_NS):
+      return objects
+    result = tuple(obj for obj in objects if obj.timestamp_ns != self.last_ns or
+                   obj.physical_track_id not in self.would_suppress)
+    self.publication_suppressed += len(objects) - len(result)
+    return result
+
+
 class BoschMirrorM3Shadow:
   """M3 edge-birth/coupled-extension state with an optional publication-only ACTIVE view."""
 
@@ -5894,6 +5991,7 @@ class BoschRadarProvider:
     self.b5_birth_defer = BoschBirthB5Defer(b5_mode)
     self.mirror_birth_hold = BoschMirrorBirthHold(mirror_birth_mode)
     self.mirror_m3_shadow = BoschMirrorM3Shadow()
+    self.road_edge_filter = BoschRoadEdgePublicationFilter()
     self.sidepass_lateral = _BoschSidePassLateralEstimator(sidepass_lateral_mode)
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
     self.oem_gate = _BoschOemValidationGate(oem_gate_mode)
@@ -6105,6 +6203,10 @@ class BoschRadarProvider:
     return burst.publication_view(objects)
 
   def publication_view(self, objects, timestamp_ns=None):
+    result = self._publication_view_without_road_edge(objects, timestamp_ns)
+    return self.road_edge_filter.publication_view(result, timestamp_ns)
+
+  def _publication_view_without_road_edge(self, objects, timestamp_ns=None):
     # Candidate P91 ACTIVE is the Bosch research-branch production path. The
     # independent camera-extended ACTIVE_TEST path below remains experimental.
     """Apply Bosch-only final-publication filters after alias allocation.
@@ -6352,6 +6454,7 @@ class BoschRadarProvider:
       self.b5_birth_defer.reset('PROVIDER_TIMEOUT')
       self.mirror_birth_hold.reset(now_ns, 'PROVIDER_TIMEOUT')
       self.mirror_m3_shadow.reset(now_ns, 'PROVIDER_TIMEOUT')
+      self.road_edge_filter.reset()
       self.sidepass_lateral.reset(now_ns, 'PROVIDER_TIMEOUT')
       self.p91.update((), now_ns, v_ego, yaw_rate=yaw_rate_left)
       self.oem_gate.update((), now_ns, v_ego, state=BOSCH_OEM_STATE_NONE)
@@ -6500,6 +6603,9 @@ class BoschRadarProvider:
       camera_associations=self.camera_extended.last_associations,
       word0_pids=processed_pids,
       mirror_enabled=self.mirror_birth_hold.mode != BOSCH_MIRROR_BIRTH_OFF)
+    self.road_edge_filter.update(
+      qualified, availability_ns, valid=not self.can_error and not self.wrong_config,
+      camera_associations=self.camera_extended.last_associations, word0_pids=processed_pids)
     # Side-pass lateral estimate: same scan, same OEM evidence the other
     # publication stages read; applied only by publication_view().
     self.sidepass_lateral.update(

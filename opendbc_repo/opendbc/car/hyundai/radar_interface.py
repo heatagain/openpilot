@@ -694,6 +694,7 @@ class RadarInterface(RadarInterfaceBase):
     path = ()
     source_ns = 0
     if model is not None and 0 <= now_ns - model_ns <= 200_000_000:
+      self.bosch.road_edge_filter.ingest_model(model, int(model_ns))
       self.bosch.b5_birth_defer.ingest_model(model, int(model_ns))
       self.bosch.mirror_m3_shadow.ingest_model(model, int(model_ns))
       if model.leadsV3:
@@ -709,6 +710,8 @@ class RadarInterface(RadarInterfaceBase):
         self._bosch_path_ns = model_ns
       path = self._bosch_path
       source_ns = self._bosch_path_source_ns
+    else:
+      self.bosch.road_edge_filter.invalidate_model()
     self._bosch_context = (int(now_ns), yaw, cues, path, model_ns, source_ns)
 
   def update_carrot(self, v_ego, a_ego, rcv_time, can_packets):
