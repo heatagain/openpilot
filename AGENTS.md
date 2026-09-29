@@ -1,5 +1,23 @@
 # Repository memory
 
+- On 2026-09-29, the user clarified that DM's 20-second standard hold starts
+  only when surrounding moving traffic appears after an absence. Additional
+  vehicles during occupancy do not extend it. Camera monitoring during the hold
+  uses stock timing/detection/inputs, expires prior grace and suspends experimental
+  resets; camera-unavailable timing stays 15/30/45. Then experimental criteria
+  resume, but occupied surroundings cannot earn the empty-road bonus. Retain
+  accumulated warnings/lockout and the two-second observation dropout retention.
+  No forced warning for attentive drivers. See docs/dm_traffic_hold_20260929.md.
+
+- On 2026-09-29, the user approved the C4 DM inset immediately right of D:
+  84x84 at (382,144), leaving 10px before the right strip. VISION moves above it;
+  confidence-dot travel returns to full height. C3 placement is unchanged.
+  DM event stage1 is visual-only; stage2 (first audible) has final PCM gain
+  >=0.7, and stage3 (final) always uses 1.0 regardless of user/ambient volume.
+  Match event identity and sound together so navigation sharing the WAV retains
+  normal volume. Desktop PCM/UI tests and synthetic rendering do not establish
+  physical-device loudness or readability. See docs/dm_onroad_preview_20260928.md.
+
 - On 2026-09-28, the user requested live DriverMonitoringMode changes. Poll
   typed Params every 0.5 seconds in the existing DM dispatcher; ignore the retired
   CARROT_DM_MODE startup latch. Preserve elapsed awareness, calibration, traffic
