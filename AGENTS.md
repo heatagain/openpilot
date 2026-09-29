@@ -1,5 +1,18 @@
 # Repository memory
 
+- On 2026-09-29, the user selected IMU-based suspected-impact detection at 1.5g
+  horizontal acceleration, with a visible/audible warning, ten seconds to cancel
+  by touching anywhere, then OpenpilotEnabledToggle=false and manager DoReboot.
+  Compensate gravity and mounting angle using fresh valid pose/calibration;
+  require two fresh samples within 30ms. aEgo is supporting context only.
+  Unseen/frozen UI cancels the transition; preserve takeover alert precedence.
+  Block control including AlwaysLateral during reboot, preserve normal volume,
+  and use the existing bounded reboot sound helper. Saved OFF persists until
+  manually enabled; reboot interrupts recording. No incident file protection or
+  upload is implied. The 1.5g threshold, drop/rough-road rejection, physical
+  display/audio and actual vehicle reboot remain unvalidated. See
+  docs/impact_dashcam_20260929.md.
+
 - On 2026-09-29, the user expanded the Carrot Web auto-update reboot sound request
   to ordinary reboots. Use the stdlib-parent common/reboot.py helper for hardware,
   manager, main Web tools and startup recovery: existing prompt.wav once before
@@ -109,7 +122,11 @@
   DM off may violate applicable laws or driving requirements without claiming
   universal illegality. The next ignition-on or manager/device restart clears
   only DriverMonitoringSessionDisabled; a saved Web OFF stays off until the
-  user manually enables DriverMonitoringEnabled again. Disabled DM
+  user manually enables DriverMonitoringEnabled again. File/QR backups and
+  file/QR/profile restore paths exclude DriverMonitoringEnabled, including
+  values in older backups; old backup downloads are filtered too. Resetting all
+  settings may restore the default ON value. Persistent OFF must be selected
+  locally on each device. Disabled DM
   stops the model during normal onroad operation and gates alerts, monitoring
   force deceleration and lockout while retaining a neutral state heartbeat.
   Driver View may run the model only for face preview while enforcement remains
