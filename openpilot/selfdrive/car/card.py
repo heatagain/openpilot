@@ -24,6 +24,7 @@ from openpilot.selfdrive.car.card_diagnostics import should_log_card_diagnostics
 from openpilot.selfdrive.car.cruise import VCruiseCarrot
 from openpilot.selfdrive.car.car_specific import MockCarState
 from openpilot.selfdrive.car.openpilot_toggle import CruiseMainOpenpilotToggle
+from openpilot.selfdrive.car.hyundai_mdps_recovery import MdpsRecovery, supported as mdps_recovery_supported
 from openpilot.selfdrive.carrot.xiaoge.xiaoge_vision import (
   XiaogeVisionResult,
   apply_xiaoge_vision_result,
@@ -118,6 +119,8 @@ class Car:
       self.params.put_bool("FirmwareQueryDone", True)
     else:
       self.CI, self.CP = CI, CI.CP
+
+    self.mdps_recovery = MdpsRecovery() if mdps_recovery_supported(self.CP) else None
 
     self.CP.alternativeExperience = get_alternative_experience(self.params.get_bool("DisengageOnAccelerator"))
     openpilot_enabled_toggle = self.params.get_bool("OpenpilotEnabledToggle")
@@ -230,6 +233,10 @@ class Car:
 
     if can_rcv_valid and REPLAY:
       self.can_log_mono_time = messaging.log_from_bytes(can_strs[0]).logMonoTime
+
+    if self.mdps_recovery is not None:
+      recovery_now = can_list[-1][0] if REPLAY and can_list else recv_ns
+      CS.hyundaiMdpsRecovery = self.mdps_recovery.update(can_list, recovery_now, CS.canValid and not CS.canTimeout)
 
     # radarcan consumes the CAN stream independently. These bounds preserve the
     # old update_carrot(CS.vEgo, CS.aEgo, ..., can_list) association exactly.

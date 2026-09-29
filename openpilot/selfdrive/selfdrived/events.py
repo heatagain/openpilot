@@ -823,6 +823,10 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.NO_ENTRY: NoEntryAlert("Steering Temporarily Unavailable"),
   },
 
+  EventName.steerTempUnavailablePending: {
+    ET.NO_ENTRY: NoEntryAlert("Steering Temporarily Unavailable"),
+  },
+
   EventName.steerTimeLimit: {
     ET.SOFT_DISABLE: soft_disable_alert("Vehicle Steering Time Limit"),
     ET.NO_ENTRY: NoEntryAlert("Vehicle Steering Time Limit"),
