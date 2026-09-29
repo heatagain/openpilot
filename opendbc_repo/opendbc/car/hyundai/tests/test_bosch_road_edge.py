@@ -1,4 +1,5 @@
 from dataclasses import replace
+import math
 from types import SimpleNamespace as NS
 
 import pytest
@@ -127,3 +128,47 @@ def test_context_does_not_touch_non_bosch_interface():
   interface = NS(bosch=None)
   RadarInterface.set_bosch_context(interface, T, model=model(), model_ns=T)
   assert vars(interface) == {'bosch': None}
+
+
+def test_same_timestamp_changed_coordinates_are_revalidated():
+  f = BoschRoadEdgePublicationFilter()
+  sample = model()
+  objects = (point(),)
+  f.ingest_model(sample, T)
+  f.update(objects, T)
+  assert f.would_suppress == {1}
+  sample.roadEdges[0].y = (-20., -20.)
+  sample.roadEdges[1].y = (20., 20.)
+  f.ingest_model(sample, T)
+  f.update(objects, T)
+  assert f.publication_view(objects, T) is objects
+
+
+def test_repeated_coordinates_still_read_new_uncertainty_and_invalid_data():
+  f = BoschRoadEdgePublicationFilter()
+  objects = (point(),)
+  f.ingest_model(model(), T)
+  f.update(objects, T)
+  assert f.would_suppress == {1}
+  f.ingest_model(model(stds=(1., 1.)), T)
+  f.update(objects, T)
+  assert f.publication_view(objects, T) is objects
+  f.ingest_model(model(), T)
+  f.update(objects, T)
+  assert f.would_suppress == {1}
+  f.ingest_model(model(left=(float('nan'), -2.)), T)
+  assert f.publication_view(objects, T) is objects
+  f.update(objects, T)
+  assert not f.would_suppress
+
+
+def test_cached_coordinates_preserve_signed_zero_and_own_input_values():
+  f = BoschRoadEdgePublicationFilter()
+  sample = model(xs=[-0., 150.])
+  f.ingest_model(sample, T)
+  before = f.model_edges[-1][1][0][0][0]
+  sample.roadEdges[0].x[0] = 0.
+  f.ingest_model(sample, T)
+  after = f.model_edges[-1][1][0][0][0]
+  assert math.copysign(1., before[0]) == -1.
+  assert math.copysign(1., after[0]) == 1.

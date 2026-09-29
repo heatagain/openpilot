@@ -1,6 +1,7 @@
 import bisect
 import copy
 import math
+import struct
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from numbers import Integral, Real
@@ -4636,8 +4637,9 @@ class BoschBirthB5Defer:
       del contexts[:-4]
 
   @staticmethod
-  def _interpolate(samples, timestamp_ns, value_index=1):
-    times = [row[0] for row in samples]
+  def _interpolate(samples, timestamp_ns, value_index=1, *, times=None):
+    if times is None:
+      times = [row[0] for row in samples]
     index = bisect.bisect_left(times, timestamp_ns)
     if index <= 0:
       return samples[0][value_index]
@@ -4657,6 +4659,7 @@ class BoschBirthB5Defer:
     x = y = heading = 0.
     timestamp_ns = start_ns
     pose_times = [row[0] for row in poses]
+    speed_times = [row[0] for row in speeds]
     while timestamp_ns < end_ns:
       next_ns = min(timestamp_ns + 10_000_000, end_ns)
       middle_ns = (timestamp_ns + next_ns) // 2
@@ -4664,8 +4667,8 @@ class BoschBirthB5Defer:
       if (pose_index < 0 or middle_ns - poses[pose_index][0] > BOSCH_B5_CONTEXT_MAX_AGE_NS or
           not poses[pose_index][2]):
         return None
-      speed = self._interpolate(speeds, middle_ns)
-      yaw = self._interpolate(poses, middle_ns)
+      speed = self._interpolate(speeds, middle_ns, times=speed_times)
+      yaw = self._interpolate(poses, middle_ns, times=pose_times)
       if not math.isfinite(speed) or not math.isfinite(yaw):
         return None
       dt = (next_ns - timestamp_ns) * 1e-9
@@ -5672,9 +5675,11 @@ class BoschRoadEdgePublicationFilter:
     self.source_model_ns = None
     self.would_suppress = frozenset()
     self.publication_suppressed = 0
+    self._validated_lines = None
 
   def invalidate_model(self):
     self.model_edges.clear()
+    self._validated_lines = None
     self.source_model_ns = None
     self.would_suppress = frozenset()
 
@@ -5690,13 +5695,19 @@ class BoschRoadEdgePublicationFilter:
     stds = tuple(getattr(model, 'roadEdgeStds', ()))
     if len(edges) == 2 and len(stds) == 2 and all(math.isfinite(s) and 0 <= s <= 1 for s in stds):
       lines = tuple((tuple(e.x), tuple(e.y)) for e in edges)
-      if all(len(xs) >= 2 and len(xs) == len(ys) and
+      # Compare contents, not publication time or mutable message identity.
+      # Binary doubles preserve signed zero; retain only one validated shape.
+      key = tuple((struct.pack(f'<{len(xs)}d', *xs), struct.pack(f'<{len(ys)}d', *ys)) for xs, ys in lines)
+      if self._validated_lines is not None and key == self._validated_lines[0]:
+        sample = (self._validated_lines[1], stds)
+      elif all(len(xs) >= 2 and len(xs) == len(ys) and
              all(math.isfinite(v) for v in xs + ys) and
              all(a < b for a, b in zip(xs, xs[1:])) for xs, ys in lines):
         # np.interp otherwise converts both tuples for every edge/object pair.
         # Own the float arrays once per sample and reuse them without changing
         # validation, interpolation arithmetic, or model freshness decisions.
         sample = (tuple((np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)) for xs, ys in lines), stds)
+        self._validated_lines = (key, sample[0])
     self.model_edges = [(ns, value) for ns, value in self.model_edges if ns != model_ns]
     self.model_edges.append((int(model_ns), sample))
     self.model_edges.sort(key=lambda item: item[0])

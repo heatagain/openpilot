@@ -1415,6 +1415,27 @@ class TestBoschB5BirthDefer:
     assert math.isnan(BoschBirthB5Defer._interp(points, -.01))
     assert math.isnan(BoschBirthB5Defer._interp(points, 2.01))
 
+  @pytest.mark.parametrize(('query', 'expected'), ((-1, 1.), (0, 1.), (5, 2.), (10, 3.), (15, 6.), (20, 7.), (21, 7.)))
+  def test_motion_interpolation_prepared_times_preserve_boundaries(self, query, expected):
+    samples = [(0, 1.), (10, 3.), (10, 5.), (20, 7.)]
+    assert BoschBirthB5Defer._interpolate(samples, query) == expected
+    assert BoschBirthB5Defer._interpolate(samples, query, times=[0, 10, 10, 20]) == expected
+
+  def test_motion_reuses_times_only_within_call_and_keeps_pose_validity(self):
+    b5 = BoschBirthB5Defer()
+    start, end = 1_000_000_000, 1_030_000_000
+    b5.speed_samples = [(start, 10.), (end, 10.)]
+    b5.pose_samples = [(start, 0., True), (end, 0., True)]
+    x, y, heading = b5._integrate_motion(start, end)
+    assert x == pytest.approx(.3) and y == 0. and heading == 0.
+    b5.speed_samples = [(start, 20.), (end, 20.)]
+    assert b5._integrate_motion(start, end)[0] == pytest.approx(.6)
+    b5.pose_samples[0] = (start, 0., False)
+    assert b5._integrate_motion(start, end) is None
+    b5.pose_samples = [(start, 0., True)]
+    assert b5._integrate_motion(start, start) == (0., 0., 0.)
+    assert b5._integrate_motion(start, start-1) is None
+
   def test_independent_camera_and_ambiguous_parent_fail_open(self):
     camera = {
       self.TARGET_PID: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1),
