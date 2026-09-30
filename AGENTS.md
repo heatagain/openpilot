@@ -1,5 +1,56 @@
 # Repository memory
 
+- On 2026-09-30, the handover follow-up review uses both angle-error and driver-
+  effort trends for mode 1, with tolerance and paused/gradual withdrawal for
+  ambiguous error growth, retaining fast yield for strong renewed driver effort.
+  For rapid release, onset angle error is an initial transition condition, not
+  a delayed small-error permission gate. Offline prototypes avoid ff7's short
+  46-to-25 withdrawal and schedule earlier limited offers, but unchanged-input
+  replay cannot establish vehicle response. The existing max(legacy, extra)
+  ceiling defeats bounded recovery; any implementation must coordinate total
+  authority and reference transition while preserving mode 0 and actuator limits.
+  This review changes no production code. See
+  docs/steering_handover_ff6_ff7_20260930.md for evidence and unresolved cases.
+
+- On 2026-09-30, Ioniq 5 PE ff6 segments 2/3 and ff7 segment 1 on b8a8a532
+  confirmed live handover mode 2→3 but delayed recovery after torque release.
+  Low-force confirmation can let angle error exceed the two-degree fast-recovery
+  gate; other releases miss arming/deadline conditions. No rapid recovery is
+  reconstructed in these windows. Legacy repeated-override ramps reach three
+  seconds; ff7's last release waits 520 ms then ramps for three seconds. One
+  short convergence offer is withdrawn 46→25 in about 12 ms on error growth
+  despite decreasing force. This may explain a tactile discontinuity but is not
+  proof of the user's exact felt moment. Touch-release edges arrive later and
+  are not demonstrated to be a faster cue. No controller change was requested
+  or made during this analysis. See docs/steering_handover_ff6_ff7_20260930.md.
+
+- On 2026-09-30, the user requested original-RX-paced forwarding of Hyundai
+  CAN-FD CAMERA_SCC cluster 0x161/162/1e0/1ea/200 from bus2 to bus0. Consume
+  allowed host copies into independent latest-value caches; use each stock RX
+  counter and recompute CRC, including byte-2 8-bit COUNTER for 8-byte 0x200.
+  No independent send without RX. Missing/expired host (150 ms) returns stock;
+  invalid original frames pass unchanged and invalidate the cache. Preserve
+  allowlists, relay protection, non-camera paths and existing control FIFO/reuse.
+  Latest-value sampling supports differing rates but can coalesce transient
+  displays and delay changes until next RX; freshness bounds host arrival only.
+  348 tests, 36,120-frame replay, 285,594 unchanged control comparisons and
+  F4/H7 builds pass. Wire timing, vehicle warning resolution and display/chime
+  behavior remain unvalidated. Requires updated Panda firmware. See
+  docs/canfd_cluster_rx_forwarding.md.
+
+- On 2026-09-30, the user requested live SteerHandoverMode for Hyundai/Kia/Genesis
+  angle control: 0 preserves legacy/default, 1 offers bounded recovery using
+  continuous driver effort and angle-error trends, 2 confirms abrupt force release
+  before faster recovery, and 3 combines them with release priority and no summed
+  gains. Poll every 0.5 seconds; only actual mode changes reset experimental history.
+  Keep legacy recovery state independent, steeringPressed boolean, torque-control
+  vehicles, touch/DM and angle/CAN limits unchanged. Effort is unbounded above 2;
+  the offer ceiling 80 is not physical torque or a proven tactile notification.
+  Reversal, rising force, error and invalidity withdraw added authority. Mode 0
+  matches the prior controller in a 6,000-frame input replay; synthetic/CAN tests
+  do not establish closed-loop driving or driver consent. A prolonged zero crossing
+  remains ambiguous. See docs/steering_handover_20260930.md for tests and limits.
+
 - On 2026-09-29, the user selected IMU-based suspected-impact detection at 1.5g
   horizontal acceleration, with a visible/audible warning, ten seconds to cancel
   by touching anywhere, then OpenpilotEnabledToggle=false and manager DoReboot.
