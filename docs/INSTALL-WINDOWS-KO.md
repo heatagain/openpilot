@@ -18,6 +18,10 @@ Windows 10/11 64비트 · PC 여유 공간 약 70GB · 64GB 이상 microSD와 US
 
 > **Installing to M.2 NVMe?** Use the same installer, then **01 → 02 → 03 common patch**. See the patch download and instructions below. No new image download is needed.
 
+**9월 30일 수정 — 공용 패치 v2:** v1에 초기 부팅을 막는 오류가 있어 교체했습니다. 이미 SSD에 설치·패치했다면 **새 패치를 기존 폴더에 덮어 풀고 03만 다시 실행**하세요. 01·02나 이미지 재기록은 필요 없습니다.
+
+> **September 30 fix — common patch v2:** v1 contained an early-boot defect. For an already installed/patched SSD, **extract the new patch over the existing folder and rerun only 03**. Skip 01 and 02; no image rewrite is needed.
+
 ---
 
 ### ① 압축을 모두 풀기
@@ -64,7 +68,7 @@ Windows 10/11 64비트 · PC 여유 공간 약 70GB · 64GB 이상 microSD와 US
 
 *Additional step for NVMe · Common microSD/NVMe patch · About 5–20 min*
 
-**[공용 패치파일 받기 · 약 32MB](https://upload.shind0.synology.me/downloads/jetson/v0.4.0-sd-nvme-patch-preview/carrot-jetson-windows.zip)**
+**[공용 패치파일 받기 · 약 32MB](https://upload.shind0.synology.me/downloads/jetson/v0.4.0-sd-nvme-patch-v2-preview/carrot-jetson-windows.zip)**
 
 > **Download the common patch · About 32 MB**
 
@@ -93,6 +97,14 @@ Wi-Fi 정보는 연결한 콤마에서 자동으로 받습니다. 시스템은 �
 > Wi-Fi settings come automatically from the connected comma. The system is configured read-only; logs and temporary files use RAM.
 
 ---
+
+### 🔑 SSH로 Jetson에 접속하기 · 선택 사항
+
+*Optional SSH access*
+
+PC에서 상태를 확인할 분은 **[SSH 접속 안내](JETSON-SSH.md)**를 따라 주세요. **키 만들기 → 카드·SSD에 공개키 등록 → IP 확인 → 접속** 순서로 설명합니다. 계정은 `jetlink`이며 기본 비밀번호는 없습니다. 이미지 재설치 없이 키를 등록할 수 있습니다.
+
+> Follow the **SSH guide** linked above to create a key, enroll it on the card/SSD, find the IP and connect. The account is `jetlink`; there is no default password. No image rewrite is required.
 
 ### ⚠️ 시작 전, 이것만 확인하세요
 
