@@ -5186,6 +5186,17 @@ def bosch_fill_point(point, obj, v_ego, alias=None, a_lead=math.nan):
   point.measured = True
 
 
+def bosch_native_surface_coordinates(obj, now_ns):
+  """Coordinates after the same Float32 writes used by bosch_append_points."""
+  raw_id, d_rel, y_rel, v_rel = bosch_published_surface(obj)
+  representative = obj.members[0] if len(obj.members) == 1 else next(
+    member for member in obj.members if member.raw_track_id == raw_id)
+  def f32(value):
+    return struct.unpack('<f', struct.pack('<f', value))[0]
+  d_rel, y_rel, v_rel = f32(d_rel), f32(y_rel), f32(v_rel)
+  return f32(d_rel + v_rel * ((now_ns - representative.timestamp_ns) * 1e-9)), y_rel, v_rel
+
+
 def bosch_append_points(radar, objects, v_ego, now_ns, alias=None, a_lead_by_pid=None):
   """Append directly to the final native list, retaining SCC aliasing safety."""
   if not objects:
@@ -5675,6 +5686,7 @@ class BoschRoadEdgePublicationFilter:
   def __init__(self, enabled=True):
     self.enabled = enabled
     self.model_edges = []
+    self.publication_model_edges = []
     self.last_ns = None
     self.source_model_ns = None
     self.would_suppress = frozenset()
@@ -5683,6 +5695,7 @@ class BoschRoadEdgePublicationFilter:
 
   def invalidate_model(self):
     self.model_edges.clear()
+    self.publication_model_edges.clear()
     self._validated_lines = None
     self.source_model_ns = None
     self.would_suppress = frozenset()
@@ -5694,24 +5707,33 @@ class BoschRoadEdgePublicationFilter:
   def ingest_model(self, model, model_ns):
     # Keep invalid samples too: an uncertain current edge must not silently
     # fall back to a previously confident one.
-    sample = None
+    sample = publication_sample = None
     edges = getattr(model, 'roadEdges', ())
     stds = tuple(getattr(model, 'roadEdgeStds', ()))
-    if len(edges) == 2 and len(stds) == 2 and all(math.isfinite(s) and 0 <= s <= 1 for s in stds):
+    if len(edges) == 2 and len(stds) == 2 and all(math.isfinite(s) and s >= 0 for s in stds):
       lines = tuple((tuple(e.x), tuple(e.y)) for e in edges)
       # Compare contents, not publication time or mutable message identity.
       # Binary doubles preserve signed zero; retain only one validated shape.
       key = tuple((struct.pack(f'<{len(xs)}d', *xs), struct.pack(f'<{len(ys)}d', *ys)) for xs, ys in lines)
       if self._validated_lines is not None and key == self._validated_lines[0]:
-        sample = (self._validated_lines[1], stds)
+        publication_sample = (self._validated_lines[1], stds)
       elif all(len(xs) >= 2 and len(xs) == len(ys) and
              all(math.isfinite(v) for v in xs + ys) and
              all(a < b for a, b in zip(xs, xs[1:])) for xs, ys in lines):
         # np.interp otherwise converts both tuples for every edge/object pair.
         # Own the float arrays once per sample and reuse them without changing
         # validation, interpolation arithmetic, or model freshness decisions.
-        sample = (tuple((np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)) for xs, ys in lines), stds)
-        self._validated_lines = (key, sample[0])
+        publication_sample = (tuple((np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)) for xs, ys in lines), stds)
+        self._validated_lines = (key, publication_sample[0])
+    # The existing scan gate still requires two confident edges. Retain the
+    # same validated arrays for the final distant-corner check, which may use
+    # a confident exterior edge independently of an uncertain opposite edge.
+    if publication_sample is not None and all(s <= 1 for s in stds):
+      sample = publication_sample
+    self.publication_model_edges = [(ns, value) for ns, value in self.publication_model_edges if ns != model_ns]
+    self.publication_model_edges.append((int(model_ns), publication_sample))
+    self.publication_model_edges.sort(key=lambda item: item[0])
+    self.publication_model_edges = self.publication_model_edges[-4:]
     self.model_edges = [(ns, value) for ns, value in self.model_edges if ns != model_ns]
     self.model_edges.append((int(model_ns), sample))
     self.model_edges.sort(key=lambda item: item[0])
@@ -5765,6 +5787,73 @@ class BoschRoadEdgePublicationFilter:
                    obj.physical_track_id not in self.would_suppress)
     self.publication_suppressed += len(objects) - len(result)
     return result
+
+  def publication_surface_view(self, provider, objects, timestamp_ns):
+    """Recheck current geometry at the coordinates the native points will use.
+
+    Fresh unsupported moving singletons outside the path corridor qualify.
+    A distant turn may use its exterior edge independently when the current
+    path bends by more than the whole road width. Competing raw edges alone
+    do not veto this conjunction, but a genuinely tied assignment does.
+    Current support or invalid geometry releases immediately; no holds.
+    """
+    if (not self.enabled or not objects or timestamp_ns is None or
+        provider.can_error or provider.wrong_config):
+      return objects
+    current = next(((ns, sample) for ns, sample in reversed(self.publication_model_edges) if ns <= timestamp_ns), None)
+    if current is None or current[1] is None or not 0 <= timestamp_ns - current[0] <= self.FRESH_NS:
+      return objects
+    lines, stds = current[1]
+    if not any(s <= 1 for s in stds):
+      return objects
+    shared, kept = {}, []
+    for obj in objects:
+      # The earlier scan gate and the final native projection have different
+      # coordinates and model availability. Never reuse a scan verdict here.
+      if len(obj.members) != 1 or obj.members[0].timestamp_ns != provider.last_scan_timestamp_ns:
+        kept.append(obj)
+        continue
+      wire_d, wire_y, wire_v = bosch_native_surface_coordinates(obj, timestamp_ns)
+      d, right = wire_d + self.RADAR_TO_CAMERA_M, -wire_y
+      if (not all(math.isfinite(v) for v in (d, right, wire_v)) or
+          not all(xs[0] <= d <= xs[-1] for xs, _ in lines)):
+        kept.append(obj)
+        continue
+      left_edge, right_edge = (float(np.interp(d, xs, ys)) for xs, ys in lines)
+      outside = (stds[0] <= 1 and left_edge - right - 1.0 - 2.0 * stds[0] > 0,
+                 stds[1] <= 1 and right - right_edge - 1.0 - 2.0 * stds[1] > 0)
+      if left_edge >= right_edge or not any(outside):
+        kept.append(obj)
+        continue
+      decision = provider.unsupported_birth.verdict(provider, obj, timestamp_ns,
+                                                     _shared=shared, _first_only=False)
+      if decision['exclude'] and all(s <= 1 for s in stds):
+        continue
+      if not decision['exclude'] and decision['reason'] == 'AMBIGUOUS_RAW':
+        decision = provider.unsupported_birth.verdict(provider, obj, timestamp_ns,
+            _shared=shared, _first_only=False, _require_single_candidate=False)
+      if not decision['exclude']:
+        kept.append(obj)
+        continue
+      _, _, yaw, path, _ = shared['context'][1]
+      # Both motion and the current path must agree about the turn. Removing
+      # initial heading isolates curvature; a nearby gentle bend is retained.
+      if 'curve_path' not in shared:
+        xs, ys = zip(*path)
+        shared['curve_path'] = (xs, ys) if all(a < b for a, b in zip(xs, xs[1:])) else None
+      curve_path = shared['curve_path']
+      if curve_path is None:
+        kept.append(obj)
+        continue
+      xs, ys = curve_path
+      heading = (ys[1] - ys[0]) / (xs[1] - xs[0])
+      bend = float(np.interp(obj.d_rel, xs, ys)) - ys[0] - heading * (obj.d_rel - xs[0])
+      exterior = 0 if yaw < 0 and bend > 0 else 1 if yaw > 0 and bend < 0 else None
+      if exterior is None or abs(bend) <= right_edge - left_edge or not outside[exterior]:
+        kept.append(obj)
+    removed = len(objects) - len(kept)
+    self.publication_suppressed += removed
+    return tuple(kept) if removed else objects
 
 
 class BoschMirrorM3Shadow:
@@ -6049,14 +6138,14 @@ class BoschUnsupportedBirthFilter:
       return 'STALE_SCAN', None, None
     return None, context, scan_ns
 
-  def verdict(self, provider, obj, publication_ns, *, _shared=None):
+  def verdict(self, provider, obj, publication_ns, *, _shared=None, _first_only=True, _require_single_candidate=True):
     def keep(reason):
       return {'exclude': False, 'reason': reason}
     if not self.enabled:
       return keep('DISABLED')
     if provider.can_error or provider.wrong_config:
       return keep('INVALID_PROVIDER')
-    if len(obj.members) != 1 or obj.age_scans != 1:
+    if len(obj.members) != 1 or (_first_only and obj.age_scans != 1):
       return keep('NOT_FIRST_SINGLETON_OBSERVATION')
     if _shared is None:
       reason, context, scan_ns = self._context(provider, publication_ns)
@@ -6073,7 +6162,7 @@ class BoschUnsupportedBirthFilter:
     identity = provider.tracker.raw_manager.last_identity_evidence.get(member.raw_track_id)
     if identity is None or identity[0] != member.timestamp_ns or member.timestamp_ns > scan_ns:
       return keep('MISSING_RAW_LINK')
-    if identity[1] > 1 or identity[2]:
+    if (_require_single_candidate and identity[1] > 1) or identity[2]:
       return keep('AMBIGUOUS_RAW')
     if not all(math.isfinite(v) for v in (obj.d_rel, obj.y_rel, obj.v_rel)):
       return keep('INVALID_MEASUREMENT')
@@ -6369,7 +6458,8 @@ class BoschRadarProvider:
   def publication_view(self, objects, timestamp_ns=None):
     result = self._publication_view_without_road_edge(objects, timestamp_ns)
     result = self.road_edge_filter.publication_view(result, timestamp_ns)
-    return self.unsupported_birth.publication_view(self, result, timestamp_ns)
+    result = self.unsupported_birth.publication_view(self, result, timestamp_ns)
+    return self.road_edge_filter.publication_surface_view(self, result, timestamp_ns)
 
   def _publication_view_without_road_edge(self, objects, timestamp_ns=None):
     """Apply Bosch-only final-publication filters after alias allocation.

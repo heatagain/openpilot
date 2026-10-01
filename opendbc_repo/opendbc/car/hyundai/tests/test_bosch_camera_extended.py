@@ -2013,3 +2013,211 @@ def test_unsupported_birth_duplicate_pid_keeps_unexcluded_object():
   p, obj = _unsupported_birth_fixture()
   established = replace(obj, age_scans=2)
   assert _unsupported_birth_view(p, (obj, established)) == (established,)
+
+
+def _publication_edge_model(width=2., std=.1):
+  return NS(roadEdges=[NS(x=(0., 160.), y=(-width, -width)),
+                       NS(x=(0., 160.), y=(width, width))], roadEdgeStds=(std, std))
+
+
+def test_current_native_edge_excludes_established_unsupported_point_without_track_or_alias_change():
+  p, obj = _unsupported_birth_fixture()
+  obj = replace(obj, age_scans=20)
+  ns = _UNSUPPORTED_BIRTH_NS + 50_000_000
+  p.road_edge_filter.ingest_model(_publication_edge_model(), ns)
+  assert _unsupported_birth_view(p, (obj,), ns) == (obj,)
+  assert p.publication_view((obj,), ns) == ()
+  msg = structs.RadarData.new_message()
+  bosch_append_points(msg, p.publication_view((obj,), ns), 20., ns,
+                      alias=p.publication_aliases.physical_to_alias)
+  assert not msg.points
+  assert obj.members[0].raw_track_id == 7 and obj.age_scans == 20
+  assert p.publication_aliases.physical_to_alias == {1000001: 32}
+
+
+@pytest.mark.parametrize('protection', ['vision', 'oem', 'word0', 'camera', 'ambiguous_camera',
+                                      'corridor', 'stationary', 'ambiguous_raw', 'competing_raw',
+                                      'coasted_raw', 'missing_pose', 'disabled'])
+def test_current_native_edge_preserves_supported_or_uncertain_points(protection):
+  p, obj = _unsupported_birth_fixture()
+  obj = replace(obj, age_scans=20)
+  ns = _UNSUPPORTED_BIRTH_NS + 50_000_000
+  p.road_edge_filter.ingest_model(_publication_edge_model(), ns)
+  if protection == 'vision': obj = replace(obj, vision_supported=True)
+  if protection == 'oem': obj = replace(obj, oem_selected=True)
+  if protection == 'word0': p._debug_processed_pids = {obj.physical_track_id}
+  if protection in ('camera', 'ambiguous_camera'):
+    p.camera_extended._associate = lambda *args: (1 if protection == 'camera' else 2, 0, 0)
+  if protection == 'corridor': obj = replace(obj, y_rel=1.8)
+  if protection == 'stationary': obj = replace(obj, v_rel=-20.)
+  if protection == 'ambiguous_raw': p.tracker.raw_manager.last_identity_evidence[7] = (_UNSUPPORTED_BIRTH_NS, 1, True)
+  if protection == 'competing_raw': p.tracker.raw_manager.last_identity_evidence[7] = (_UNSUPPORTED_BIRTH_NS, 2, False)
+  if protection == 'coasted_raw': p.last_scan_timestamp_ns += 1
+  if protection == 'missing_pose':
+    context = list(p._unsupported_birth_context)
+    context[2] = None
+    p._unsupported_birth_context = tuple(context)
+  if protection == 'disabled': p.unsupported_birth.enabled = False
+  objects = (obj,)
+  assert p.publication_view(objects, ns) == objects
+
+
+def test_current_native_edge_rereads_support_and_model_even_at_same_publication_time():
+  p, obj = _unsupported_birth_fixture()
+  obj = replace(obj, age_scans=20)
+  ns = _UNSUPPORTED_BIRTH_NS + 50_000_000
+  p.road_edge_filter.ingest_model(_publication_edge_model(), ns)
+  assert not p.publication_view((obj,), ns)
+  p.camera_extended._associate = lambda *args: (1, 0, 0)
+  assert p.publication_view((obj,), ns) == (obj,)
+  p.camera_extended._associate = lambda *args: (0, -1, -1)
+  assert not p.publication_view((obj,), ns)
+  p.road_edge_filter.ingest_model(_publication_edge_model(width=20.), ns)
+  assert p.publication_view((obj,), ns) == (obj,)
+  p.road_edge_filter.ingest_model(_publication_edge_model(), ns)
+  assert not p.publication_view((obj,), ns)
+  p.road_edge_filter.ingest_model(_publication_edge_model(std=2.), ns)
+  assert p.publication_view((obj,), ns) == (obj,)
+
+
+@pytest.mark.parametrize('model_ns', [_UNSUPPORTED_BIRTH_NS - 200_000_001,
+                                   _UNSUPPORTED_BIRTH_NS + 50_000_001])
+def test_current_native_edge_missing_stale_or_future_model_keeps_point(model_ns):
+  p, obj = _unsupported_birth_fixture()
+  obj = replace(obj, age_scans=20)
+  ns = _UNSUPPORTED_BIRTH_NS + 50_000_000
+  assert p.publication_view((obj,), ns) == (obj,)
+  p.road_edge_filter.ingest_model(_publication_edge_model(), model_ns)
+  assert p.publication_view((obj,), ns) == (obj,)
+
+
+def test_current_native_edge_uses_projected_float32_point_not_unprojected_anchor():
+  p, obj = _unsupported_birth_fixture()
+  obj = replace(obj, age_scans=20, y_rel=4.025)
+  ns = _UNSUPPORTED_BIRTH_NS + 100_000_000
+  # left(d) = -2 - .02*d: the anchor is inside the margin, but the
+  # current native range has moved 0.5m toward the narrower boundary.
+  p.road_edge_filter.ingest_model(NS(
+    roadEdges=[NS(x=(0., 160.), y=(-2., -5.2)), NS(x=(0., 160.), y=(2., 5.2))],
+    roadEdgeStds=(0., 0.)), ns)
+  assert obj.y_rel < 3. + .02 * (obj.d_rel + 1.52)
+  assert not p.publication_view((obj,), ns)
+
+
+def test_native_surface_helper_exactly_matches_capnp_rounding_and_signed_zero():
+  import struct
+  from opendbc.car.hyundai.radar_bosch import BoschPublishedSurface, bosch_native_surface_coordinates
+  p, obj = _unsupported_birth_fixture()
+  obj = replace(obj, published_surface=BoschPublishedSurface(7, 51.1234567, -0., -3.1234567))
+  ns = _UNSUPPORTED_BIRTH_NS + 73_000_001
+  msg = structs.RadarData.new_message()
+  bosch_append_points(msg, (obj,), 20., ns, alias=p.publication_aliases.physical_to_alias)
+  actual = msg.points[0]
+  calculated = bosch_native_surface_coordinates(obj, ns)
+  assert [struct.pack('<f', value) for value in calculated] == [
+    struct.pack('<f', getattr(actual, field)) for field in ('dRel', 'yRel', 'vRel')]
+
+
+def test_current_native_edge_real_interface_preserves_scc_control_point(monkeypatch):
+  from opendbc.car.hyundai.radar_interface import RadarInterface
+  from opendbc.car.interfaces import RadarInterfaceBase
+  def legacy_result(*args):
+    ret = structs.RadarData.new_message()
+    point = ret.init('points', 1)[0]
+    point.trackId = 0
+    point.dRel = 10.
+    point.vRel = -1.
+    point.measured = True
+    point.radarSource = 'scc'
+    return ret
+  monkeypatch.setattr(RadarInterfaceBase, 'update_carrot', legacy_result)
+  interface = RadarInterface.__new__(RadarInterface)
+  p, obj = _unsupported_birth_fixture()
+  obj = replace(obj, age_scans=20)
+  ns = _UNSUPPORTED_BIRTH_NS + 50_000_000
+  p.road_edge_filter.ingest_model(_publication_edge_model(), ns)
+  p.publication_aliases.physical_to_alias = {}
+  p.tracker.group_manager.states = {obj.physical_track_id: object()}
+  interface.bosch = p
+  interface._bosch_objects = (obj,)
+  interface._bosch_now_ns = ns
+  interface.v_ego = 20.
+  result = interface.update_carrot(20., 0., 1.05, [])
+  assert len(result.points) == 1 and result.points[0].radarSource == 'scc'
+  assert result.points[0].trackId == 0 and result.points[0].dRel == 10.
+
+
+def _far_corner_fixture(side=1):
+  p, obj = _unsupported_birth_fixture()
+  obj = replace(obj, age_scans=20, y_rel=4. * side)
+  ns = _UNSUPPORTED_BIRTH_NS + 50_000_000
+  context = list(p._unsupported_birth_context)
+  context[2] = -.05 * side
+  context[3] = ((0., 0.), (1., 0.), (50., 20. * side), (160., 50. * side))
+  p._unsupported_birth_context = tuple(context)
+  edges = ((12., 22.) if side == 1 else (-22., -12.))
+  model = NS(roadEdges=[NS(x=(0., 160.), y=(edge, edge)) for edge in edges],
+             roadEdgeStds=(.2, 2.) if side == 1 else (2., .2))
+  p.road_edge_filter.ingest_model(model, ns)
+  return p, obj, ns, model
+
+
+@pytest.mark.parametrize('side', (1, -1))
+def test_far_corner_uses_confident_exterior_despite_uncertain_opposite_edge(side):
+  p, obj, ns, model = _far_corner_fixture(side)
+  assert p.road_edge_filter.model_edges[-1][1] is None  # scan gate unchanged
+  assert not p.publication_view((obj,), ns)
+  # Current camera support releases at the same timestamp; no history hold.
+  p.camera_extended._associate = lambda *args: (1, 0, 0)
+  assert p.publication_view((obj,), ns) == (obj,)
+
+
+@pytest.mark.parametrize('change', ('near_curve', 'opposite_yaw', 'opposite_path',
+    'uncertain_exterior', 'invalid_opposite', 'crossed_edges', 'future', 'stale', 'tied_raw'))
+def test_far_corner_keeps_without_independent_current_geometry(change):
+  p, obj, ns, model = _far_corner_fixture()
+  context = list(p._unsupported_birth_context)
+  if change == 'near_curve': context[3] = ((0., 0.), (1., 0.), (50., 2.), (160., 4.))
+  elif change == 'opposite_yaw': context[2] = .05
+  elif change == 'opposite_path': context[3] = ((0., 0.), (1., 0.), (50., -20.), (160., -50.))
+  elif change == 'uncertain_exterior': model.roadEdgeStds = (1.01, 2.)
+  elif change == 'invalid_opposite': model.roadEdgeStds = (.2, float('nan'))
+  elif change == 'crossed_edges': model.roadEdges.reverse()
+  elif change == 'future': p.road_edge_filter.invalidate_model()
+  elif change == 'stale': p.road_edge_filter.invalidate_model()
+  elif change == 'tied_raw': p.tracker.raw_manager.last_identity_evidence[7] = (_UNSUPPORTED_BIRTH_NS, 2, True)
+  p._unsupported_birth_context = tuple(context)
+  stamp = ns + 1 if change == 'future' else ns - 200_000_001 if change == 'stale' else ns
+  p.road_edge_filter.ingest_model(model, stamp)
+  assert p.publication_view((obj,), ns) == (obj,)
+
+
+def test_far_corner_invalid_current_sample_cannot_reuse_previous_good_edge():
+  p, obj, ns, model = _far_corner_fixture()
+  assert not p.publication_view((obj,), ns)
+  model.roadEdgeStds = (2., 2.)
+  p.road_edge_filter.ingest_model(model, ns)
+  assert p.publication_view((obj,), ns) == (obj,)
+
+
+def test_far_corner_distinguishes_competing_edges_from_a_tied_assignment():
+  p, obj, ns, _ = _far_corner_fixture()
+  p.tracker.raw_manager.last_identity_evidence[7] = (_UNSUPPORTED_BIRTH_NS, 2, False)
+  assert not p.publication_view((obj,), ns)
+  p.tracker.raw_manager.last_identity_evidence[7] = (_UNSUPPORTED_BIRTH_NS, 2, True)
+  assert p.publication_view((obj,), ns) == (obj,)
+
+
+def test_native_surface_helper_uses_published_member_measurement_time():
+  import struct
+  from opendbc.car.hyundai.radar_bosch import BoschPublishedSurface, bosch_native_surface_coordinates
+  _, obj = _unsupported_birth_fixture()
+  other = replace(obj.members[0], raw_track_id=8,
+                  detection=replace(obj.members[0].detection, timestamp_ns=_UNSUPPORTED_BIRTH_NS + 20_000_000))
+  obj = replace(obj, members=(obj.members[0], other),
+                published_surface=BoschPublishedSurface(8, 51.1234567, -.1, -3.1234567))
+  ns = _UNSUPPORTED_BIRTH_NS + 73_000_001
+  msg = structs.RadarData.new_message()
+  bosch_append_points(msg, (obj,), 20., ns)
+  assert [struct.pack('<f', v) for v in bosch_native_surface_coordinates(obj, ns)] == [
+    struct.pack('<f', getattr(msg.points[0], field)) for field in ('dRel', 'yRel', 'vRel')]
