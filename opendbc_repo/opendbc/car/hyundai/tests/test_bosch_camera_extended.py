@@ -1,5 +1,6 @@
 import math
 from dataclasses import replace
+from types import SimpleNamespace as NS
 
 import pytest
 
@@ -46,6 +47,7 @@ from opendbc.car.hyundai.radar_interface import (
   _BoschCurveReacquireHistory,
 )
 from opendbc.car import structs
+from opendbc.car.hyundai.radar_bosch import BoschRawTrackManager, birth_d_path
 
 
 def signed(value, bits):
@@ -1830,3 +1832,141 @@ class TestBoschCameraScaleCorrection:
 def module_path():
   import opendbc.car.hyundai.radar_interface as module
   return module.__file__
+
+
+# First-observation publication with current camera support and fail-open inputs.
+_UNSUPPORTED_BIRTH_NS = 1_000_000_000
+_UNSUPPORTED_BIRTH_PATH = ((0., 0.), (160., 0.))
+
+
+def _unsupported_birth_fixture():
+  p = BoschRadarProvider(0)
+  raw = BoschRawTrack(7, BoschRawDetection(_UNSUPPORTED_BIRTH_NS, 1, 50., 4., -5., 0), 1)
+  obj = BoschPhysicalObject(1000001, _UNSUPPORTED_BIRTH_NS, (raw,), 7, 50., 4., -5., False, False, 1, 'single_return')
+  p.last_scan_timestamp_ns = _UNSUPPORTED_BIRTH_NS
+  p._last_now_ns = _UNSUPPORTED_BIRTH_NS + 50_000_000
+  p._unsupported_birth_context = (p._last_now_ns, 20., 0., _UNSUPPORTED_BIRTH_PATH, _UNSUPPORTED_BIRTH_NS)
+  p.tracker.raw_manager.last_identity_evidence = {7: (_UNSUPPORTED_BIRTH_NS, 0, False)}
+  p.camera_extended.last_ns = _UNSUPPORTED_BIRTH_NS
+  p.camera_extended.camera = NS(snapshot=lambda ns: ((), 0, 0, _UNSUPPORTED_BIRTH_NS))
+  p.publication_aliases.physical_to_alias = {1000001: 32}
+  return p, obj
+
+
+def _unsupported_birth_view(p, objects, ns=_UNSUPPORTED_BIRTH_NS + 50_000_000):
+  return p.unsupported_birth.publication_view(p, objects, ns)
+
+
+def test_actual_provider_final_publication_and_native_array_exclude_first_scan():
+  p, obj = _unsupported_birth_fixture()
+  assert p.publication_view((obj,), _UNSUPPORTED_BIRTH_NS + 50_000_000) == ()
+  msg = structs.RadarData.new_message()
+  bosch_append_points(msg, p.publication_view((obj,), _UNSUPPORTED_BIRTH_NS + 90_000_000), 20., _UNSUPPORTED_BIRTH_NS + 90_000_000,
+                      alias=p.publication_aliases.physical_to_alias)
+  assert not msg.points
+  assert obj.members[0].raw_track_id == 7 and obj.age_scans == 1
+  assert p.publication_aliases.physical_to_alias == {1000001: 32}
+
+
+def test_normal_first_observation_delay_is_an_explicit_policy_limit():
+  p, obj = _unsupported_birth_fixture()
+  assert not _unsupported_birth_view(p, (obj,))  # A normal off-path actor can also be deferred.
+  grown = replace(obj, age_scans=2)
+  assert _unsupported_birth_view(p, (grown,)) == (grown,)
+
+
+@pytest.mark.parametrize('support', ['vision', 'oem', 'word0', 'scan_camera', 'current_camera', 'ambiguous_camera'])
+def test_independent_current_support_preserves_actor(support):
+  p, obj = _unsupported_birth_fixture()
+  if support == 'vision':obj = replace(obj, vision_supported=True)
+  if support == 'oem':obj = replace(obj, oem_selected=True)
+  if support == 'word0':p._debug_processed_pids = {obj.physical_track_id}
+  if support == 'scan_camera':p.camera_extended.last_associations = {obj.physical_track_id: (1, 0, 0)}
+  if support in ('current_camera', 'ambiguous_camera'):
+    p.camera_extended._associate = lambda *args: (1 if support == 'current_camera' else 2, 0, 0)
+  assert _unsupported_birth_view(p, (obj,)) == (obj,)
+
+
+def test_later_camera_support_only_releases_after_its_availability():
+  p, obj = _unsupported_birth_fixture()
+  snapshot = p.camera_extended.camera.snapshot
+  p.camera_extended.camera.snapshot = lambda ns: snapshot(ns) if ns < _UNSUPPORTED_BIRTH_NS + 70_000_000 else ((object(),), 1, 0, _UNSUPPORTED_BIRTH_NS + 70_000_000)
+  p.camera_extended._associate = lambda obj, candidates, count: (1, 0, 0) if count else (0, -1, -1)
+  assert _unsupported_birth_view(p, (obj,), _UNSUPPORTED_BIRTH_NS + 50_000_000) == ()
+  assert _unsupported_birth_view(p, (obj,), _UNSUPPORTED_BIRTH_NS + 90_000_000) == (obj,)
+
+
+@pytest.mark.parametrize('change', ['stationary', 'corridor', 'path_extent', 'no_pose', 'stale_ego', 'future_ego',
+                                   'no_path', 'stale_path', 'future_path', 'missing_camera', 'stale_camera',
+                                   'ambiguous_raw', 'multiple_raw_candidates', 'missing_raw', 'future_raw', 'can_error', 'disabled'])
+def test_uncertain_input_and_protected_geometry_fail_open(change):
+  p, obj = _unsupported_birth_fixture();context=list(p._unsupported_birth_context)
+  if change == 'stationary':obj=replace(obj, v_rel=-20.)
+  if change == 'corridor':obj=replace(obj, y_rel=1.8)
+  if change == 'path_extent':obj=replace(obj, d_rel=161.)
+  if change == 'no_pose':context[2]=None
+  if change == 'stale_ego':context[0]=_UNSUPPORTED_BIRTH_NS-200_000_001
+  if change == 'future_ego':context[0]=_UNSUPPORTED_BIRTH_NS+50_000_001
+  if change == 'no_path':context[3]=()
+  if change == 'stale_path':context[4]=_UNSUPPORTED_BIRTH_NS-200_000_001
+  if change == 'future_path':context[4]=_UNSUPPORTED_BIRTH_NS+50_000_001
+  if change == 'missing_camera':p.camera_extended.camera=None
+  if change == 'stale_camera':p.camera_extended.camera.snapshot=lambda ns: ((), 0, 0, _UNSUPPORTED_BIRTH_NS-200_000_001)
+  if change == 'ambiguous_raw':p.tracker.raw_manager.last_identity_evidence={7:(_UNSUPPORTED_BIRTH_NS,1,True)}
+  if change == 'multiple_raw_candidates':p.tracker.raw_manager.last_identity_evidence={7:(_UNSUPPORTED_BIRTH_NS,2,False)}
+  if change == 'missing_raw':p.tracker.raw_manager.last_identity_evidence={}
+  if change == 'future_raw':p.tracker.raw_manager.last_identity_evidence={7:(_UNSUPPORTED_BIRTH_NS+1,0,False)}
+  if change == 'can_error':p.can_error=True
+  if change == 'disabled':p.unsupported_birth.enabled=False
+  p._unsupported_birth_context=tuple(context)
+  assert _unsupported_birth_view(p,(obj,)) == (obj,)
+
+
+def test_minimal_raw_identity_evidence_matches_optional_trace_and_expires():
+  plain=BoschRawTrackManager();traced=BoschRawTrackManager();traced.trace_decisions=True
+  for index in range(4):
+    ns=_UNSUPPORTED_BIRTH_NS+index*100_000_000
+    raw=(BoschRawDetection(ns,0,50.,0.,-5.,0),BoschRawDetection(ns,1,50.,0.,-5.,0))
+    assert plain.update(ns,raw)==traced.update(ns,raw)
+    assert not plain.last_decisions
+    assert plain.last_identity_evidence=={d.raw_track_id:(ns,d.candidate_count,d.identity_ambiguous) for d in traced.last_decisions}
+  plain.update(_UNSUPPORTED_BIRTH_NS+500_000_000,())
+  assert not plain.last_identity_evidence
+
+
+def test_geometry_uses_nearest_normal_and_model_y_inversion():
+  path=((0.,0.),(100.,-10.))
+  assert birth_d_path(path,50.,5.) == pytest.approx(0.)
+  assert birth_d_path(path,50.,9.) == pytest.approx(4./(1.01**.5))
+
+
+def test_off_switch_retains_identity_alias_and_nan_fields():
+  p,obj=_unsupported_birth_fixture();p.unsupported_birth.enabled=False
+  objects=p.publication_view((obj,),_UNSUPPORTED_BIRTH_NS+50_000_000)
+  assert objects==(obj,) and objects[0] is obj
+  msg=structs.RadarData.new_message();bosch_append_points(msg,objects,20.,_UNSUPPORTED_BIRTH_NS+50_000_000,alias=p.publication_aliases.physical_to_alias)
+  assert msg.points[0].trackId==32 and msg.points[0].dRel==49.75
+  import math
+  assert math.isnan(msg.points[0].aLead) and math.isnan(msg.points[0].yvRel)
+
+
+def test_real_radar_interface_control_input_filters_bosch_and_keeps_scc(monkeypatch):
+  from opendbc.car.hyundai.radar_interface import RadarInterface
+  from opendbc.car.interfaces import RadarInterfaceBase
+  def legacy_result(*args):
+    ret=structs.RadarData.new_message();point=ret.init('points',1)[0]
+    point.trackId=0;point.dRel=10.;point.vRel=-1.;point.measured=True;point.radarSource='scc'
+    return ret
+  monkeypatch.setattr(RadarInterfaceBase,'update_carrot',legacy_result)
+  interface=RadarInterface.__new__(RadarInterface)
+  p,obj=_unsupported_birth_fixture();p.publication_aliases.physical_to_alias={}
+  p.tracker.group_manager.states={obj.physical_track_id:object()}
+  interface.bosch=p;interface._bosch_objects=(obj,);interface._bosch_now_ns=_UNSUPPORTED_BIRTH_NS+50_000_000
+  interface.v_ego=20.
+  filtered=interface.update_carrot(20.,0.,1.05,[])
+  assert len(filtered.points)==1 and filtered.points[0].radarSource=='scc'
+  p.unsupported_birth.enabled=False
+  unfiltered=interface.update_carrot(20.,0.,1.05,[])
+  assert len(unfiltered.points)==2
+  assert unfiltered.points[0].to_dict()==filtered.points[0].to_dict()
+  assert unfiltered.points[1].trackId==32 and unfiltered.points[1].radarSource=='frontRadar'

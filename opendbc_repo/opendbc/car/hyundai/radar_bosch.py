@@ -4,6 +4,7 @@ import math
 import struct
 from collections import Counter, deque
 from dataclasses import dataclass, field
+from functools import lru_cache
 from numbers import Integral, Real
 from typing import Sequence
 
@@ -1917,6 +1918,8 @@ class BoschRawTrackManager:
     # path unchanged; on only fills last_decisions. Neither setting gates a match.
     self.trace_decisions = False
     self.last_decisions: tuple[BoschRawAssociationDecision, ...] = ()
+    # Only current-scan ambiguity evidence; no expensive association trace.
+    self.last_identity_evidence: dict[int, tuple[int, int, bool]] = {}
 
   @property
   def active_count(self) -> int:
@@ -2081,6 +2084,7 @@ class BoschRawTrackManager:
       states[state.track.raw_track_id] = state
     output = []
     decisions = []
+    identity_evidence = {}
     assignments = cross_slot = recovered_count = created = 0
     for col, (point, (x, y)) in enumerate(zip(current, observed)):
       row = assignment.get(col)
@@ -2098,6 +2102,7 @@ class BoschRawTrackManager:
         created += 1
       output.append(track)
       states[track.raw_track_id] = _BoschRawState(track, x, y, timestamp_ns, update_count)
+      identity_evidence[track.raw_track_id] = (point.timestamp_ns, len(column_edges[col]), col in ambiguous_columns)
       if self.trace_decisions:
         chosen = next((cost for other, cost in column_edges[col] if other == row), None)
         alternatives = sorted(cost for other, cost in column_edges[col] if other != row)
@@ -2119,6 +2124,7 @@ class BoschRawTrackManager:
           chosen_cost=chosen, best_alternative_cost=alternatives[0] if alternatives else None,
           candidate_count=len(column_edges[col]), identity_ambiguous=col in ambiguous_columns))
     self.last_decisions = tuple(decisions)
+    self.last_identity_evidence = identity_evidence
     self.last_timestamp_ns = int(timestamp_ns)
     stats = self.stats
     for key, value in pending_stats.items():
@@ -5986,6 +5992,116 @@ class BoschMirrorM3Shadow:
     return tuple(obj for obj in objects if obj.physical_track_id not in suppressed)
 
 
+# Provisional acquisition policy; a normal first observation can also be deferred.
+@lru_cache(maxsize=8)
+def _unsupported_birth_segments(path):
+  points = tuple((float(x), -float(y)) for x, y in path)
+  segments = []
+  for (x0, y0), (x1, y1) in zip(points, points[1:]):
+    dx, dy = x1 - x0, y1 - y0
+    length = math.hypot(dx, dy)
+    if length >= 1e-6:
+      segments.append((x0, y0, dx / length, dy / length, length))
+  return points, tuple(segments)
+
+
+def birth_d_path(path, x, y):
+  """Nearest clamped polyline normal, with model right-positive y inverted.
+
+  The caller forbids range extrapolation (x <= final path x), so the terminal
+  extrapolation branch of the control projector cannot apply here.
+  """
+  points, segments = _unsupported_birth_segments(path)
+  if not segments:
+    return y - points[0][1]
+  best_distance = math.inf
+  best = None
+  for x0, y0, tx, ty, length in segments:
+    dx, dy = tx * length, ty * length
+    ratio = min(1.0, max(0.0, ((x - x0) * dx + (y - y0) * dy) / (length * length)))
+    ox, oy = x - (x0 + ratio * dx), y - (y0 + ratio * dy)
+    distance = ox * ox + oy * oy
+    if distance < best_distance:
+      best_distance, best = distance, -ty * ox + tx * oy
+  return best
+
+
+class BoschUnsupportedBirthFilter:
+  def __init__(self, enabled=True):
+    self.enabled = bool(enabled)
+    self.last_decisions = {}
+
+  def verdict(self, provider, obj, publication_ns):
+    def keep(reason):
+      return {'exclude': False, 'reason': reason}
+    if not self.enabled:
+      return keep('DISABLED')
+    if provider.can_error or provider.wrong_config:
+      return keep('INVALID_PROVIDER')
+    if len(obj.members) != 1 or obj.age_scans != 1:
+      return keep('NOT_FIRST_SINGLETON_OBSERVATION')
+    context = provider._unsupported_birth_context
+    if context is None or publication_ns is None:
+      return keep('MISSING_RECEIVE_CONTEXT')
+    received_ns, ego, yaw, path, path_ns = context
+    if not 0 <= publication_ns - received_ns <= 200_000_000:
+      return keep('STALE_EGO_CONTEXT')
+    if not math.isfinite(ego) or ego < 3.0 or yaw is None or not math.isfinite(yaw) or abs(yaw / ego) > .02:
+      return keep('MISSING_OR_INVALID_MOTION')
+    if (path_ns is None or not 0 <= publication_ns - path_ns <= 200_000_000 or len(path) < 2
+        or not all(math.isfinite(float(v)) for point in path for v in point)):
+      return keep('MISSING_OR_STALE_PATH')
+    scan_ns = provider.last_scan_timestamp_ns
+    if scan_ns is None or not scan_ns <= received_ns <= publication_ns or publication_ns - scan_ns > 150_000_000:
+      return keep('STALE_SCAN')
+    if obj.timestamp_ns != scan_ns:
+      return keep('NOT_FIRST_SINGLETON_OBSERVATION')
+    member = obj.members[0]
+    identity = provider.tracker.raw_manager.last_identity_evidence.get(member.raw_track_id)
+    if identity is None or identity[0] != member.timestamp_ns or member.timestamp_ns > scan_ns:
+      return keep('MISSING_RAW_LINK')
+    if identity[1] > 1 or identity[2]:
+      return keep('AMBIGUOUS_RAW')
+    if not all(math.isfinite(v) for v in (obj.d_rel, obj.y_rel, obj.v_rel)):
+      return keep('INVALID_MEASUREMENT')
+    if abs(ego + obj.v_rel) <= 1.0:
+      return keep('STATIONARY_LIKE')
+    if obj.d_rel < path[0][0] or obj.d_rel > path[-1][0]:
+      return keep('OUTSIDE_PATH_EXTENT')
+    d_path = birth_d_path(path, obj.d_rel, obj.y_rel)
+    if d_path is None or not math.isfinite(d_path) or abs(d_path) <= 1.8:
+      return keep('CURRENT_PATH_CORRIDOR')
+    pid = obj.physical_track_id
+    cache = provider.camera_extended
+    prior = cache.last_associations.get(pid)
+    if (obj.vision_supported or obj.oem_selected or pid in provider._debug_processed_pids
+        or (cache.last_ns == scan_ns and prior is not None and prior[0] in (1, 2))):
+      return keep('CURRENT_NATIVE_SUPPORT')
+    snapshot = cache.camera.snapshot(publication_ns) if cache.camera is not None else None
+    if snapshot is None or not 0 <= publication_ns - snapshot[3] <= 200_000_000:
+      return keep('MISSING_OR_STALE_CAMERA')
+    association = cache._associate(obj, tuple(snapshot[0][:snapshot[1]]), snapshot[1])
+    if association[0] in (1, 2):
+      return keep('CURRENT_A0_SUPPORTED_OR_AMBIGUOUS')
+    return {'exclude': True, 'reason': 'MOVING_FIRST_SINGLETON_OFFPATH_CURRENTLY_UNSUPPORTED',
+            'dPath': d_path, 'world_longitudinal_speed_approx': ego + obj.v_rel,
+            'current_a0': association, 'source_ns': member.timestamp_ns,
+            'snapshot_complete_ns': snapshot[3], 'publication_ns': publication_ns}
+
+  def publication_view(self, provider, objects, publication_ns):
+    self.last_decisions = {}
+    if not self.enabled:
+      return objects
+    kept = []
+    for obj in objects:
+      decision = self.verdict(provider, obj, publication_ns)
+      if decision['exclude']:
+        self.last_decisions[obj.physical_track_id] = decision
+      else:
+        kept.append(obj)
+    return tuple(kept) if self.last_decisions else objects
+
+
 class BoschRadarProvider:
   def __init__(self, bus: int, *, qualification=True, camera_bus=1,
                camera_extended_mode=BOSCH_CAMERA_EXTENDED_MODE, p91_mode=BOSCH_P91_MODE,
@@ -5994,7 +6110,7 @@ class BoschRadarProvider:
                provisional_bundle=True, family_companion_mode=BOSCH_FAMILY_COMPANION_MODE,
                burst_multireturn_mode=BOSCH_BURST_MULTIRETURN_MODE,
                b5_mode=BOSCH_B5_MODE, sidepass_lateral_mode=BOSCH_SIDEPASS_LATERAL_MODE,
-               mirror_birth_mode=BOSCH_MIRROR_BIRTH_MODE):
+               mirror_birth_mode=BOSCH_MIRROR_BIRTH_MODE, unsupported_birth=True):
     self.bus = bus
     self.camera_bus = camera_bus
     self.scc_bus = scc_bus
@@ -6008,6 +6124,8 @@ class BoschRadarProvider:
     self.mirror_birth_hold = BoschMirrorBirthHold(mirror_birth_mode)
     self.mirror_m3_shadow = BoschMirrorM3Shadow()
     self.road_edge_filter = BoschRoadEdgePublicationFilter()
+    self.unsupported_birth = BoschUnsupportedBirthFilter(unsupported_birth)
+    self._unsupported_birth_context = None
     self.sidepass_lateral = _BoschSidePassLateralEstimator(sidepass_lateral_mode)
     self.p91 = _BoschPersistentSpatialCloneFilter(p91_mode)
     self.oem_gate = _BoschOemValidationGate(oem_gate_mode)
@@ -6220,7 +6338,8 @@ class BoschRadarProvider:
 
   def publication_view(self, objects, timestamp_ns=None):
     result = self._publication_view_without_road_edge(objects, timestamp_ns)
-    return self.road_edge_filter.publication_view(result, timestamp_ns)
+    result = self.road_edge_filter.publication_view(result, timestamp_ns)
+    return self.unsupported_birth.publication_view(self, result, timestamp_ns)
 
   def _publication_view_without_road_edge(self, objects, timestamp_ns=None):
     """Apply Bosch-only final-publication filters after alias allocation.
@@ -6362,6 +6481,7 @@ class BoschRadarProvider:
     """
     if self._last_now_ns is not None and now_ns < self._last_now_ns:
       raise ValueError('provider receive clock must not regress')
+    self._unsupported_birth_context = (now_ns, v_ego, yaw_rate_left, tuple(path), path_ns)
     self._last_now_ns = now_ns
     if self._start_ns is None:
       self._start_ns = now_ns
