@@ -8,7 +8,6 @@ from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.stopping import CanfdStopping
 from opendbc.car.hyundai.steering_handover import SteeringHandover
-from opendbc.car.hyundai.syswarning_test import SysWarningTest
 from opendbc.car.carlog import carlog
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParams, CAR, CAN_GEARS, HyundaiExtFlags
@@ -230,8 +229,6 @@ class CarController(CarControllerBase):
     self.handover_model_time = 0
 
     self.lkas11_active = False
-    self.syswarning_test = (SysWarningTest() if CP.carFingerprint == CAR.HYUNDAI_ELANTRA
-                            and not CP.flags & (HyundaiFlags.CANFD | HyundaiFlags.SEND_LFA) else None)
 
     self.canfd_debug = 0
     self.MainMode_ACC_trigger = 0
@@ -609,15 +606,13 @@ class CarController(CarControllerBase):
         else:
           can_sends.extend(self.create_button_messages(CC, CS, use_clu11=False))
     else:
-      syswarning_test_value = self.syswarning_test.get_override(CC, CS.out) if self.syswarning_test is not None else None
       if CS.lkas11 is not None:
         if self.lkas11_active:
           can_sends.append(hyundaican.create_lkas11(self.packer, self.frame, self.CP, apply_torque, apply_steer_req,
                                                     torque_fault, CS.lkas11, sys_warning, sys_state, CC.enabled,
                                                     hud_control.leftLaneVisible, hud_control.rightLaneVisible,
                                                     left_lane_warning, right_lane_warning, self.is_ldws_car,
-                                                    dm_alert=hud_control.driverMonitoringAlert,
-                                                    syswarning_test_value=syswarning_test_value))
+                                                    dm_alert=hud_control.driverMonitoringAlert))
         self.lkas11_active = True
 
       if not self.CP.openpilotLongitudinalControl:
