@@ -26,7 +26,7 @@ def suppress_casper_ev_fca11_fault(values):
 def create_lkas11(packer, frame, CP, apply_torque, steer_req,
                   torque_fault, lkas11, sys_warning, sys_state, enabled,
                   left_lane, right_lane,
-                  left_lane_depart, right_lane_depart, is_ldws_car, dm_alert=0):
+                  left_lane_depart, right_lane_depart, is_ldws_car, dm_alert=0, *, syswarning_test_value=None):
 
   values = {s: lkas11[s] for s in [
     "CF_Lkas_LdwsActivemode",
@@ -111,6 +111,14 @@ def create_lkas11(packer, frame, CP, apply_torque, steer_req,
       values["CF_Lkas_SysWarning"] = 3
     if values["CF_Lkas_SysWarning"]:
       values["CF_Lkas_LdwsSysState"] = 3  # permit the warning even for AlwaysOnDM while disengaged
+
+  # The controller permits this temporary display test only while parked and inactive.
+  # Reuse the existing DM warning display state; leave all actuation/lane fields alone.
+  if (CP.carFingerprint == CAR.HYUNDAI_ELANTRA and not CP.flags & (HyundaiFlags.CANFD | HyundaiFlags.SEND_LFA)
+      and type(syswarning_test_value) is int and 0 <= syswarning_test_value <= 6):
+    values["CF_Lkas_SysWarning"] = syswarning_test_value
+    if syswarning_test_value:
+      values["CF_Lkas_LdwsSysState"] = 3
 
   values["CF_Lkas_Chksum"] = 0
 
