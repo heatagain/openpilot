@@ -5512,7 +5512,7 @@ class BoschMirrorBirthHold:
     return mirror, {decision.physical_track_id: decision for decision in decisions}
 
   def update(self, objects, raw_tracks, timestamp_ns, v_ego, yaw_rate_left,
-             *, camera_associations=(), word0_pids=()):
+             *, camera_associations=(), word0_pids=(), live_pids=None):
     self._pending_events = []
     self.last_decisions = ()
     self.would_suppress = frozenset()
@@ -5551,6 +5551,11 @@ class BoschMirrorBirthHold:
         self.hist = (moved[-(BOSCH_MIRROR_BIRTH_HIST_SCANS - 1):]
                      if BOSCH_MIRROR_BIRTH_HIST_SCANS > 1 else [])
     self.last_ns = timestamp_ns
+
+    # Physical IDs are never reused. Keep birth guards for coasting live IDs,
+    # but retired IDs cannot return and need no lifetime-long tombstone.
+    if live_pids is not None:
+      self.seen_births.intersection_update(live_pids)
 
     mirror, decisions = self._mirror_decisions(
       timestamp_ns, v_ego, yaw_rate_left, raw_tracks, objects,
@@ -5866,7 +5871,7 @@ class BoschMirrorM3Shadow:
     return best
 
   def update(self, timestamp_ns, v_ego, mirror_objects, mirror_decisions, *,
-             camera_associations=None, word0_pids=(), mirror_enabled=True):
+             camera_associations=None, word0_pids=(), mirror_enabled=True, live_pids=None):
     """Read M1's current scan result and make an independent SHADOW decision."""
     timestamp_ns = int(timestamp_ns)
     self._pending_events = []
@@ -5892,6 +5897,9 @@ class BoschMirrorM3Shadow:
         self.seen_births.clear()
         self.reset_count += 1
     self.last_ns = timestamp_ns
+
+    if live_pids is not None:
+      self.seen_births.intersection_update(live_pids)
 
     for pid in list(self.holds):
       state = self.holds[pid]
@@ -6579,13 +6587,14 @@ class BoschRadarProvider:
     self.mirror_birth_hold.update(
       qualified, self.tracker.last_raw_tracks, availability_ns, v_ego, yaw_rate_left,
       camera_associations=self.camera_extended.last_associations,
-      word0_pids=processed_pids)
+      word0_pids=processed_pids, live_pids=self.tracker.group_manager.states)
     self.mirror_m3_shadow.update(
       availability_ns, v_ego, self.mirror_birth_hold.last_mirror_objects,
       self.mirror_birth_hold.last_decisions_by_pid,
       camera_associations=self.camera_extended.last_associations,
       word0_pids=processed_pids,
-      mirror_enabled=self.mirror_birth_hold.mode != BOSCH_MIRROR_BIRTH_OFF)
+      mirror_enabled=self.mirror_birth_hold.mode != BOSCH_MIRROR_BIRTH_OFF,
+      live_pids=self.tracker.group_manager.states)
     self.road_edge_filter.update(
       qualified, availability_ns, valid=not self.can_error and not self.wrong_config,
       camera_associations=self.camera_extended.last_associations, word0_pids=processed_pids)

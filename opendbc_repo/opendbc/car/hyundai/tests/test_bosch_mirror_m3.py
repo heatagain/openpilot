@@ -37,6 +37,21 @@ def edge_birth(shadow=None, *, ns=1_000_000_000, candidate=None, parent=None,
 
 
 class TestBoschMirrorM3Shadow:
+  def test_retired_birth_guards_are_pruned_but_coasting_ids_remain(self):
+    shadow = BoschMirrorM3Shadow()
+    shadow.update(1_000_000_000, 12, {1001: obj(y=0)}, {}, live_pids={1001})
+    shadow.update(1_100_000_000, 12, {}, {}, live_pids={1001})
+    assert shadow.seen_births == {1001}
+    shadow.update(1_200_000_000, 12, {}, {}, live_pids=set())
+    assert not shadow.seen_births
+
+  def test_birth_guard_memory_is_bounded_under_continuous_pid_churn(self):
+    shadow = BoschMirrorM3Shadow()
+    for index in range(2000):
+      pid, ns = 1001 + index, 1_000_000_000 + index * 100_000_000
+      shadow.update(ns, 12, {pid: obj(y=0)}, {}, live_pids={pid})
+      assert shadow.seen_births == {pid}
+
   def test_default_is_active_and_other_mode_is_rejected(self):
     assert BoschMirrorM3Shadow().mode == BOSCH_MIRROR_M3_ACTIVE
     with pytest.raises(ValueError):

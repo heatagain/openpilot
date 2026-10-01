@@ -54,6 +54,24 @@ def start_hold():
 
 
 class TestBoschMirrorBirthHold:
+  def test_retired_birth_guards_are_pruned_but_coasting_ids_remain(self):
+    hold = BoschMirrorBirthHold()
+    objects = (physical(1001, 1001, 1_000_000_000, 30, 0, -10, 1),)
+    hold.update(objects, (), 1_000_000_000, 20, 0, live_pids={1001})
+    # A live tracker state can coast without appearing in the current scan.
+    hold.update((), (), 1_100_000_000, 20, 0, live_pids={1001})
+    assert hold.seen_births == {1001}
+    hold.update((), (), 1_200_000_000, 20, 0, live_pids=set())
+    assert not hold.seen_births
+
+  def test_birth_guard_memory_is_bounded_under_continuous_pid_churn(self):
+    hold = BoschMirrorBirthHold()
+    for index in range(2000):
+      pid, ns = 1001 + index, 1_000_000_000 + index * 100_000_000
+      objects = (physical(pid, pid, ns, 30, 0, -10, 1),)
+      hold.update(objects, (), ns, 20, 0, live_pids={pid})
+      assert hold.seen_births == {pid}
+
   def test_default_mode_is_active(self):
     assert BoschMirrorBirthHold().mode == BOSCH_MIRROR_BIRTH_ACTIVE
 
