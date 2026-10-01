@@ -6031,7 +6031,25 @@ class BoschUnsupportedBirthFilter:
     self.enabled = bool(enabled)
     self.last_decisions = {}
 
-  def verdict(self, provider, obj, publication_ns):
+  @staticmethod
+  def _context(provider, publication_ns):
+    context = provider._unsupported_birth_context
+    if context is None or publication_ns is None:
+      return 'MISSING_RECEIVE_CONTEXT', None, None
+    received_ns, ego, yaw, path, path_ns = context
+    if not 0 <= publication_ns - received_ns <= 200_000_000:
+      return 'STALE_EGO_CONTEXT', None, None
+    if not math.isfinite(ego) or ego < 3.0 or yaw is None or not math.isfinite(yaw) or abs(yaw / ego) > .02:
+      return 'MISSING_OR_INVALID_MOTION', None, None
+    if (path_ns is None or not 0 <= publication_ns - path_ns <= 200_000_000 or len(path) < 2
+        or not all(math.isfinite(float(v)) for point in path for v in point)):
+      return 'MISSING_OR_STALE_PATH', None, None
+    scan_ns = provider.last_scan_timestamp_ns
+    if scan_ns is None or not scan_ns <= received_ns <= publication_ns or publication_ns - scan_ns > 150_000_000:
+      return 'STALE_SCAN', None, None
+    return None, context, scan_ns
+
+  def verdict(self, provider, obj, publication_ns, *, _shared=None):
     def keep(reason):
       return {'exclude': False, 'reason': reason}
     if not self.enabled:
@@ -6040,20 +6058,15 @@ class BoschUnsupportedBirthFilter:
       return keep('INVALID_PROVIDER')
     if len(obj.members) != 1 or obj.age_scans != 1:
       return keep('NOT_FIRST_SINGLETON_OBSERVATION')
-    context = provider._unsupported_birth_context
-    if context is None or publication_ns is None:
-      return keep('MISSING_RECEIVE_CONTEXT')
+    if _shared is None:
+      reason, context, scan_ns = self._context(provider, publication_ns)
+    else:
+      if 'context' not in _shared:
+        _shared['context'] = self._context(provider, publication_ns)
+      reason, context, scan_ns = _shared['context']
+    if reason is not None:
+      return keep(reason)
     received_ns, ego, yaw, path, path_ns = context
-    if not 0 <= publication_ns - received_ns <= 200_000_000:
-      return keep('STALE_EGO_CONTEXT')
-    if not math.isfinite(ego) or ego < 3.0 or yaw is None or not math.isfinite(yaw) or abs(yaw / ego) > .02:
-      return keep('MISSING_OR_INVALID_MOTION')
-    if (path_ns is None or not 0 <= publication_ns - path_ns <= 200_000_000 or len(path) < 2
-        or not all(math.isfinite(float(v)) for point in path for v in point)):
-      return keep('MISSING_OR_STALE_PATH')
-    scan_ns = provider.last_scan_timestamp_ns
-    if scan_ns is None or not scan_ns <= received_ns <= publication_ns or publication_ns - scan_ns > 150_000_000:
-      return keep('STALE_SCAN')
     if obj.timestamp_ns != scan_ns:
       return keep('NOT_FIRST_SINGLETON_OBSERVATION')
     member = obj.members[0]
@@ -6077,10 +6090,21 @@ class BoschUnsupportedBirthFilter:
     if (obj.vision_supported or obj.oem_selected or pid in provider._debug_processed_pids
         or (cache.last_ns == scan_ns and prior is not None and prior[0] in (1, 2))):
       return keep('CURRENT_NATIVE_SUPPORT')
-    snapshot = cache.camera.snapshot(publication_ns) if cache.camera is not None else None
+    if _shared is None:
+      snapshot = cache.camera.snapshot(publication_ns) if cache.camera is not None else None
+    else:
+      if 'snapshot' not in _shared:
+        _shared['snapshot'] = cache.camera.snapshot(publication_ns) if cache.camera is not None else None
+      snapshot = _shared['snapshot']
     if snapshot is None or not 0 <= publication_ns - snapshot[3] <= 200_000_000:
       return keep('MISSING_OR_STALE_CAMERA')
-    association = cache._associate(obj, tuple(snapshot[0][:snapshot[1]]), snapshot[1])
+    if _shared is None:
+      candidates = tuple(snapshot[0][:snapshot[1]])
+    else:
+      if 'candidates' not in _shared:
+        _shared['candidates'] = tuple(snapshot[0][:snapshot[1]])
+      candidates = _shared['candidates']
+    association = cache._associate(obj, candidates, snapshot[1])
     if association[0] in (1, 2):
       return keep('CURRENT_A0_SUPPORTED_OR_AMBIGUOUS')
     return {'exclude': True, 'reason': 'MOVING_FIRST_SINGLETON_OFFPATH_CURRENTLY_UNSUPPORTED',
@@ -6090,11 +6114,17 @@ class BoschUnsupportedBirthFilter:
 
   def publication_view(self, provider, objects, publication_ns):
     self.last_decisions = {}
-    if not self.enabled:
+    if not self.enabled or not objects or provider.can_error or provider.wrong_config:
       return objects
+    # Reuse only within this synchronous publication. A second publication,
+    # even at the same timestamp, must read changed path/camera support again.
+    shared = {}
     kept = []
     for obj in objects:
-      decision = self.verdict(provider, obj, publication_ns)
+      if obj.age_scans != 1 or len(obj.members) != 1:
+        kept.append(obj)
+        continue
+      decision = self.verdict(provider, obj, publication_ns, _shared=shared)
       if decision['exclude']:
         self.last_decisions[obj.physical_track_id] = decision
       else:

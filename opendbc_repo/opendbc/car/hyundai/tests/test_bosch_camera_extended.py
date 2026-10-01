@@ -1970,3 +1970,46 @@ def test_real_radar_interface_control_input_filters_bosch_and_keeps_scc(monkeypa
   assert len(unfiltered.points)==2
   assert unfiltered.points[0].to_dict()==filtered.points[0].to_dict()
   assert unfiltered.points[1].trackId==32 and unfiltered.points[1].radarSource=='frontRadar'
+
+
+def test_unsupported_birth_skips_verdict_for_existing_objects(monkeypatch):
+  p, obj = _unsupported_birth_fixture()
+  established = replace(obj, age_scans=2)
+  monkeypatch.setattr(p.unsupported_birth, 'verdict', lambda *args, **kwargs: pytest.fail('No birth verdict needed'))
+  objects = (established,)
+  assert _unsupported_birth_view(p, objects) is objects
+
+
+def test_unsupported_birth_reuses_snapshot_only_within_publication():
+  p, obj = _unsupported_birth_fixture()
+  other = replace(obj, physical_track_id=1000002)
+  calls = []
+  p.camera_extended.camera.snapshot = lambda ns: calls.append(ns) or ((), 0, 0, _UNSUPPORTED_BIRTH_NS)
+  assert not _unsupported_birth_view(p, (obj, other))
+  assert len(calls) == 1
+  assert not _unsupported_birth_view(p, (obj, other))
+  assert len(calls) == 2
+
+
+def test_unsupported_birth_same_time_changed_camera_is_read_again():
+  p, obj = _unsupported_birth_fixture()
+  assert not _unsupported_birth_view(p, (obj,))
+  p.camera_extended.camera.snapshot = lambda ns: ((object(),), 1, 0, _UNSUPPORTED_BIRTH_NS)
+  p.camera_extended._associate = lambda *args: (1, 0, 0)
+  assert _unsupported_birth_view(p, (obj,)) == (obj,)
+  assert not p.unsupported_birth.last_decisions
+
+
+def test_unsupported_birth_same_time_changed_path_is_read_again():
+  p, obj = _unsupported_birth_fixture()
+  assert not _unsupported_birth_view(p, (obj,))
+  context = list(p._unsupported_birth_context)
+  context[3] = ((0., -4.), (160., -4.))
+  p._unsupported_birth_context = tuple(context)
+  assert _unsupported_birth_view(p, (obj,)) == (obj,)
+
+
+def test_unsupported_birth_duplicate_pid_keeps_unexcluded_object():
+  p, obj = _unsupported_birth_fixture()
+  established = replace(obj, age_scans=2)
+  assert _unsupported_birth_view(p, (obj, established)) == (established,)
