@@ -2162,6 +2162,9 @@ class BoschGroupingConfig:
   coast_s: float = .3
   first_physical_id: int = 1_000_000
   provisional_enabled: bool = True
+  # Experimental SHAPE_MEMORY_2000 port. Recorded morphology is not physical
+  # identity evidence; leave disabled until independent identity controls pass.
+  mature_retention_enabled: bool = False
   provisional_min_distance_m: float = 1.0
   provisional_max_distance_m: float = 2.0
   provisional_max_lateral_m: float = .25
@@ -2173,9 +2176,9 @@ class BoschGroupingConfig:
 
   def __post_init__(self):
     for name, value in vars(self).items():
-      if name == 'provisional_enabled':
+      if name in ('provisional_enabled', 'mature_retention_enabled'):
         if not isinstance(value, bool):
-          raise ValueError('provisional_enabled must be boolean')
+          raise ValueError(f'{name} must be boolean')
         continue
       if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
         raise ValueError(f'{name} must be positive and finite')
@@ -2475,11 +2478,188 @@ def _bosch_physical_assignment(row_edges, column_edges):
   return assignment
 
 
+@dataclass
+class _BoschMatureGroupCertificate:
+  start_ns: int
+  last_strict_ns: int
+  ages: tuple[int, ...]
+  history: list[tuple[int, dict[tuple[int, int], tuple[float, float]]]] = field(default_factory=list)
+  ready: bool = False
+
+
+class _BoschMatureGroupRetention:
+  """Bounded morphology memory for exact raw families, never PID ownership.
+
+  Only an exact group present in the previous scan may receive extra edges.
+  Archived certificates can resume only after a natural strict rejoin. They
+  contain no physical-object state or history and do not alter strict evidence.
+  This experimental policy reproduces SHAPE_MEMORY_2000, not physical identity.
+  """
+  MATURITY_NS = 2_000_000_000
+  LEASE_NS = 2_000_000_000
+  MEMORY_NS = 3_000_000_000
+  LIVE_MAX = 16
+  ARCHIVE_MAX = 64
+  HISTORY_MAX = 21
+
+  def __init__(self):
+    self.families: dict[tuple[int, ...], _BoschMatureGroupCertificate] = {}
+    self.suspended: dict[tuple[int, ...], _BoschMatureGroupCertificate] = {}
+    self.last_raw_ages: dict[int, int] = {}
+    self.now_ns: int | None = None
+    self.stats = Counter()
+    self.events: list[dict] = []
+    self.peak = self.archive_peak = 0
+
+  @staticmethod
+  def _pairs(family: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
+    return tuple((a, b) for index, a in enumerate(family) for b in family[index+1:])
+
+  def _veto(self, certificate: _BoschMatureGroupCertificate, pairs: tuple[tuple[int, int], ...],
+            offsets: dict[tuple[int, int], tuple[float, float]], live: dict[int, BoschRawTrack],
+            config: BoschGroupingConfig, v_ego: float) -> str | None:
+    for a, b in pairs:
+      ra, rb = live[a], live[b]
+      dd, dy = map(abs, offsets[(a, b)])
+      speeds = (abs(ra.v_rel+v_ego), abs(rb.v_rel+v_ego))
+      if dd > config.distance_diameter_m+.25 or dy > config.lateral_diameter_m+.03125:
+        return 'extent_veto'
+      if (abs(ra.v_rel-rb.v_rel) > .5 or
+          (math.isfinite(v_ego) and min(speeds) <= config.stationary_speed_mps and
+           max(speeds) >= config.moving_speed_mps)):
+        return 'motion_veto'
+      if certificate.history:
+        historical = [entry[1][(a, b)] for entry in certificate.history]
+        recent = [entry[1][(a, b)] for entry in certificate.history
+                  if entry[0] >= certificate.last_strict_ns-round(config.evidence_window_s*1e9)]
+        component_unstable = (
+          dd-min(abs(p[0]) for p in historical) > config.max_relative_distance_growth_m+.25 or
+          dy-min(abs(p[1]) for p in historical) > config.max_relative_lateral_growth_m+.1875)
+        if not recent:
+          return 'separation_reference_missing_veto'
+        if component_unstable and math.hypot(dd, dy) > max(math.hypot(*p) for p in recent)+.25:
+          return 'shape_growth_veto'
+    return None
+
+  def before(self, manager: 'BoschObjectGroupManager', timestamp_ns: int,
+             raw_tracks: tuple[BoschRawTrack, ...], compatible: list[int],
+             pair_cost: list[float], raw_index: dict[int, int], v_ego: float) -> None:
+    config = manager.config
+    live = {raw.raw_track_id: raw for raw in raw_tracks}
+    raw_ids = set(live)
+    previous_groups = [{member.raw_track_id for member in state.observation.members}
+                       for state in manager.states.values()]
+    self.events = []
+    if self.now_ns is not None and timestamp_ns-self.now_ns > round(config.pair_max_gap_s*1e9):
+      self.suspended.clear()
+      self.last_raw_ages.clear()
+      self.families.clear()
+      self.stats['gap_resets'] += 1
+    self.now_ns = timestamp_ns
+    broken = {rid for rid, raw in live.items()
+              if rid in self.last_raw_ages and raw.age_scans <= self.last_raw_ages[rid]}
+    for family in tuple(self.suspended):
+      certificate = self.suspended[family]
+      if (not set(family).issubset(raw_ids) or broken.intersection(family) or
+          timestamp_ns-certificate.last_strict_ns > self.MEMORY_NS or
+          any(group.intersection(family) and not group.issubset(family) for group in previous_groups)):
+        del self.suspended[family]
+        self.stats['suspended_certificate_pruned'] += 1
+    previous = {tuple(sorted(group)) for group in previous_groups if len(group) >= 2}
+    for family in previous:
+      if family not in self.families and family in self.suspended:
+        self.families[family] = copy.deepcopy(self.suspended[family])
+        self.stats['natural_rejoin_certificate_reused'] += 1
+    self.families = {family: cert for family, cert in self.families.items() if family in previous}
+    n = len(raw_tracks)
+    for family in sorted(previous):
+      if not all(rid in live for rid in family):
+        self.families.pop(family, None)
+        self.stats['missing_member_veto'] += 1
+        continue
+      indices = tuple(raw_index[rid] for rid in family)
+      pairs = self._pairs(family)
+      strict = all(compatible[raw_index[a]] & (1 << raw_index[b]) for a, b in pairs)
+      certificate = self.families.get(family)
+      ages = tuple(live[rid].age_scans for rid in family)
+      if certificate and any(age <= old for age, old in zip(ages, certificate.ages, strict=False)):
+        certificate = None
+        self.families.pop(family, None)
+        self.stats['age_rollback_veto'] += 1
+      offsets = {pair: (live[pair[0]].d_rel-live[pair[1]].d_rel,
+                        live[pair[0]].y_rel-live[pair[1]].y_rel) for pair in pairs}
+      if strict:
+        if certificate is None:
+          certificate = _BoschMatureGroupCertificate(timestamp_ns, timestamp_ns, ages)
+          self.families[family] = certificate
+        certificate.last_strict_ns = timestamp_ns
+        certificate.ready = certificate.ready or timestamp_ns-certificate.start_ns >= self.MATURITY_NS
+        certificate.ages = ages
+        certificate.history.append((timestamp_ns, offsets))
+        certificate.history = certificate.history[-self.HISTORY_MAX:]
+        continue
+      if not certificate or not certificate.ready:
+        self.stats['maturity_veto'] += 1
+        self.families.pop(family, None)
+        continue
+      certificate.ages = ages
+      elapsed = timestamp_ns-certificate.last_strict_ns
+      if elapsed > self.LEASE_NS:
+        self.stats['lease_expiry_veto'] += 1
+        self.families.pop(family, None)
+        continue
+      reason = self._veto(certificate, pairs, offsets, live, config, v_ego)
+      if reason is None:
+        for outsider in raw_tracks:
+          if outsider.raw_track_id in family:
+            continue
+          outsider_index = raw_index[outsider.raw_track_id]
+          if any(compatible[index] & (1 << outsider_index) for index in indices):
+            reason = 'strict_competitor_veto'
+            break
+          if any(abs(outsider.d_rel-live[rid].d_rel) <= 5.0 and
+                 abs(outsider.y_rel-live[rid].y_rel) <= 2.0 and
+                 abs(outsider.v_rel-live[rid].v_rel) <= 1.0 for rid in family):
+            reason = 'near_competitor_veto'
+            break
+      if reason:
+        self.stats[reason] += 1
+        self.families.pop(family, None)
+        continue
+      added = []
+      for a, b in pairs:
+        i, j = raw_index[a], raw_index[b]
+        if not compatible[i] & (1 << j):
+          compatible[i] |= 1 << j
+          compatible[j] |= 1 << i
+          pair_cost[i*n+j] = pair_cost[j*n+i] = (
+            abs(live[a].d_rel-live[b].d_rel)/config.distance_diameter_m +
+            abs(live[a].y_rel-live[b].y_rel)/config.lateral_diameter_m +
+            abs(live[a].v_rel-live[b].v_rel)/config.velocity_diameter_mps)
+          added.append((a, b))
+      self.events.append({'ns': timestamp_ns, 'family': family, 'added': added, 'lease_ms': elapsed/1e6})
+      self.stats['retained_group_scans'] += 1
+      self.stats['retained_edges'] += len(added)
+    self.peak = max(self.peak, len(self.families))
+    if len(self.families) > self.LIVE_MAX:
+      raise AssertionError('nonexclusive family certificate')
+    for family, certificate in self.families.items():
+      if certificate.ready:
+        self.suspended[family] = copy.deepcopy(certificate)
+    if len(self.suspended) > self.ARCHIVE_MAX:
+      self.suspended = dict(sorted(self.suspended.items(),
+                                   key=lambda item: (-item[1].last_strict_ns, item[0]))[:self.ARCHIVE_MAX])
+    self.last_raw_ages = {rid: raw.age_scans for rid, raw in live.items()}
+    self.archive_peak = max(self.archive_peak, len(self.suspended))
+    self.peak = max(self.peak, len(self.families)+len(self.suspended))
+
+
 class BoschObjectGroupManager:
   """Temporal complete-link grouping followed by global physical-ID assignment.
 
-  Every pair in a cluster must satisfy the full geometry, motion-band and
-  temporal evidence constraints. There is no transitive single-link merge.
+  Formation requires strict geometry, motion-band and temporal pair evidence.
+  An opt-in mature exact-family policy can retain bounded morphology edges;
+  complete-link still applies. There is no transitive single-link merge.
   Existing raw membership and representative continuity preserve the physical
   ID. OEM selection never establishes identity or creates an extra point.
   """
@@ -2493,6 +2673,7 @@ class BoschObjectGroupManager:
     self.last_pair_possible = self.last_pair_candidates = 0
     self.last_conflicts = self.last_direct_carries = self.last_multi_count = 0
     self.provisional_bundles: dict[tuple[int, int], _BoschProvisionalBundleState] = {}
+    self.mature_retention = _BoschMatureGroupRetention() if self.config.mature_retention_enabled else None
     self.provisional_hidden: dict[int, int] = {}
     self.provisional_pid_pairs: dict[tuple[int, int], tuple[int, int]] = {}
     self.last_provisional_decisions: tuple[BoschProvisionalBundleDecision, ...] = ()
@@ -2763,6 +2944,8 @@ class BoschObjectGroupManager:
     self.stats['pair_rejected_velocity_diameter'] += velocity_rejections
     self.stats['pair_rejected_stationary_moving_conflict'] += motion_rejections
 
+    if self.mature_retention is not None:
+      self.mature_retention.before(self, timestamp_ns, raw_tracks, compatible, pair_cost, raw_index, v_ego)
     owner = {rid: pid for pid, state in self.states.items() for rid in state.member_last_seen}
     previous = sorted(self.states)
     owner_bits = {pid: 1 << i for i, pid in enumerate(previous)}
@@ -6229,11 +6412,13 @@ class BoschRadarProvider:
                provisional_bundle=True, family_companion_mode=BOSCH_FAMILY_COMPANION_MODE,
                burst_multireturn_mode=BOSCH_BURST_MULTIRETURN_MODE,
                b5_mode=BOSCH_B5_MODE, sidepass_lateral_mode=BOSCH_SIDEPASS_LATERAL_MODE,
-               mirror_birth_mode=BOSCH_MIRROR_BIRTH_MODE, unsupported_birth=True):
+               mirror_birth_mode=BOSCH_MIRROR_BIRTH_MODE, unsupported_birth=True,
+               mature_group_retention=False):
     self.bus = bus
     self.camera_bus = camera_bus
     self.scc_bus = scc_bus
-    self.tracker = BoschPhysicalTracker(group_config=BoschGroupingConfig(provisional_enabled=provisional_bundle))
+    self.tracker = BoschPhysicalTracker(group_config=BoschGroupingConfig(
+      provisional_enabled=provisional_bundle, mature_retention_enabled=mature_group_retention))
     self.camera_extended = BoschCameraExtendedGrouping(camera_extended_mode, curve_reacquire_mode)
     self.publication_aliases = BoschPublicationAliasAllocator()
     self.qualifier = _BoschPublicationPassThrough() if qualification else None

@@ -55,6 +55,7 @@ jobs:
         run: |
           python -m pytest -o addopts='' -q \
             opendbc_repo/opendbc/car/hyundai/tests/test_radar.py \
+            opendbc_repo/opendbc/car/hyundai/tests/test_bosch_mature_retention.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_bosch_camera_extended.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_bosch_mirror_birth.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_bosch_mirror_m3.py \
