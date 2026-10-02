@@ -191,3 +191,88 @@ def test_thirty_two_raws_produce_at_most_sixteen_live_family_certificates():
   assert len(retention.families) == len(retention.suspended) == 16
   assert len(retention.last_raw_ages) == 32
   assert all(len(cert.history) == 21 for cert in retention.families.values())
+
+
+def test_certificate_clone_isolates_mutable_containers_and_field_assignments():
+  certificate = mature().mature_retention.families[(1, 2)]
+  before = pickle.dumps(certificate)
+  cloned = certificate.clone()
+  assert cloned == certificate and cloned is not certificate
+  assert cloned.ages is certificate.ages
+  assert cloned.history is not certificate.history
+  for original_entry, cloned_entry in zip(certificate.history, cloned.history, strict=True):
+    assert cloned_entry is not original_entry and cloned_entry[1] is not original_entry[1]
+    for pair, offset in original_entry[1].items():
+      assert next(key for key in cloned_entry[1] if key == pair) is pair
+      assert cloned_entry[1][pair] is offset
+  cloned.history[0][1][(1, 2)] = (999., -0.)
+  cloned.history.append((0, {}))
+  cloned.start_ns = cloned.last_strict_ns = 0
+  cloned.ages = (0, 0)
+  cloned.ready = False
+  assert pickle.dumps(certificate) == before
+  cloned_before = pickle.dumps(cloned)
+  certificate.history[1][1].clear()
+  certificate.history.pop()
+  certificate.ages = (1, 1)
+  certificate.ready = False
+  assert pickle.dumps(cloned) == cloned_before
+
+
+def test_certificate_clone_preserves_repeated_internal_history_aliases():
+  offsets = {(1, 2): (-0., 1.5)}
+  entry = (STEP, offsets)
+  certificate = _BoschMatureGroupCertificate(0, STEP, (1, 1), [entry, entry, (2*STEP, offsets)], True)
+  cloned = certificate.clone()
+  assert cloned == certificate
+  assert cloned.history[0] is cloned.history[1]
+  assert cloned.history[0][1] is cloned.history[2][1]
+  assert cloned.history[0] is not entry and cloned.history[0][1] is not offsets
+  cloned.history[0][1][(1, 2)] = (2., 3.)
+  assert cloned.history[2][1][(1, 2)] == (2., 3.)
+  assert offsets == {(1, 2): (-0., 1.5)}
+
+
+def test_manager_deepcopy_and_pickle_keep_certificate_graph_isolated():
+  import copy
+  manager = mature()
+  before = pickle.dumps(manager.__dict__)
+  copied = copy.deepcopy(manager)
+  assert pickle.dumps(copied.__dict__) == before
+  copied.mature_retention.families[(1, 2)].history[0][1].clear()
+  copied.mature_retention.families[(1, 2)].ages = (0, 0)
+  copied.mature_retention.stats['probe'] += 1
+  assert pickle.dumps(manager.__dict__) == before
+  restored = pickle.loads(pickle.dumps(manager))
+  assert pickle.dumps(restored.__dict__) == before
+
+
+def test_id_overflow_staging_preserves_certificate_transactions():
+  manager = mature()
+  pid = next(iter(manager.states))
+  manager.next_id = 2**31-1
+  # The overflow guard must stage this carry update, without needing a new ID.
+  assert update(manager, 31)[0].physical_track_id == pid
+  before = pickle.dumps(manager.__dict__)
+  with pytest.raises(OverflowError, match='physical Int32 ID space exhausted'):
+    manager.update(32*STEP, (raw(3, 32, 100.), raw(4, 32, 150.)), v_ego=10.)
+  assert pickle.dumps(manager.__dict__) == before
+
+
+def test_archive_and_natural_rejoin_preserve_mutable_snapshot_isolation():
+  manager = mature()
+  retention = manager.mature_retention
+  for scan, dd in ((31, 3.5), (32, 2.8), (33, 2.8), (34, 2.8), (35, 3.125)):
+    update(manager, scan, dd)
+  assert retention.stats['natural_rejoin_certificate_reused'] == 1
+  live = retention.families[(1, 2)]
+  archived = retention.suspended[(1, 2)]
+  assert live.history is not archived.history
+  assert all(a[1] is not b[1] for a, b in zip(live.history, archived.history, strict=True))
+  before = pickle.dumps(archived)
+  live.history[0][1].clear()
+  live.history.pop()
+  assert pickle.dumps(archived) == before
+  live_before = pickle.dumps(live)
+  archived.history[1][1].clear()
+  assert pickle.dumps(live) == live_before

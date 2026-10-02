@@ -35,6 +35,26 @@ representative 선택 및 common ancestry 경로는 유지했습니다. 실험 �
   현재 raw age 32개로 제한합니다. archive 초과 시 마지막 strict 시각의 최신순,
   family tuple 순으로 결정적으로 남깁니다.
 
+## 인증서 snapshot 복사 최적화
+
+Archive 저장과 자연 재합류 복원에서는 typed `clone()`으로 인증서를 복사합니다.
+History list와 각 offsets dict는 별도로 복사하고, 반복된 entry/dict의 내부 참조는
+보존합니다. Producer가 만드는 int/float tuple 등 immutable leaf는 공유합니다.
+임의 subclass, 추가 attribute 또는 mutable leaf에 대한 일반 `deepcopy` 대체는
+아닙니다. Int32 overflow의 manager transaction staging은 기존 `deepcopy`를 유지합니다.
+Retention 조건, history 값, PID 소유권, 기본 OFF 정책은 바뀌지 않습니다.
+
+후속 `20261003_bosch_group_certificate_perf_v6` 검증에서 affected 148파일의
+88,821 records 및 최신 Route2ee 34파일의 연속 19,936 records를 비교했습니다.
+Route2ee는 최초 cold start 1회와 상태를 유지한 파일 경계 33개를 포함합니다.
+Provider/certificate/owner/stats/events 및 전체 lead IEEE 값의 불일치는 0입니다.
+Mutable snapshot 격리, 반복 내부 alias, manager serialization과 overflow transaction을
+검사하는 5개 회귀 테스트를 추가해 집중 테스트는 총 28개입니다.
+
+32-return 4×8 구성의 같은 입력 paired desktop WSL 측정에서 manager 중앙값은
+7.564ms에서 2.412ms로 줄었습니다. 다른 연구가 함께 실행된 desktop 측정이며,
+실차 CPU·scheduling deadline 또는 물리 객체 동일성 검증을 대신하지 않습니다.
+
 ## 검증과 근거
 
 새 결과 디렉터리는

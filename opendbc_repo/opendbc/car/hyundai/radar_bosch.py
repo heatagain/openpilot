@@ -2486,6 +2486,20 @@ class _BoschMatureGroupCertificate:
   history: list[tuple[int, dict[tuple[int, int], tuple[float, float]]]] = field(default_factory=list)
   ready: bool = False
 
+  def clone(self) -> '_BoschMatureGroupCertificate':
+    # Copy mutable containers, preserving repeated history references.
+    offsets_memo = {}
+    entries_memo = {}
+    history = []
+    for entry in self.history:
+      if id(entry) not in entries_memo:
+        ns, offsets = entry
+        if id(offsets) not in offsets_memo:
+          offsets_memo[id(offsets)] = offsets.copy()
+        entries_memo[id(entry)] = (ns, offsets_memo[id(offsets)])
+      history.append(entries_memo[id(entry)])
+    return _BoschMatureGroupCertificate(self.start_ns, self.last_strict_ns, self.ages, history, self.ready)
+
 
 class _BoschMatureGroupRetention:
   """Bounded morphology memory for exact raw families, never PID ownership.
@@ -2568,7 +2582,7 @@ class _BoschMatureGroupRetention:
     previous = {tuple(sorted(group)) for group in previous_groups if len(group) >= 2}
     for family in previous:
       if family not in self.families and family in self.suspended:
-        self.families[family] = copy.deepcopy(self.suspended[family])
+        self.families[family] = self.suspended[family].clone()
         self.stats['natural_rejoin_certificate_reused'] += 1
     self.families = {family: cert for family, cert in self.families.items() if family in previous}
     n = len(raw_tracks)
@@ -2645,7 +2659,7 @@ class _BoschMatureGroupRetention:
       raise AssertionError('nonexclusive family certificate')
     for family, certificate in self.families.items():
       if certificate.ready:
-        self.suspended[family] = copy.deepcopy(certificate)
+        self.suspended[family] = certificate.clone()
     if len(self.suspended) > self.ARCHIVE_MAX:
       self.suspended = dict(sorted(self.suspended.items(),
                                    key=lambda item: (-item[1].last_strict_ns, item[0]))[:self.ARCHIVE_MAX])
