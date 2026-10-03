@@ -137,6 +137,26 @@ class TestBoschCameraCycleCache:
 
 
 class TestBoschCameraAssociationAndGeometry:
+  def test_retained_scan_camera_scalars_survive_ring_reuse_and_expire(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_PUBLICATION)
+    start = 1_000_000_000
+    initial = (7, 14., 0., 0., 2.5, 1, 0, -.06, .06)
+    for cycle in range(2):
+      feed(grouping.camera, start + cycle * 40_000_000, cycle, [initial])
+    scan = start + 50_000_000
+    objects = (physical(1_000_100, 12.5, ns=scan), physical(1_000_101, 18.5, ns=scan))
+    grouping.update(scan, objects, 10.)
+    episode, retained = next(iter(grouping.last_camera_by_episode.items()))
+    scan_values = replace(retained)
+    changed = (7, 15., .25, 1., 1.9, 6, 0, -.05, .05)
+    for cycle in range(2, 7):
+      feed(grouping.camera, start + cycle * 40_000_000, cycle, [changed])
+    # Reusing the producer's ring must not change the association's scan values.
+    assert grouping.last_camera_by_episode[episode] == scan_values
+    assert retained == scan_values
+    grouping.update(start + 500_000_000, (), 10.)
+    assert grouping.last_camera_by_episode == {}
+
   def test_a0_many_to_one_and_ambiguous(self):
     # cam 20 m, 폭 1.70 m. 창은 양쪽 모두 1.75 + 0.12*d_rel 이고, 더 이상
     # "카메라가 더 멀 때만" 허용하지 않는다.

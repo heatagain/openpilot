@@ -1123,7 +1123,7 @@ class BoschCameraExtendedGrouping:
     camera_count = 0
     if snapshot is not None:
       camera_objects, camera_count, _, _ = snapshot
-      camera_by_episode = {camera_objects[index].episode: camera_objects[index] for index in range(camera_count)}
+      camera_by_episode = {camera_objects[index].episode: copy.copy(camera_objects[index]) for index in range(camera_count)}
       self._curve_history_prepare(timestamp_ns, by_pid, camera_objects, camera_count)
       # The frozen shadow definition runs the normal A0 gate for every live
       # physical PID. Extra baseline verdicts seed history only; they are not
