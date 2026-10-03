@@ -1,4 +1,7 @@
+import gc
 import math
+import sys
+import weakref
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -3538,3 +3541,43 @@ def test_bosch_names_are_identity_reexported():
     'BoschRadarProvider',
   )
   assert all(getattr(radar_interface_module, name) is getattr(radar_bosch_module, name) for name in names)
+
+
+@pytest.mark.parametrize('solver', [radar_bosch_module._bosch_raw_unique_component, radar_bosch_module._bosch_physical_component])
+@pytest.mark.parametrize('outcome', ['unique', 'tie', 'exception'])
+def test_recursive_matching_releases_closure_with_gc_disabled(solver, outcome):
+  refs = []
+  previous_profile = sys.getprofile()
+  previously_enabled = gc.isenabled()
+
+  def observe(frame, event, arg):
+    if event == 'call' and frame.f_code.co_name == 'solve' and frame.f_back.f_code is solver.__code__:
+      refs.append(weakref.ref(frame.f_back.f_locals['solve']))
+      if outcome == 'exception':
+        raise RuntimeError('injected solver failure')
+
+  def run():
+    edges = [[(0, .1), (1, .1)], [(0, .1), (1, .05 if outcome == 'unique' else .1)]]
+    columns = [[(0, .1), (1, .1)], [(0, .1), (1, edges[1][1][1])]]
+    if solver is radar_bosch_module._bosch_raw_unique_component:
+      return solver([0, 1], [0, 1], edges, columns, 1.)
+    # A unique physical optimum uses the larger score; the same fixture has one.
+    return solver([0, 1], [0, 1], edges, columns, 1e-12)
+
+  try:
+    gc.disable()
+    for _ in range(100):
+      sys.setprofile(observe)
+      if outcome == 'exception':
+        with pytest.raises(RuntimeError, match='injected solver failure'):
+          run()
+      else:
+        result = run()
+        assert (result is None) == (outcome == 'tie')
+      sys.setprofile(previous_profile)
+    assert len(refs) == 100
+    assert all(ref() is None for ref in refs)
+  finally:
+    sys.setprofile(previous_profile)
+    if previously_enabled:
+      gc.enable()

@@ -1804,7 +1804,11 @@ def _bosch_raw_unique_component(rows, columns, row_edges, column_edges, unmatche
     memo[key] = result
     return result
 
-  best, second, matching = solve(0, 0)
+  try:
+    best, second, matching = solve(0, 0)
+  finally:
+    # Break the recursive closure cycle even when process-wide GC is disabled.
+    solve = None
   return dict(matching) if best - second > margin else None
 
 
@@ -2434,7 +2438,11 @@ def _bosch_physical_component(rows, columns, row_edges, column_edges, margin):
     memo[key] = result
     return result
 
-  best, second, matching = solve(0, 0)
+  try:
+    best, second, matching = solve(0, 0)
+  finally:
+    # Break the recursive closure cycle even when process-wide GC is disabled.
+    solve = None
   return dict(matching) if best-second > margin else None
 
 
