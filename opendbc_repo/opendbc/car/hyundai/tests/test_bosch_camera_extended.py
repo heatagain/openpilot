@@ -1,4 +1,5 @@
 import math
+import sys
 from dataclasses import replace
 from types import SimpleNamespace as NS
 
@@ -1873,10 +1874,30 @@ def _unsupported_birth_fixture():
   return p, obj
 
 
+@pytest.fixture
+def birth_and_corner_gates(monkeypatch):
+  """Exercise the retained birth/corner mechanisms at fixture range.
+
+  Production keeps the birth guard off and limits the corner gate to far points."""
+  module = sys.modules[BoschRadarProvider.__module__]
+  monkeypatch.setattr(module, 'BOSCH_UNSUPPORTED_BIRTH_PUBLICATION', True)
+  monkeypatch.setattr(module, 'BOSCH_SURFACE_CORNER_GATE', True)
+  monkeypatch.setattr(module, 'BOSCH_SURFACE_CORNER_MIN_RANGE_M', 0.)
+
+
+def test_default_publication_keeps_unsupported_first_singleton(monkeypatch):
+  p, obj = _unsupported_birth_fixture()
+  monkeypatch.setattr(p.unsupported_birth, 'verdict', lambda *args, **kwargs: pytest.fail('Birth is off; no corner edge'))
+  objects = (obj,)
+  assert p.publication_view(objects, _UNSUPPORTED_BIRTH_NS + 50_000_000) == objects
+  assert not p.unsupported_birth.last_decisions
+
+
 def _unsupported_birth_view(p, objects, ns=_UNSUPPORTED_BIRTH_NS + 50_000_000):
   return p.unsupported_birth.publication_view(p, objects, ns)
 
 
+@pytest.mark.usefixtures('birth_and_corner_gates')
 def test_actual_provider_final_publication_and_native_array_exclude_first_scan():
   p, obj = _unsupported_birth_fixture()
   assert p.publication_view((obj,), _UNSUPPORTED_BIRTH_NS + 50_000_000) == ()
@@ -1970,6 +1991,7 @@ def test_off_switch_retains_identity_alias_and_nan_fields():
   assert math.isnan(msg.points[0].aLead) and math.isnan(msg.points[0].yvRel)
 
 
+@pytest.mark.usefixtures('birth_and_corner_gates')
 def test_real_radar_interface_control_input_filters_bosch_and_keeps_scc(monkeypatch):
   from opendbc.car.hyundai.radar_interface import RadarInterface
   from opendbc.car.interfaces import RadarInterfaceBase
@@ -2040,6 +2062,7 @@ def _publication_edge_model(width=2., std=.1):
                        NS(x=(0., 160.), y=(width, width))], roadEdgeStds=(std, std))
 
 
+@pytest.mark.usefixtures('birth_and_corner_gates')
 def test_current_native_edge_excludes_established_unsupported_point_without_track_or_alias_change():
   p, obj = _unsupported_birth_fixture()
   obj = replace(obj, age_scans=20)
@@ -2055,6 +2078,7 @@ def test_current_native_edge_excludes_established_unsupported_point_without_trac
   assert p.publication_aliases.physical_to_alias == {1000001: 32}
 
 
+@pytest.mark.usefixtures('birth_and_corner_gates')
 @pytest.mark.parametrize('protection', ['vision', 'oem', 'word0', 'camera', 'ambiguous_camera',
                                       'corridor', 'stationary', 'ambiguous_raw', 'competing_raw',
                                       'coasted_raw', 'missing_pose', 'disabled'])
@@ -2082,6 +2106,7 @@ def test_current_native_edge_preserves_supported_or_uncertain_points(protection)
   assert p.publication_view(objects, ns) == objects
 
 
+@pytest.mark.usefixtures('birth_and_corner_gates')
 def test_current_native_edge_rereads_support_and_model_even_at_same_publication_time():
   p, obj = _unsupported_birth_fixture()
   obj = replace(obj, age_scans=20)
@@ -2100,6 +2125,7 @@ def test_current_native_edge_rereads_support_and_model_even_at_same_publication_
   assert p.publication_view((obj,), ns) == (obj,)
 
 
+@pytest.mark.usefixtures('birth_and_corner_gates')
 @pytest.mark.parametrize('model_ns', [_UNSUPPORTED_BIRTH_NS - 200_000_001,
                                    _UNSUPPORTED_BIRTH_NS + 50_000_001])
 def test_current_native_edge_missing_stale_or_future_model_keeps_point(model_ns):
@@ -2111,6 +2137,7 @@ def test_current_native_edge_missing_stale_or_future_model_keeps_point(model_ns)
   assert p.publication_view((obj,), ns) == (obj,)
 
 
+@pytest.mark.usefixtures('birth_and_corner_gates')
 def test_current_native_edge_uses_projected_float32_point_not_unprojected_anchor():
   p, obj = _unsupported_birth_fixture()
   obj = replace(obj, age_scans=20, y_rel=4.025)
@@ -2138,6 +2165,7 @@ def test_native_surface_helper_exactly_matches_capnp_rounding_and_signed_zero():
     struct.pack('<f', getattr(actual, field)) for field in ('dRel', 'yRel', 'vRel')]
 
 
+@pytest.mark.usefixtures('birth_and_corner_gates')
 def test_current_native_edge_real_interface_preserves_scc_control_point(monkeypatch):
   from opendbc.car.hyundai.radar_interface import RadarInterface
   from opendbc.car.interfaces import RadarInterfaceBase
@@ -2182,6 +2210,7 @@ def _far_corner_fixture(side=1):
   return p, obj, ns, model
 
 
+@pytest.mark.usefixtures('birth_and_corner_gates')
 @pytest.mark.parametrize('side', (1, -1))
 def test_far_corner_uses_confident_exterior_despite_uncertain_opposite_edge(side):
   p, obj, ns, model = _far_corner_fixture(side)
@@ -2192,6 +2221,7 @@ def test_far_corner_uses_confident_exterior_despite_uncertain_opposite_edge(side
   assert p.publication_view((obj,), ns) == (obj,)
 
 
+@pytest.mark.usefixtures('birth_and_corner_gates')
 @pytest.mark.parametrize('change', ('near_curve', 'opposite_yaw', 'opposite_path',
     'uncertain_exterior', 'invalid_opposite', 'crossed_edges', 'future', 'stale', 'tied_raw'))
 def test_far_corner_keeps_without_independent_current_geometry(change):
@@ -2212,6 +2242,7 @@ def test_far_corner_keeps_without_independent_current_geometry(change):
   assert p.publication_view((obj,), ns) == (obj,)
 
 
+@pytest.mark.usefixtures('birth_and_corner_gates')
 def test_far_corner_invalid_current_sample_cannot_reuse_previous_good_edge():
   p, obj, ns, model = _far_corner_fixture()
   assert not p.publication_view((obj,), ns)
@@ -2220,11 +2251,53 @@ def test_far_corner_invalid_current_sample_cannot_reuse_previous_good_edge():
   assert p.publication_view((obj,), ns) == (obj,)
 
 
+@pytest.mark.usefixtures('birth_and_corner_gates')
 def test_far_corner_distinguishes_competing_edges_from_a_tied_assignment():
   p, obj, ns, _ = _far_corner_fixture()
   p.tracker.raw_manager.last_identity_evidence[7] = (_UNSUPPORTED_BIRTH_NS, 2, False)
   assert not p.publication_view((obj,), ns)
   p.tracker.raw_manager.last_identity_evidence[7] = (_UNSUPPORTED_BIRTH_NS, 2, True)
+  assert p.publication_view((obj,), ns) == (obj,)
+
+
+def test_default_corner_gate_is_far_only_and_birth_guard_off():
+  module = sys.modules[BoschRadarProvider.__module__]
+  assert module.BOSCH_SURFACE_CORNER_GATE and module.BOSCH_SURFACE_CORNER_MIN_RANGE_M == 100.
+  assert not module.BOSCH_UNSUPPORTED_BIRTH_PUBLICATION
+
+
+def test_default_corner_gate_keeps_near_unsupported_point_outside_edge(monkeypatch):
+  # Exit lanes, gores, shoulders and parallel roads put real cars outside the model road edge.
+  p, obj = _unsupported_birth_fixture()
+  obj = replace(obj, age_scans=20)
+  ns = _UNSUPPORTED_BIRTH_NS + 50_000_000
+  p.road_edge_filter.ingest_model(_publication_edge_model(), ns)
+  assert p.publication_view((obj,), ns) == (obj,)
+  # The same point is removed by the mechanism itself; only the range floor keeps it.
+  monkeypatch.setattr(sys.modules[BoschRadarProvider.__module__], 'BOSCH_SURFACE_CORNER_MIN_RANGE_M', 0.)
+  assert p.publication_view((obj,), ns) == ()
+
+
+@pytest.mark.parametrize('d_rel, kept', [(100.2, True), (100.25, False), (150., False)])
+def test_default_corner_gate_floor_uses_published_native_range(d_rel, kept):
+  from opendbc.car.hyundai.radar_bosch import bosch_native_surface_coordinates
+  p, obj = _unsupported_birth_fixture()
+  raw = replace(obj.members[0], detection=replace(obj.members[0].detection, d_rel=d_rel))
+  obj = replace(obj, age_scans=20, d_rel=d_rel, members=(raw,))
+  ns = _UNSUPPORTED_BIRTH_NS + 50_000_000
+  p.road_edge_filter.ingest_model(_publication_edge_model(), ns)
+  # 50 ms of v_rel -5 m/s moves the published range 0.25 m nearer than the anchor.
+  assert (bosch_native_surface_coordinates(obj, ns)[0] >= 100.) == (not kept)
+  assert p.publication_view((obj,), ns) == ((obj,) if kept else ())
+
+
+def test_default_corner_gate_far_point_keeps_current_support():
+  p, obj = _unsupported_birth_fixture()
+  obj = replace(obj, age_scans=20, d_rel=120.)
+  ns = _UNSUPPORTED_BIRTH_NS + 50_000_000
+  p.road_edge_filter.ingest_model(_publication_edge_model(), ns)
+  assert p.publication_view((obj,), ns) == ()
+  p.camera_extended._associate = lambda *args: (1, 0, 0)
   assert p.publication_view((obj,), ns) == (obj,)
 
 

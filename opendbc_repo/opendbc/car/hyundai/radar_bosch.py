@@ -387,6 +387,17 @@ BOSCH_COMPANION_DEFER_WIDTH_DD_M = ((2.00, 5.0), (2.30, 7.0))
 BOSCH_OEM_NEARER_PUBLICATION_OFF = 0
 BOSCH_OEM_NEARER_PUBLICATION_ACTIVE = 1
 BOSCH_OEM_NEARER_PUBLICATION_MODE = BOSCH_OEM_NEARER_PUBLICATION_ACTIVE
+# 미지원 첫 singleton 발행 억제(birth guard)와 native surface 코너 gate. 2026-10-03
+# 전체 코퍼스 검증(카메라 확인 차량 8,047 episode)에서 둘 다 실제 차량을 지웠다
+# (birth 42, corner 22 REAL_CONFIRMED; birth는 실제 끼어들기 경계 0.75 s 지연과 정상
+# fixture 3개 손실). 따라서 birth는 기본으로 끄고, 판정 코드와 시험은 그대로 둔다.
+BOSCH_UNSUPPORTED_BIRTH_PUBLICATION = False
+# 코너 gate가 지운 영상 확인 차량 22대 중 21대는 92.5 m 이내의 분기·출구·갓길·병행
+# 차로 차량이었고(model road edge 밖), 사용자 확인 코너 고스트 11개는 모두 109.7 m
+# 이상이었다. 그래서 gate는 품질을 보장하지 않는 원거리 발행점에만 작용한다. 하한은
+# 발행 좌표(native dRel) 기준이고 다른 판정 조건은 그대로다.
+BOSCH_SURFACE_CORNER_GATE = True
+BOSCH_SURFACE_CORNER_MIN_RANGE_M = 100.0
 
 
 def _bosch_camera_signed(value, bits):
@@ -6001,6 +6012,7 @@ class BoschRoadEdgePublicationFilter:
     path bends by more than the whole road width. Competing raw edges alone
     do not veto this conjunction, but a genuinely tied assignment does.
     Current support or invalid geometry releases immediately; no holds.
+    Only points published at or beyond BOSCH_SURFACE_CORNER_MIN_RANGE_M qualify.
     """
     if (not self.enabled or not objects or timestamp_ns is None or
         provider.can_error or provider.wrong_config):
@@ -6021,6 +6033,7 @@ class BoschRoadEdgePublicationFilter:
       wire_d, wire_y, wire_v = bosch_native_surface_coordinates(obj, timestamp_ns)
       d, right = wire_d + self.RADAR_TO_CAMERA_M, -wire_y
       if (not all(math.isfinite(v) for v in (d, right, wire_v)) or
+          wire_d < BOSCH_SURFACE_CORNER_MIN_RANGE_M or
           not all(xs[0] <= d <= xs[-1] for xs, _ in lines)):
         kept.append(obj)
         continue
@@ -6665,8 +6678,11 @@ class BoschRadarProvider:
   def publication_view(self, objects, timestamp_ns=None):
     result = self._publication_view_without_road_edge(objects, timestamp_ns)
     result = self.road_edge_filter.publication_view(result, timestamp_ns)
-    result = self.unsupported_birth.publication_view(self, result, timestamp_ns)
-    return self.road_edge_filter.publication_surface_view(self, result, timestamp_ns)
+    if BOSCH_UNSUPPORTED_BIRTH_PUBLICATION:
+      result = self.unsupported_birth.publication_view(self, result, timestamp_ns)
+    if BOSCH_SURFACE_CORNER_GATE:
+      result = self.road_edge_filter.publication_surface_view(self, result, timestamp_ns)
+    return result
 
   def _publication_view_without_road_edge(self, objects, timestamp_ns=None):
     """Apply Bosch-only final-publication filters after alias allocation.
