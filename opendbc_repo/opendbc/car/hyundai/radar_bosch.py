@@ -2177,8 +2177,9 @@ class BoschGroupingConfig:
   coast_s: float = .3
   first_physical_id: int = 1_000_000
   provisional_enabled: bool = True
-  # Experimental SHAPE_MEMORY_2000 port. Recorded morphology is not physical
-  # identity evidence; leave disabled until independent identity controls pass.
+  # SHAPE_MEMORY_2000 retention with the world-robust surface guard. Recorded
+  # morphology is not identity evidence: a retained family may only hide
+  # members the published surface covers (see _BoschMatureGroupRetention).
   mature_retention_enabled: bool = False
   provisional_min_distance_m: float = 1.0
   provisional_max_distance_m: float = 2.0
@@ -2526,7 +2527,15 @@ class _BoschMatureGroupRetention:
   Only an exact group present in the previous scan may receive extra edges.
   Archived certificates can resume only after a natural strict rejoin. They
   contain no physical-object state or history and do not alter strict evidence.
-  This experimental policy reproduces SHAPE_MEMORY_2000, not physical identity.
+  This policy reproduces SHAPE_MEMORY_2000, not physical identity.
+
+  World-robust surface guard: whether a family is one vehicle or two cannot be
+  observed, so a retained scan must never be worse than the strict split in
+  either case. The retained group may only hide members that its published
+  surface covers -- nearer (within GUARD_NEAR_TOL_M), not faster, and at least
+  as close to the driven path or within GUARD_COVER_PATH_M of it. Every DPath
+  lateral gate is at least that wide, so any gate a hidden member passes the
+  surface passes too. Without a recent path the scan falls back to the split.
   """
   MATURITY_NS = 2_000_000_000
   LEASE_NS = 2_000_000_000
@@ -2534,6 +2543,10 @@ class _BoschMatureGroupRetention:
   LIVE_MAX = 16
   ARCHIVE_MAX = 64
   HISTORY_MAX = 21
+  GUARD_NEAR_TOL_M = .25
+  GUARD_COVER_PATH_M = .5
+  GUARD_COVER_SPEED_MPS = .25
+  GUARD_PATH_HOLD_NS = 500_000_000
 
   def __init__(self):
     self.families: dict[tuple[int, ...], _BoschMatureGroupCertificate] = {}
@@ -2543,6 +2556,58 @@ class _BoschMatureGroupRetention:
     self.stats = Counter()
     self.events: list[dict] = []
     self.peak = self.archive_peak = 0
+    # Scan context for the surface guard, supplied by the group manager/provider.
+    self.context = (None, None, ())
+    self.path: tuple = ()
+    self.path_ns: int | None = None
+
+  def ingest_path(self, path, timestamp_ns: int) -> None:
+    """Latest scan-gated model path; held for at most GUARD_PATH_HOLD_NS."""
+    if len(path) >= 2:
+      self.path = tuple(path)
+      self.path_ns = timestamp_ns
+
+  def _surface_guard(self, manager, family, timestamp_ns, raw_tracks, raw_index, live):
+    prior = None
+    for state in manager.states.values():
+      if tuple(sorted(m.raw_track_id for m in state.observation.members)) == family:
+        prior = state.observation
+        break
+    if prior is None:
+      return 'guard_prior_missing_veto'
+    yaw_rate, oem_slot, vision = self.context
+    cues = [(cue.d_rel, cue.y_rel, cue.distance_tolerance_m, cue.lateral_tolerance_m) for cue in vision
+            if math.isfinite(cue.d_rel) and math.isfinite(cue.y_rel) and cue.probability >= .7]
+    vision_supported = [any(abs(r.detection.d_rel-cd) <= dt and abs(r.detection.y_rel-cy) <= lt
+                            for cd, cy, dt, lt in cues) for r in raw_tracks]
+    # The same representative the group update will choose for this exact family.
+    dt = (timestamp_ns-prior.timestamp_ns)/1e9
+    angle = -(yaw_rate or 0.)*dt
+    dx = prior.d_rel + prior.v_rel*dt
+    ca, sa = math.cos(angle), math.sin(angle)
+    candidates = tuple(live[rid] for rid in family)
+    rep = _bosch_group_representative(candidates, raw_index, vision_supported, oem_slot, prior=prior,
+                                      predicted_xy=(dx*ca-prior.y_rel*sa, dx*sa+prior.y_rel*ca))
+    # Published surface: the anchor, unless the final OEM-nearer stage moves it to a nearer word1 member.
+    surface = rep
+    if BOSCH_OEM_NEARER_PUBLICATION_MODE == BOSCH_OEM_NEARER_PUBLICATION_ACTIVE and oem_slot is not None:
+      owned = next((m for m in candidates if m.slot == oem_slot), None)
+      if owned is not None and owned.d_rel < rep.d_rel:
+        surface = owned
+    if surface.d_rel - min(m.d_rel for m in candidates) > self.GUARD_NEAR_TOL_M:
+      return 'guard_surface_not_nearest_veto'
+    if len(self.path) < 2 or self.path_ns is None or not 0 <= timestamp_ns - self.path_ns <= self.GUARD_PATH_HOLD_NS:
+      return 'guard_path_missing_veto'
+    offset = _BoschFamilyCompanionFilter._path_offset
+    surface_path = abs(offset(surface, self.path))
+    for member in candidates:
+      if member is surface:
+        continue
+      if surface.v_rel > member.v_rel + self.GUARD_COVER_SPEED_MPS:
+        return 'guard_cover_speed_veto'
+      if surface_path > max(abs(offset(member, self.path)), self.GUARD_COVER_PATH_M):
+        return 'guard_cover_lateral_veto'
+    return None
 
   @staticmethod
   def _pairs(family: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
@@ -2655,6 +2720,8 @@ class _BoschMatureGroupRetention:
                  abs(outsider.v_rel-live[rid].v_rel) <= 1.0 for rid in family):
             reason = 'near_competitor_veto'
             break
+      if reason is None:
+        reason = self._surface_guard(manager, family, timestamp_ns, raw_tracks, raw_index, live)
       if reason:
         self.stats[reason] += 1
         self.families.pop(family, None)
@@ -2978,6 +3045,7 @@ class BoschObjectGroupManager:
     self.stats['pair_rejected_stationary_moving_conflict'] += motion_rejections
 
     if self.mature_retention is not None:
+      self.mature_retention.context = (yaw_rate, oem_slot, vision)
       self.mature_retention.before(self, timestamp_ns, raw_tracks, compatible, pair_cost, raw_index, v_ego)
     owner = {rid: pid for pid, state in self.states.items() for rid in state.member_last_seen}
     previous = sorted(self.states)
@@ -6448,7 +6516,7 @@ class BoschRadarProvider:
                burst_multireturn_mode=BOSCH_BURST_MULTIRETURN_MODE,
                b5_mode=BOSCH_B5_MODE, sidepass_lateral_mode=BOSCH_SIDEPASS_LATERAL_MODE,
                mirror_birth_mode=BOSCH_MIRROR_BIRTH_MODE, unsupported_birth=True,
-               mature_group_retention=False):
+               mature_group_retention=True):
     self.bus = bus
     self.camera_bus = camera_bus
     self.scc_bus = scc_bus
@@ -6983,6 +7051,9 @@ class BoschRadarProvider:
     word0_active = (processed_word is not None and processed_word != BOSCH_INACTIVE_WORD and
                     not processed_word & (1 << 31))
     oem_state = _BoschOemValidationGate.classify(word0_active, word1_active)
+    retention = self.tracker.group_manager.mature_retention
+    if retention is not None:
+      retention.ingest_path(path, availability_ns)
     objects = self.tracker.update(availability_ns, detections, yaw_rate=yaw_rate_left,
                                   v_ego=v_ego, oem_slot=oem_slot, vision=vision)
     self.last_scan_timestamp_ns = availability_ns

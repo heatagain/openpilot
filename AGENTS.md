@@ -1,5 +1,15 @@
 # Repository memory
 
+- On 2026-10-04, the user approved default activation of Bosch mature group
+  retention with the world-robust surface guard for vehicle testing, and the
+  replacement of the SCC-slope aLead criterion by a known-truth braking test.
+  A retained family may hide only members its published surface covers
+  (nearest within 0.25 m, not faster by >0.25 m/s, |dPath| <= max(hidden, 0.5 m),
+  model path required, held <= 0.5 s); otherwise the strict split stands. No PID
+  history copy or threshold relaxation. Recorded/synthetic evidence only; device
+  timing, closed-loop and vehicle behaviour remain unvalidated. See
+  docs/bosch_group_retention_20261003.md.
+
 - On 2026-10-03, the user requested a manual compatibility option for intermittent
   cluster warnings: HyundaiCanfdClusterDirectTx defaults OFF on every vehicle,
   including EV6. In CAN-FD CAMERA_SCC only, enabling it at startup selects the

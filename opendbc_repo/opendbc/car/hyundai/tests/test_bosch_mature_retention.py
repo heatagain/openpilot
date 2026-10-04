@@ -11,6 +11,7 @@ from opendbc.car.hyundai.radar_bosch import (
 
 
 STEP = 100_000_000
+STRAIGHT = tuple((float(x), 0.) for x in range(0, 120, 5))
 
 
 def raw(rid, scan, d=50., y=0., v=-5., age=None):
@@ -23,6 +24,8 @@ def update(manager, scan, dd=2.8, dy=0., dv=0., age=None, outsider=False, missin
     tracks.append(raw(2, scan, 50.+dd, dy, -5.+dv, age))
   if outsider:
     tracks.append(raw(3, scan, 54., 0., -5.))
+  if manager.mature_retention is not None:
+    manager.mature_retention.ingest_path(STRAIGHT, scan*STEP)
   return manager.update(scan*STEP, tracks, v_ego=10.)
 
 
@@ -51,8 +54,9 @@ def test_default_allocates_no_retention_and_keeps_strict_split():
     dd = 2.8 if scan < 31 else 3.125
     assert update(default, scan, dd) == update(explicit, scan, dd)
   assert len(default.states) == 2
-  assert BoschRadarProvider(1).tracker.group_manager.mature_retention is None
-  assert BoschRadarProvider(1, mature_group_retention=True).tracker.group_manager.mature_retention is not None
+  # The provider enables guarded retention by default; the bare manager and an explicit opt-out do not.
+  assert BoschRadarProvider(1).tracker.group_manager.mature_retention is not None
+  assert BoschRadarProvider(1, mature_group_retention=False).tracker.group_manager.mature_retention is None
 
 
 def test_bounded_retention_preserves_pid_but_never_writes_strict_pair_evidence():
@@ -276,3 +280,66 @@ def test_archive_and_natural_rejoin_preserve_mutable_snapshot_isolation():
   live_before = pickle.dumps(live)
   archived.history[1][1].clear()
   assert pickle.dumps(live) == live_before
+
+
+# ---- world-robust surface guard -------------------------------------------------------------------------------
+
+
+class _Pair:
+  """Near return 1 at 50 m, far return 2 at 50 m + dd. With far_first the far return is tracked alone first,
+  so its PID and continuity anchor predate the near one."""
+  def __init__(self, y_near=0., y_far=0., v_far=-5., far_first=False, path=STRAIGHT):
+    self.m = BoschObjectGroupManager(BoschGroupingConfig(mature_retention_enabled=True))
+    self.y_near, self.y_far, self.v_far, self.far_first, self.path = y_near, y_far, v_far, far_first, path
+
+  def step(self, scan, dd, oem_slot=None, feed_path=True):
+    if feed_path:
+      self.m.mature_retention.ingest_path(self.path, scan*STEP)
+    far = raw(2, scan, 50.+dd, self.y_far, self.v_far, scan)
+    if self.far_first and scan <= 5:
+      tracks = [far]
+    else:
+      tracks = [raw(1, scan, 50., self.y_near, -5., scan-(5 if self.far_first else 0)), far]
+    return self.m.update(scan*STEP, tracks, v_ego=10., oem_slot=oem_slot)
+
+  def boundary(self, oem_slot=None, feed_path=True):
+    for scan in range(1, 31):
+      objects = self.step(scan, 2.8, oem_slot)
+    assert len(objects) == 1 and self.m.mature_retention.families[(1, 2)].ready
+    return self.step(31, 3.125, oem_slot, feed_path)
+
+
+@pytest.mark.parametrize('y_near,y_far,groups', [(.1, -.1, 1), (.45, 0., 1), (.8, 0., 2), (0., 1.2, 1)])
+def test_guard_requires_surface_lateral_coverage(y_near, y_far, groups):
+  pair = _Pair(y_near, y_far)
+  assert len(pair.boundary()) == groups
+  assert pair.m.mature_retention.stats['guard_cover_lateral_veto'] == (groups == 2)
+
+
+def test_guard_rejects_hidden_nearer_member_unless_oem_publishes_it():
+  pair = _Pair(far_first=True)
+  assert len(pair.boundary()) == 2
+  assert pair.m.mature_retention.stats['guard_surface_not_nearest_veto'] == 1
+  assert len(_Pair(far_first=True).boundary(oem_slot=0)) == 1
+
+
+def test_guard_rejects_surface_faster_than_hidden_member():
+  pair = _Pair(v_far=-5.5)
+  assert len(pair.boundary()) == 2
+  assert pair.m.mature_retention.stats['guard_cover_speed_veto'] == 1
+
+
+def test_guard_fails_closed_without_path():
+  pair = _Pair(path=())
+  assert len(pair.boundary()) == 2
+  assert pair.m.mature_retention.stats['guard_path_missing_veto'] == 1
+
+
+@pytest.mark.parametrize('age,retained', [(5, True), (6, False)])
+def test_guard_path_hold_is_bounded(age, retained):
+  pair = _Pair()
+  for scan in range(1, 31):
+    pair.step(scan, 2.8)
+  retention = pair.m.mature_retention
+  retention.path, retention.path_ns = STRAIGHT, (31-age)*STEP
+  assert (len(pair.step(31, 3.125, feed_path=False)) == 1) is retained

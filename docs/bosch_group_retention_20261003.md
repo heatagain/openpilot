@@ -116,3 +116,34 @@ SHA-256:
 통합·공유와 활성화/배포 허가는 별개입니다. 실제 후보가 개입한 SAME 및 moving
 DIFFERENT 대조군, 짧은 family 범위, native downstream/IPC/MPC/control/차량 검증이
 후속 근거로 필요합니다. 이번 Windows replay는 이를 대신하지 않습니다.
+
+## 2026-10-04 world-robust surface guard and default activation
+
+The user approved the guard below, the replacement of acceptance criterion G5 by a known-truth braking test, and default
+activation for vehicle testing. `BoschRadarProvider(..., mature_group_retention=True)` is now the default;
+`BoschGroupingConfig.mature_retention_enabled` stays `False` for bare managers and explicit opt-out remains available.
+
+Guard (applied before any retention edge, otherwise the scan falls back to the strict split):
+- the published surface (continuity anchor, or a nearer OEM word1 member moved by the OEM-nearer stage) must be within
+  0.25 m of the family's nearest member;
+- it must not be faster than any hidden member by more than 0.25 m/s;
+- its |dPath| must not exceed max(hidden member |dPath|, 0.5 m). Every DPath lateral gate is at least 0.5 m, so any gate a
+  hidden member passes the surface passes too;
+- a scan-gated model path is required and held for at most 0.5 s.
+
+No PID history is copied, no threshold is loosened and publication rules are unchanged.
+
+Evidence (`analysis/20261004_opus55_bosch_group_retention_enable`, faithful lockstep radarcan replay, HEAD 637bd00a):
+- 1,413 recorded segments: zero lead_one/lead_two/cut-in frames less conservative than OFF; hidden-nearer surfaces in the
+  path corridor/near side 613 -> 0; OFF arm identical; all differences attributed to retention episodes (115 episodes,
+  344 retained group-scans). Lead differences occur only in Route269 S7 (nearer range matching stock SCC; aLead both ways).
+- Known-truth injection into 23 straight recorded windows: six DIFFERENT-vehicle scenarios, 0 frames worse than OFF
+  (the unguarded policy lost the revealed lead in a cut-out case); a Route269-type truck: lead dropouts 340 -> 22; known
+  -2 m/s^2 braking: frames without a lead 560 -> 128 and aLead bias +0.283 -> +0.009 m/s^2.
+- The original G5 (SCC-slope aLead on differing frames) failed (0.274 > 0.245) because near-zero true acceleration favours
+  OFF's warm-up zeros; the user approved replacing it with the braking test.
+- Native planner open-loop on Route269: aTarget difference -0.058..+0.019 m/s^2.
+
+Not validated: device CPU/memory and deadlines, native IPC, closed-loop control and vehicle behaviour. Short families
+(e.g. IO01, 0.4 s maturity) remain unsupported. Physical identity of retained families is still not observed; the guard
+makes the published output no worse than the split under either identity.
