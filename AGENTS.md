@@ -26,7 +26,11 @@
   min(1.75, w/2+0.5), at |dv|<=0.5. Exported A0 verdicts are unchanged.
   Split scans fell 357->232, with no new two-vehicle collapse and no lead change.
   Residual risk: an unseen same-speed vehicle just ahead of a short large vehicle
-  can be merged (lead_one unaffected; lead_two may hide).
+  can be merged (lead_one unaffected; lead_two may hide). Stage 4 lets a camera
+  class-1 set mature after one stable interval, but only when its representative
+  is the nearest member (a far OEM anchor still waits two). Class-6 P2 still needs
+  two. Split scans fell 232->199, with no new two-vehicle collapse and no lead
+  farther or lost.
 
 - On 2026-10-05, the user clarified that instructions such as "작업해" or
   "진행해" include committing and pushing the completed task unless explicitly

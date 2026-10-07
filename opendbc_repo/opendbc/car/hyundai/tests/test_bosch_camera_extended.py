@@ -722,12 +722,14 @@ class TestBoschActiveTestPublication:
 
   @pytest.mark.parametrize('mode', (BOSCH_CAMERA_EXTENDED_OFF, BOSCH_CAMERA_EXTENDED_SHADOW,
                                    BOSCH_CAMERA_EXTENDED_ACTIVE, BOSCH_CAMERA_EXTENDED_PUBLICATION))
-  def test_two_completed_intervals_only_test_mode_suppresses(self, mode):
+  def test_class1_one_completed_interval_only_test_mode_suppresses(self, mode):
+    # Both members carry a camera class-1 verdict, which already ties them to one
+    # body: one stable interval suffices (class-6 truck-P2 sets still need two).
     p = BoschRadarProvider(1, camera_extended_mode=mode)
     for i, ns in enumerate((1_000_000_000, 1_099_123_456, 1_198_765_432, 1_299_000_000)):
       objects, view = self.scan(p, ns)
-      assert len(view) == (1 if mode == BOSCH_CAMERA_EXTENDED_PUBLICATION and i >= 2 else 2)
-      if i < 2 or mode != BOSCH_CAMERA_EXTENDED_PUBLICATION:
+      assert len(view) == (1 if mode == BOSCH_CAMERA_EXTENDED_PUBLICATION and i >= 1 else 2)
+      if i < 1 or mode != BOSCH_CAMERA_EXTENDED_PUBLICATION:
         assert view is objects
     if mode == BOSCH_CAMERA_EXTENDED_PUBLICATION:
       assert p.camera_extended.histories[(1_000_001, 1_000_002)].stable_intervals == 2
@@ -755,7 +757,7 @@ class TestBoschActiveTestPublication:
 
   def test_coast_never_makes_a_group_mature(self):
     p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_PUBLICATION)
-    for i in range(2):                                       # one interval only: not mature yet
+    for i in range(1):                                       # no completed interval: not mature yet
       _, view = self.scan(p, 1_000_000_000 + i * 100_000_000)
     assert len(view) == 2
     ns = 1_200_000_000
@@ -950,7 +952,9 @@ class TestBoschActiveTestPublication:
       for result in outputs:
         assert result.points[0].to_dict() == baseline().points[0].to_dict()
       assert target not in b.free_aliases
-    assert visible == [True, True, False, False, False, True, True, True, False]
+    # Class-1 sets collapse after one interval; the camera gap at i=5 splits the
+    # set and the reappearance restarts with one interval.
+    assert visible == [True, False, False, False, False, True, True, False, False]
 
   def test_route254_original_policy_keeps_24m_lateral_member(self):
     p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_PUBLICATION)
@@ -1134,7 +1138,18 @@ class TestBoschTruckAwareP2:
       self.statuses(provider.camera_extended, ns, self.assigned(class_code=1))
       provider.camera_extended.update(ns, objects, 10.)
       visible.append(len(provider.publication_view(objects)))
-    assert visible == [2, 2, 1, 1, 1, 1]
+    assert visible == [2, 1, 1, 1, 1, 1]
+
+  def test_class6_truck_p2_set_still_needs_two_intervals(self):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_PUBLICATION)
+    mature = []
+    for i in range(BOSCH_TRUCK_P2_CONFIRMATIONS + 3):
+      ns = 1_000_000_000 + i * 100_000_000
+      self.statuses(grouping, ns, self.assigned())
+      grouping.update(ns, self.objects(ns), 10.)
+      mature.append(bool(grouping.mature_groups))
+    strict_at = BOSCH_TRUCK_P2_CONFIRMATIONS - 1
+    assert mature.index(True) == strict_at + 2
 
   @pytest.mark.parametrize(('field', 'value', 'accepted'), (
     ('width', 2.40, True), ('width', 2.35, False),

@@ -75,6 +75,17 @@ Lockstep replay against stage 2, with criteria frozen first (`analysis/20261008_
 
 Over all three stages, large-vehicle split scans on these drives fell from 598 to 232.
 
+## Stage 4: one interval for camera class-1 sets onto their nearest member
+A camera class-1 (large vehicle) verdict on both members already ties them to one body. Such a set now matures after **one** stable interval instead of two. The shortcut applies only when the representative is the nearest member, because the representative prefers an OEM-selected member: a moved OEM anchor on a farther member must still wait the full requirement, otherwise a nearer surface could be hidden. Class-6 truck-P2 sets keep two intervals, and the motion-continuity checks are unchanged.
+
+Lockstep replay against stage 3 (`analysis/20261008_truck_fix/GO_CRITERIA_B4_B5.md`):
+- **Tracker output:** identical.
+- **Large-vehicle split scans:** 232 → 199.
+- **Pairs the camera sees as two vehicles:** newly collapsed 0.
+- **New collapses:** 11 scans. Nine were checked numerically: one wide class-1 object, or inside the stage-3 footprint. Two narrower class-1 objects (1.95 m and 2.15 m wide) were confirmed by video as single box trucks.
+- **lead_one:** one frame nearer, none farther or lost.
+- **Design change made after results:** the nearest-member condition was added after the first results. It did not change any measured result and is recorded in the criteria appendix.
+
 ## Limits
 - This is recorded-input replay only. Device timing, closed-loop behaviour and vehicle display are unvalidated.
 - 478 split scans remain. They belong to the truck-P2 and association-window stages, which have their own frozen criteria.

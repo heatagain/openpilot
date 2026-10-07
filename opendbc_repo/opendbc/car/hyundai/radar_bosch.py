@@ -305,6 +305,10 @@ BOSCH_CAMERA_MATURITY_Y_RANGE_K = 0.005
 # which is independent evidence that the set is one vehicle. Shorten the
 # interval requirement for that case only; the geometry checks are unchanged.
 BOSCH_CAMERA_MATURITY_WORD1_INTERVALS = 1
+# A camera class-1 (large vehicle) verdict on both members is itself independent
+# evidence that the set is one body, so one stable interval suffices there too.
+# The motion-continuity checks are unchanged.
+BOSCH_CAMERA_MATURITY_CLASS1_INTERVALS = 1
 BOSCH_CAMERA_EXTENDED_MODE = BOSCH_CAMERA_EXTENDED_PUBLICATION
 BOSCH_CAMERA_HEADER = 0x738
 BOSCH_CAMERA_FIRST_OBJECT = 0x739
@@ -1300,6 +1304,12 @@ class BoschCameraExtendedGrouping:
           required = BOSCH_CAMERA_EXTENDED_TEST_INTERVALS
           if prior is not None and state.oem_anchor >= 0 and prior.oem_anchor == state.oem_anchor:
             required = BOSCH_CAMERA_MATURITY_WORD1_INTERVALS
+          if class_code == 1:
+            # Only when the set collapses onto its nearest member: a moved OEM
+            # anchor on a farther member must still wait the full requirement.
+            rep = representatives.get(members)
+            if rep is not None and rep.d_rel <= min(by_pid[p].d_rel for p in members):
+              required = min(required, BOSCH_CAMERA_MATURITY_CLASS1_INTERVALS)
           if state.stable_intervals >= required:
             mature.append(members)
         else:
