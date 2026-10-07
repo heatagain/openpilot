@@ -46,3 +46,12 @@ A first candidate without the cap delayed cut-in risk on 5 of 165 identified rea
   - The candidate was shaped after seeing the uncapped candidate's failures on the same data, so these results are in-sample.
   - Out-of-sample confirmation is the next real drive.
   - Closed-loop behaviour is unvalidated.
+
+## Reverted (2026-10-08)
+After release, a geometric entry check without camera GT found 2 more real cut-ins where this change delayed cut-in risk. It covered 468 radar-identified entries; the camera GT had 165. lead_one timing was unchanged in both.
+- `00000273` s35: 0.5 s later. A one-scan outward camera jump (3.60→3.80 m) was read as "camera still". The arm held the point 0.42 m outward for one scan, and that broke DPath inward progress.
+- `0000025c` s8: 0.15 s later. A long-held arm released 0.3 m after the camera started moving.
+
+The change was reverted to keep the zero-delay rule for real entries. A retry must at least:
+- not arm on a camera whose lateral jumps in either direction;
+- include the geometric entry check in its frozen criteria.

@@ -214,18 +214,6 @@ BOSCH_SIDEPASS_MAX_OFFSET_M = 1.0        # beyond surface migration on one body
 BOSCH_SIDEPASS_REALIGN_MPS = .10         # below the downstream lateral motion floor
 BOSCH_SIDEPASS_MAX_GAP_NS = 320_000_000
 BOSCH_SIDEPASS_STATE_MAX = 64
-# Camera-still arming: while an adjacent vehicle is overtaken its return moves
-# from the rear face to the near corner/side, inward by up to about half the body
-# width plus side slide, while its camera object keeps its lateral (2f1/2f2/2f4
-# drives: 45 of 50 cut-in pre-decelerations, raw inward 0.3-2.7 m, camera
-# 0-0.2 m). Arm only on camera evidence that the vehicle itself did not move, and
-# never hold it outward of the camera lateral: early in a real lane change the
-# camera can lag the radar by 0.5-1.2 s, from outward of the camera position.
-BOSCH_SIDEPASS_CAMERA_MIN_CLOSING_MPS = .5
-BOSCH_SIDEPASS_CAMERA_RADAR_INWARD_M = .3   # raw inward over the window to arm
-BOSCH_SIDEPASS_CAMERA_STILL_M = .1          # camera inward over the same window, at most
-BOSCH_SIDEPASS_CAMERA_ENTRY_M = .3          # camera inward since arm releases at once
-BOSCH_SIDEPASS_CAMERA_MAX_OFFSET_M = 2.0    # held, not released, beyond this
 
 # Behavioural naming for the two 0x601 records. No proprietary signal name is
 # claimed. word1 (bytes 4..7) is bit-identical to exactly one raw record in
@@ -4170,11 +4158,6 @@ class _BoschSidePassLateralState:
   offset_m: float = 0.
   quiet_scans: int = 0
   last_ns: int = 0
-  armed_by: str = ''
-  camera_anchor_m: float = 0.
-  camera_in_m: float = 0.
-  camera_samples: deque = field(default_factory=deque)
-  camera_last_m: float = 0.
 
 
 @dataclass(frozen=True)
@@ -4251,18 +4234,7 @@ class _BoschSidePassLateralEstimator:
       return None
     return (n * std - st * sd) / denominator - sv / n
 
-  @staticmethod
-  def _camera_inward_distance(obj, cameras):
-    """|lateral| of the camera object A0 assigns to obj, or None."""
-    if not cameras:
-      return None
-    verdict = BoschCameraExtendedGrouping._associate(obj, cameras, len(cameras))
-    if verdict[0] != BOSCH_CAMERA_ASSOC_ASSIGNED:
-      return None
-    camera = next((c for c in cameras if c.episode == verdict[1]), None)
-    return None if camera is None else abs(camera.lat_m)
-
-  def update(self, objects, timestamp_ns, v_ego, *, path=(), oem_pids=(), cameras=()):
+  def update(self, objects, timestamp_ns, v_ego, *, path=(), oem_pids=()):
     self.last_decisions = ()
     if self.mode == BOSCH_SIDEPASS_LATERAL_OFF:
       self._states = {}
@@ -4315,23 +4287,7 @@ class _BoschSidePassLateralEstimator:
       moving = speed_known and obj.v_rel + v_ego >= BOSCH_SIDEPASS_MIN_LEAD_SPEED_MPS
       armable = (slide is not None and slide >= BOSCH_SIDEPASS_SLIDE_ARM_MPS and len(members) == 1 and
                  closing and moving and obj.d_rel <= BOSCH_SIDEPASS_MAX_D_M)
-      camera_abs = self._camera_inward_distance(obj, cameras) if len(members) == 1 else None
-      cam_samples = state.camera_samples
-      if camera_abs is None:
-        cam_samples.clear()
-      else:
-        cam_samples.append((timestamp_ns, abs(y_rel), camera_abs))
-        while timestamp_ns - cam_samples[0][0] > BOSCH_SIDEPASS_WINDOW_NS:
-          cam_samples.popleft()
-      camera_armable = False
-      if (not state.armed and len(members) == 1 and len(cam_samples) >= BOSCH_SIDEPASS_MIN_SCANS and
-          cam_samples[-1][0] - cam_samples[0][0] >= BOSCH_SIDEPASS_MIN_SPAN_NS and
-          obj.v_rel <= -BOSCH_SIDEPASS_CAMERA_MIN_CLOSING_MPS and moving and obj.d_rel <= BOSCH_SIDEPASS_MAX_D_M):
-        radar_inward = cam_samples[0][1] - cam_samples[-1][1]
-        camera_inward = cam_samples[0][2] - cam_samples[-1][2]
-        camera_armable = (radar_inward >= BOSCH_SIDEPASS_CAMERA_RADAR_INWARD_M and
-                          camera_inward <= BOSCH_SIDEPASS_CAMERA_STILL_M)
-      if not (state.armed or state.offset_m or armable or camera_armable):
+      if not (state.armed or state.offset_m or armable):
         continue
       offset = _BoschFamilyCompanionFilter._path_offset(obj, path)
       release = None
@@ -4339,66 +4295,35 @@ class _BoschSidePassLateralEstimator:
         release = 'CORRIDOR_ENTRY'
       elif pid in oem_pids or obj.oem_selected:
         release = 'OEM_SELECTED'
-      elif state.armed_by != 'CAMERA' and abs(state.offset_m) > BOSCH_SIDEPASS_MAX_OFFSET_M:
+      elif abs(state.offset_m) > BOSCH_SIDEPASS_MAX_OFFSET_M:
         release = 'BEYOND_BODY'
-      elif (state.armed and state.armed_by == 'CAMERA' and camera_abs is not None and
-            state.camera_anchor_m - camera_abs >= BOSCH_SIDEPASS_CAMERA_ENTRY_M):
-        release = 'CAMERA_ENTRY'
       if release is not None:
         if state.armed or state.offset_m:
           decisions.append(BoschSidePassLateralDecision(
             timestamp_ns, pid, 'RELEASE', release, math.nan if slide is None else slide, y_rel, y_rel))
           self.releases += 1
         state.armed = False
-        state.armed_by = ''
         state.offset_m = 0.
         state.quiet_scans = 0
         continue
       in_zone = abs(offset) <= BOSCH_SIDEPASS_ZONE_M and obj.d_rel <= BOSCH_SIDEPASS_MAX_D_M
       if not state.armed:
-        if (armable or camera_armable) and in_zone:
+        if armable and in_zone:
           state.armed = True
-          state.armed_by = 'SLIDE' if armable else 'CAMERA'
-          state.camera_in_m = 0.
-          if armable:
-            state.anchor_y_m = published_y
-          else:
-            # Anchor at the window start, before the scatterer moved inward; the
-            # camera reference is taken at the same sample.
-            state.anchor_y_m = math.copysign(cam_samples[0][1], y_rel)
-            state.camera_anchor_m = cam_samples[0][2]
-            state.camera_last_m = cam_samples[-1][2]
+          state.anchor_y_m = published_y
           state.quiet_scans = 0
           self.arms += 1
-          decisions.append(BoschSidePassLateralDecision(timestamp_ns, pid, 'ARM', state.armed_by, slide, y_rel,
-                                                        published_y))
+          decisions.append(BoschSidePassLateralDecision(timestamp_ns, pid, 'ARM', 'SLIDE', slide, y_rel, published_y))
       else:
-        if state.armed_by == 'CAMERA':
-          quiet = (camera_abs is None or obj.v_rel > -BOSCH_SIDEPASS_CAMERA_MIN_CLOSING_MPS or not moving or
-                   not in_zone or len(members) != 1)
-        else:
-          quiet = (slide is None or slide < BOSCH_SIDEPASS_SLIDE_RELEASE_MPS or not closing or not moving or
-                   not in_zone or len(members) != 1)
+        quiet = (slide is None or slide < BOSCH_SIDEPASS_SLIDE_RELEASE_MPS or not closing or not moving or
+                 not in_zone or len(members) != 1)
         state.quiet_scans = state.quiet_scans + 1 if quiet else 0
         if state.quiet_scans >= BOSCH_SIDEPASS_RELEASE_SCANS:
           state.armed = False
-          state.armed_by = ''
           self.releases += 1
           decisions.append(BoschSidePassLateralDecision(
             timestamp_ns, pid, 'RELEASE', 'EVIDENCE_END', math.nan if slide is None else slide, y_rel, published_y))
-      if state.armed and state.armed_by == 'CAMERA':
-        # Follow only the camera's own lateral motion from the anchor and never
-        # hold the vehicle outward of where the camera sees it; never publish
-        # nearer to the ego path than the raw return, and cap the outward
-        # correction (held at the cap, never released as a step).
-        if camera_abs is not None:
-          state.camera_in_m = max(0., state.camera_anchor_m - camera_abs)
-          state.camera_last_m = camera_abs
-        raw_abs = abs(y_rel)
-        target_abs = min(abs(state.anchor_y_m) - state.camera_in_m, state.camera_last_m)
-        published_abs = max(raw_abs, min(target_abs, raw_abs + BOSCH_SIDEPASS_CAMERA_MAX_OFFSET_M))
-        state.offset_m = math.copysign(published_abs, y_rel) - y_rel
-      elif state.armed:
+      if state.armed:
         state.offset_m = state.anchor_y_m - y_rel
         if abs(state.offset_m) > BOSCH_SIDEPASS_MAX_OFFSET_M:
           state.armed = False
@@ -7289,13 +7214,9 @@ class BoschRadarProvider:
       camera_associations=self.camera_extended.last_associations, word0_pids=processed_pids)
     # Side-pass lateral estimate: same scan, same OEM evidence the other
     # publication stages read; applied only by publication_view().
-    ext = self.camera_extended
-    fresh_camera = (ext.last_camera_ns is not None and
-                    0 <= availability_ns - ext.last_camera_ns <= BOSCH_CAMERA_OBSERVATION_GAP_NS)
     self.sidepass_lateral.update(
       qualified, availability_ns, v_ego, path=path,
-      oem_pids=processed_pids if oem_state == BOSCH_OEM_STATE_VALIDATED else frozenset(),
-      cameras=tuple(ext.last_camera_by_episode.values()) if fresh_camera else ())
+      oem_pids=processed_pids if oem_state == BOSCH_OEM_STATE_VALIDATED else frozenset())
     return qualified
 
 # End Bosch MRRevo14F passive radar
