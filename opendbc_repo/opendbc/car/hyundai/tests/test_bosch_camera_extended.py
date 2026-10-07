@@ -732,10 +732,14 @@ class TestBoschActiveTestPublication:
     if mode == BOSCH_CAMERA_EXTENDED_PUBLICATION:
       assert p.camera_extended.histories[(1_000_001, 1_000_002)].stable_intervals == 2
 
-  def test_coast_holds_maturity_but_never_collapses_publication(self):
+  COAST = {1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1),
+           1_000_002: (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1)}
+
+  def test_coast_keeps_an_already_mature_group_collapsed_onto_its_nearest_member(self):
     # A scan that keeps the group through the E2 coast has no strict camera
-    # edge, so it must not suppress. The accumulated maturity survives, so the
-    # next confirmed scan is mature again instead of restarting the warm-up.
+    # edge. A group that was already mature stays collapsed while the motion
+    # still tracks, so one missing camera confirmation no longer re-splits a
+    # large vehicle. The accumulated maturity also survives the coast.
     p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_PUBLICATION)
     members = (1_000_001, 1_000_002)
     for i in range(3):
@@ -743,13 +747,40 @@ class TestBoschActiveTestPublication:
     assert len(view) == 1 and p.camera_extended.histories[members].stable_intervals == 2
     ns = 1_300_000_000
     objects = (physical(1_000_001, 15., ns=ns), physical(1_000_002, 19., ns=ns))
-    coast = {1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1),
-             1_000_002: (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1)}
-    _, view = self.scan(p, ns, objects, coast)
-    assert view is objects                                   # coast publishes both
-    assert p.camera_extended.histories[members].stable_intervals == 2   # but keeps maturity
+    _, view = self.scan(p, ns, objects, self.COAST)
+    assert [o.physical_track_id for o in view] == [1_000_001]   # nearest surface stays published
+    assert p.camera_extended.histories[members].stable_intervals == 2
     _, view = self.scan(p, 1_400_000_000)
-    assert len(view) == 1                                    # confirmed again, immediately mature
+    assert len(view) == 1                                    # confirmed again, still mature
+
+  def test_coast_never_makes_a_group_mature(self):
+    p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_PUBLICATION)
+    for i in range(2):                                       # one interval only: not mature yet
+      _, view = self.scan(p, 1_000_000_000 + i * 100_000_000)
+    assert len(view) == 2
+    ns = 1_200_000_000
+    objects = (physical(1_000_001, 15., ns=ns), physical(1_000_002, 19., ns=ns))
+    _, view = self.scan(p, ns, objects, self.COAST)
+    assert view is objects
+    assert not p.camera_extended.mature_groups
+
+  @pytest.mark.parametrize('change', ('stale_member', 'far_anchor'))
+  def test_coast_opens_without_fresh_members_or_with_a_farther_representative(self, change):
+    p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_PUBLICATION)
+    for i in range(3):
+      self.scan(p, 1_000_000_000 + i * 100_000_000)
+    ns = 1_300_000_000
+    near, far = physical(1_000_001, 15., ns=ns), physical(1_000_002, 19., ns=ns)
+    if change == 'stale_member':
+      far = replace(far, timestamp_ns=ns - 1)
+    else:
+      # The OEM now selects the far member: collapsing onto it would hide the
+      # nearer surface, which a coast must never do.
+      far = replace(far, oem_selected=True)
+    objects = (near, far)
+    _, view = self.scan(p, ns, objects, self.COAST)
+    assert view is objects
+    assert not p.camera_extended.mature_groups
 
   def test_coast_beyond_the_hold_window_discards_maturity(self):
     p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_PUBLICATION)
@@ -759,11 +790,16 @@ class TestBoschActiveTestPublication:
     coast = {1_000_001: (BOSCH_CAMERA_ASSOC_ASSIGNED, 7, 1),
              1_000_002: (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1)}
     ns = 1_200_000_000
+    views = []
     for _ in range(3):                                       # 300 ms of coasting
       ns += 100_000_000
       objects = (physical(1_000_001, 15., ns=ns), physical(1_000_002, 19., ns=ns))
       _, view = self.scan(p, ns, objects, coast)
-      assert view is objects
+      views.append((objects, view))
+    # Inside BOSCH_CAMERA_MATURITY_HOLD_NS the mature group stays collapsed onto
+    # its nearest member; past the hold it opens again.
+    assert all(view is objects or [o.physical_track_id for o in view] == [1_000_001] for objects, view in views)
+    assert views[-1][1] is views[-1][0]
     # past BOSCH_CAMERA_E2_HOLD_NS the coast drops the set, so the maturity is
     # gone either way: absent, or present with nothing accumulated.
     held = p.camera_extended.histories.get(members)
@@ -831,24 +867,39 @@ class TestBoschActiveTestPublication:
     elif failure == 'stale_member':
       objects = (objects[0], replace(objects[1], timestamp_ns=ns - 1))
     elif failure == 'motion_jump':
-      objects = tuple(replace(o, d_rel=o.d_rel + 1.) for o in objects)
+      objects = tuple(replace(o, d_rel=o.d_rel + 1.5) for o in objects)
     ext = p.camera_extended
     TestBoschCameraE2Overlay.statuses(ext, mapping)
     if failure in ('stale_camera', 'future_camera'):
       cam_ns = ns - 160_000_001 if failure == 'stale_camera' else ns + 1
       ext.camera.snapshot = lambda _: ([BoschCameraObject()], 1, 0, cam_ns)
     ext.update(ns, objects, 10.)
-    assert p.publication_view(objects) is objects
-    assert not ext.mature_groups
     if failure == 'p2':
       # A missing strict edge with the set otherwise intact is a coast, not a
       # failure: inside BOSCH_CAMERA_MATURITY_HOLD_NS the accumulated maturity
-      # is held. Publication still opens, which is what this test guards.
+      # is held, and the already-mature group stays collapsed onto its nearest
+      # member (see test_coast_keeps_an_already_mature_group_collapsed...).
+      assert [o.physical_track_id for o in p.publication_view(objects)] == [1_000_001]
       assert ext.last_maturity_resets == 0
       assert ext.histories[(1_000_001, 1_000_002)].stable_intervals == 2
     else:
+      assert p.publication_view(objects) is objects
+      assert not ext.mature_groups
       assert ext.last_maturity_resets == 1
       assert all(s.stable_intervals == 0 for s in ext.histories.values())
+
+  @pytest.mark.parametrize('jitter, mature', ((.33, True), (.8, False)))
+  def test_far_lateral_noise_scales_the_maturity_bound_with_range(self, jitter, mature):
+    # A distant large body's bearing noise grows with range: 0.33 m of lateral
+    # scatter at 65-72 m used to reset maturity every interval (fixed 0.26 m
+    # bound). The range term admits it; scatter well beyond it still resets.
+    p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_PUBLICATION)
+    for i in range(4):
+      ns = 1_000_000_000 + i * 100_000_000
+      y = jitter if i % 2 else 0.
+      objects = (physical(1_000_001, 65., y, ns=ns), physical(1_000_002, 72., y, ns=ns))
+      _, view = self.scan(p, ns, objects)
+    assert (len(view) == 1) is mature
 
   def test_missing_qualified_representative_or_member_is_fail_open(self):
     p = BoschRadarProvider(1, camera_extended_mode=BOSCH_CAMERA_EXTENDED_PUBLICATION)

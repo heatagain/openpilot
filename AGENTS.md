@@ -1,5 +1,15 @@
 # Repository memory
 
+- On 2026-10-08, the user approved fixing Bosch large-vehicle splits in risk order
+  under world-robust criteria frozen before results. Stage 1 changes only
+  camera-extended maturity: range bound 1.0+2.5dt^2, lateral bound adds 0.005*d_rel,
+  and an already-mature group stays collapsed through a coast only if every member
+  is measured this scan and the representative is the nearest member. A coast never
+  matures a group; association/strict-edge/truck-P2 gates are unchanged. On the
+  2f1/2f2/2f4 drives, split scans fell 598->478. Camera two-vehicle pairs saw no new
+  collapse, and leads were never farther or lost. Recorded replay only. See
+  docs/bosch_truck_split_maturity_20261008.md.
+
 - On 2026-10-05, the user clarified that instructions such as "작업해" or
   "진행해" include committing and pushing the completed task unless explicitly
   instructed otherwise. Commit only the task's changes; preserve unrelated work.

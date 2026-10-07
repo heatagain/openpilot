@@ -291,9 +291,16 @@ BOSCH_CAMERA_EXTENDED_TEST_INTERVALS = 2
 # strict camera edge used to throw the accumulated maturity away, so a single
 # missing camera confirmation restarted the two-interval warm-up. Hold it while
 # the member motion still tracks the prediction, bounded by the last strict
-# confirmation. A coasting group still may not collapse publication: the camera
-# has not re-confirmed the pair this scan, so both contacts stay published.
+# confirmation. A coasting group may keep collapsing publication only if it was
+# already mature on the previous scan and every member was measured this scan;
+# it never becomes mature during a coast. Otherwise both contacts stay published.
 BOSCH_CAMERA_MATURITY_HOLD_NS = 200_000_000
+# Motion-continuity bounds for maturity. Range noise of the far surface and the
+# bearing noise of a distant body (lateral error grows with range) used to reset
+# confirmed large-vehicle groups (P1 drives: 190 of 812 confirmations; lateral
+# residual p50 0.34 m at 66 m against a fixed 0.26 m bound).
+BOSCH_CAMERA_MATURITY_D_TOL_M = 1.0
+BOSCH_CAMERA_MATURITY_Y_RANGE_K = 0.005
 # The OEM selected the same member of this exact set on the previous scan too,
 # which is independent evidence that the set is one vehicle. Shorten the
 # interval requirement for that case only; the geometry checks are unchanged.
@@ -941,8 +948,9 @@ class BoschCameraExtendedGrouping:
         for pid, (d, y, v) in zip(members, prior.observations):
           obj = by_pid[pid]
           x = d + v * dt
-          if not (abs(obj.d_rel - (x * co - y * si)) <= .5 + 2.5 * dt * dt and
-                  abs(obj.y_rel - (x * si + y * co)) <= .0625 + 2 * dt and
+          if not (abs(obj.d_rel - (x * co - y * si)) <= BOSCH_CAMERA_MATURITY_D_TOL_M + 2.5 * dt * dt and
+                  abs(obj.y_rel - (x * si + y * co)) <= (.0625 + 2 * dt +
+                                                         BOSCH_CAMERA_MATURITY_Y_RANGE_K * abs(obj.d_rel)) and
                   abs(obj.v_rel - v) <= .25 + 5 * dt):
             break
         else:
@@ -1097,6 +1105,7 @@ class BoschCameraExtendedGrouping:
     if self.mode == BOSCH_CAMERA_EXTENDED_OFF:
       return objects
     prior_maturity = self.histories
+    prior_mature = set(self.mature_groups)
     self.mature_groups = ()
     curve_clock_reset = self.last_ns is not None and timestamp_ns <= self.last_ns
     if self.last_ns is not None and timestamp_ns - self.last_ns > BOSCH_CAMERA_OBSERVATION_GAP_NS:
@@ -1223,7 +1232,7 @@ class BoschCameraExtendedGrouping:
     previous = [state.members for state in self.representatives]
     groups = self._complete_link(objects, edges, previous)
 
-    self._choose_representatives(groups, by_pid, timestamp_ns, yaw_rate)
+    representatives = self._choose_representatives(groups, by_pid, timestamp_ns, yaw_rate)
     mature = []
     for group in groups:
       if len(group) < 2:
@@ -1258,9 +1267,20 @@ class BoschCameraExtendedGrouping:
         if (self.mode == BOSCH_CAMERA_EXTENDED_PUBLICATION and state.observations and
             state.stable_intervals > 0 and
             timestamp_ns - state.last_confirm_ns <= BOSCH_CAMERA_MATURITY_HOLD_NS):
-          next_history[members] = self._maturity(
+          coasted = self._maturity(
             members, state.cam_key, state.class_code, timestamp_ns, by_pid, yaw_rate,
             confirmed=False, confirm_ns=state.last_confirm_ns)
+          next_history[members] = coasted
+          required = (BOSCH_CAMERA_MATURITY_WORD1_INTERVALS
+                      if coasted.oem_anchor >= 0 and state.oem_anchor == coasted.oem_anchor
+                      else BOSCH_CAMERA_EXTENDED_TEST_INTERVALS)
+          # Without a camera edge this scan, collapse only onto the nearest
+          # member: a coast must never hide a nearer surface of the set.
+          coast_rep = representatives.get(members)
+          if (members in prior_mature and coasted.stable_intervals >= required and
+              all(by_pid[p].timestamp_ns == timestamp_ns for p in members) and
+              coast_rep is not None and coast_rep.d_rel <= min(by_pid[p].d_rel for p in members)):
+            mature.append(members)
         else:
           next_history[members] = _BoschExtendedHistory(members, state.cam_key, state.class_code,
                                                         state.last_confirm_ns)
