@@ -1,5 +1,17 @@
 # Repository memory
 
+- On 2026-10-08, the user asked to stop false cut-in pre-decelerations from
+  overtaken neighbours whose Bosch return moves rear face -> near corner -> side.
+  The carrot planner (DPath/cut-in) must not be changed; fix within the Bosch
+  provider only. The side-pass estimator gains a CAMERA arm: raw |y| moves inward
+  >=0.3 m in 0.4-0.8 s while the A0 camera |lat| moves <=0.1 m. While armed, the
+  published |y| is never outward of the camera lateral and never nearer than raw.
+  Camera inward motion >=0.3 m releases on the same scan. Without the camera cap,
+  5/165 real entries got later risk (camera lags real lane changes 0.5-1.2 s).
+  With the cap: 0 later, false risk episodes 57->43 (drives) and 278->203
+  (corpus). In-sample; next drive is out-of-sample.
+  See docs/bosch_sidepass_camera_20261008.md.
+
 - On 2026-10-08, the user approved making Bosch context timing deterministic, with
   a post-hoc determinism criterion recorded. set_bosch_context now treats a
   modelV2/livePose stamped after now_ns as not yet current and keeps the
