@@ -1138,7 +1138,7 @@ class TestBoschTruckAwareP2:
 
   @pytest.mark.parametrize(('field', 'value', 'accepted'), (
     ('width', 2.40, True), ('width', 2.35, False),
-    ('dd', 5.50, True), ('dd', 5.49, False), ('dd', 9.00, True), ('dd', 9.01, False),
+    ('dd', 5.50, True), ('dd', 5.49, False), ('dd', 10.75, True), ('dd', 12.00, True), ('dd', 12.01, False),
     ('dy', .875, True), ('dy', .876, False), ('dv', .50, True), ('dv', .501, False),
   ))
   def test_absolute_truck_gate_boundaries(self, field, value, accepted):

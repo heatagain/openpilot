@@ -39,6 +39,18 @@ Lockstep faithful replay of the same drives, HEAD vs candidate. Criteria were fr
 - **Design change made after results:** the nearest-representative condition on coast collapse was added after the first results. It is recorded in the criteria appendix and did not change any measured result.
 - **Tests:** 691 Bosch tests pass, including new tests for the range-scaled lateral bound, coast collapse onto the nearest member, and coast never maturing a group.
 
+## Stage 2: truck-P2 range spread (12 m)
+Long trucks and buses put their strongest returns 9–11 m apart. These pairs failed `BOSCH_TRUCK_P2_DD_MAX_M = 9.0` (105 of 162 unmerged class-6 scans). The limit is now 12.0 m, the same as the geometry-candidate and class-1 limit. Width (2.40 m), dy, dv, the 5 confirmations and freshness are unchanged.
+
+Lockstep replay against stage 1, with criteria frozen first (`analysis/20261008_truck_fix/GO_CRITERIA_B2.md`):
+- **Tracker output:** identical.
+- **Large-vehicle split scans:** 478 → 357.
+- **Pairs the camera sees as two vehicles:** newly collapsed 0.
+- **New collapses:** 101 scans, all from one red bus (about 12 m long) in the adjacent lane, approaching from 51 m to 19 m. Video shows the hidden point on the same bus.
+- **lead_one / lead_two:** unchanged.
+- **Cut-in risk:** the same bus was dropped for 6 frames (0.3 s). Its lateral position stayed at −3.1 m and it did not cut in.
+- **Tests:** 692 Bosch tests pass. The boundary test now accepts 10.75 m and 12.00 m and rejects 12.01 m.
+
 ## Limits
 - This is recorded-input replay only. Device timing, closed-loop behaviour and vehicle display are unvalidated.
 - 478 split scans remain. They belong to the truck-P2 and association-window stages, which have their own frozen criteria.

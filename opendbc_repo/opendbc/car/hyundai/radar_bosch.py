@@ -361,7 +361,9 @@ BOSCH_TRUCK_P2_CONFIRMATIONS = 5
 BOSCH_TRUCK_P2_STATE_MAX = 16
 BOSCH_TRUCK_P2_WIDTH_MIN_M = 2.40
 BOSCH_TRUCK_P2_DD_MIN_M = 5.50
-BOSCH_TRUCK_P2_DD_MAX_M = 9.00
+# Long trucks/buses put their two strongest returns 9-11 m apart (P1 drives: 105 of
+# 162 unmerged class-6 scans); 12 m matches the geometry candidate and class-1 limit.
+BOSCH_TRUCK_P2_DD_MAX_M = 12.00
 BOSCH_TRUCK_P2_DY_MAX_M = 0.875
 BOSCH_TRUCK_P2_DV_MAX_MPS = 0.50
 BOSCH_TRUCK_A0_RECOVERY_HOLD_SCANS = 2

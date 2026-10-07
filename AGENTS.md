@@ -8,7 +8,9 @@
   matures a group; association/strict-edge/truck-P2 gates are unchanged. On the
   2f1/2f2/2f4 drives, split scans fell 598->478. Camera two-vehicle pairs saw no new
   collapse, and leads were never farther or lost. Recorded replay only. See
-  docs/bosch_truck_split_maturity_20261008.md.
+  docs/bosch_truck_split_maturity_20261008.md. Stage 2 raises the class-6 truck-P2
+  range spread limit from 9.0 to 12.0 m (other P2 gates unchanged): split scans
+  fell 478->357, all new collapses were one adjacent-lane bus, and leads were unchanged.
 
 - On 2026-10-05, the user clarified that instructions such as "작업해" or
   "진행해" include committing and pushing the completed task unless explicitly
