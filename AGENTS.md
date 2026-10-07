@@ -30,7 +30,9 @@
   class-1 set mature after one stable interval, but only when its representative
   is the nearest member (a far OEM anchor still waits two). Class-6 P2 still needs
   two. Split scans fell 232->199, with no new two-vehicle collapse and no lead
-  farther or lost.
+  farther or lost. Stage 5 lowers truck-P2 confirmations 5->3 (other P2 gates
+  unchanged): split scans fell 199->182, and the only new collapse was the
+  adjacent bus.
 
 - On 2026-10-05, the user clarified that instructions such as "작업해" or
   "진행해" include committing and pushing the completed task unless explicitly

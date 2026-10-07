@@ -1957,7 +1957,9 @@ class TestBoschCameraScaleCorrection:
     assert module.BOSCH_OEM_GATE_MODE == module.BOSCH_OEM_GATE_ACTIVE
     assert module.BOSCH_COMPANION_DEFER_MODE == module.BOSCH_COMPANION_DEFER_ACTIVE
     assert module.BOSCH_CAMERA_EXTENDED_MODE == module.BOSCH_CAMERA_EXTENDED_PUBLICATION
-    assert (module.BOSCH_TRUCK_P2_WIDTH_MIN_M, module.BOSCH_TRUCK_P2_CONFIRMATIONS) == (2.40, 5)
+    # Confirmations 5 -> 3 by the 2026-10-08 truck-split stage 5 (frozen criteria in
+    # docs/bosch_truck_split_maturity_20261008.md); the width gate is unchanged.
+    assert (module.BOSCH_TRUCK_P2_WIDTH_MIN_M, module.BOSCH_TRUCK_P2_CONFIRMATIONS) == (2.40, 3)
 
   def test_new_constants_are_read_only_by_the_bosch_camera_path(self):
     from pathlib import Path

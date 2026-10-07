@@ -361,7 +361,9 @@ BOSCH_CAMERA_CURVE_REACQUIRE_STATE_MAX = 64
 # 아래의 독립적인 폭/rigid-pair 증거를 모두 만족할 때만 대형차 P2를 보조하며,
 # 기존 class-1 경로는 별도 분기로 그대로 유지한다.
 BOSCH_TRUCK_P2_CLASS = 6
-BOSCH_TRUCK_P2_CONFIRMATIONS = 5
+# Three continuous confirmations (0.2 s) of the same wide class-6 camera object and
+# truck geometry; five delayed most truck merges by another 0.2 s (P1 drives).
+BOSCH_TRUCK_P2_CONFIRMATIONS = 3
 BOSCH_TRUCK_P2_STATE_MAX = 16
 BOSCH_TRUCK_P2_WIDTH_MIN_M = 2.40
 BOSCH_TRUCK_P2_DD_MIN_M = 5.50

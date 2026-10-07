@@ -86,6 +86,18 @@ Lockstep replay against stage 3 (`analysis/20261008_truck_fix/GO_CRITERIA_B4_B5.
 - **lead_one:** one frame nearer, none farther or lost.
 - **Design change made after results:** the nearest-member condition was added after the first results. It did not change any measured result and is recorded in the criteria appendix.
 
+## Stage 5: three truck-P2 confirmations
+`BOSCH_TRUCK_P2_CONFIRMATIONS` goes from 5 to 3. A wide class-6 pair now opens after 0.2 s of continuous confirmation of the same camera object and truck geometry, instead of 0.4 s. Width, dd, dy, dv, freshness and the A0 recovery rule are unchanged.
+
+Lockstep replay against stage 4:
+- **Tracker output:** identical.
+- **Large-vehicle split scans:** 199 → 182.
+- **Pairs the camera sees as two vehicles:** newly collapsed 0.
+- **New collapses:** one scan, on the red bus beside the ego vehicle (checked by video).
+- **Cut-in risk:** the same bus was dropped for 3 frames; its lateral position held at −3.1 m and it did not cut in.
+
+Over the five stages, large-vehicle split scans on these drives fell from 598 to 182.
+
 ## Limits
 - This is recorded-input replay only. Device timing, closed-loop behaviour and vehicle display are unvalidated.
 - 478 split scans remain. They belong to the truck-P2 and association-window stages, which have their own frozen criteria.
