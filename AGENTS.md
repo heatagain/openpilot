@@ -1,5 +1,14 @@
 # Repository memory
 
+- On 2026-10-08, the user approved making Bosch context timing deterministic, with
+  a post-hoc determinism criterion recorded. set_bosch_context now treats a
+  modelV2/livePose stamped after now_ns as not yet current and keeps the
+  previously accepted message. Before, it invalidated the road-edge model,
+  emptied path/cue, or dropped yaw, so IPC latency flickered roadside points.
+  Stale (>200 ms) or missing context still invalidates. Replay: leads unchanged
+  over 160 segments; extra corridor removals were all stationary roadside or
+  oncoming objects. See docs/bosch_context_timing_20261008.md.
+
 - On 2026-10-08, the user approved fixing Bosch large-vehicle splits in risk order
   under world-robust criteria frozen before results. Stage 1 changes only
   camera-extended maturity: range bound 1.0+2.5dt^2, lateral bound adds 0.005*d_rel,

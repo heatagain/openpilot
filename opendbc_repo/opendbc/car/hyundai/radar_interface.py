@@ -576,6 +576,8 @@ class RadarInterface(RadarInterfaceBase):
     self._bosch_path_ns = None
     self._bosch_path_source_ns = 0
     self._bosch_path = ()
+    self._bosch_last_pose = (None, 0)
+    self._bosch_last_model = (None, 0)
     if self.radar_tracks and CP.extFlags & HyundaiExtFlags.BOSCH_RADAR:
       CAN = CanBus(CP)
       bus = CAN.ACAN if CP.extFlags & HyundaiExtFlags.BOSCH_RADAR_BUS1 else CAN.CAM
@@ -684,6 +686,20 @@ class RadarInterface(RadarInterfaceBase):
     """Optional receive context; Device yaw is right-positive, radar y is left."""
     if self.bosch is None:
       return
+    # A message stamped after now_ns (IPC/scheduling order) is not current for
+    # this batch yet. Keep the previously accepted one instead of dropping the
+    # context; the newer message is taken on the first call that reaches its
+    # stamp. Otherwise a few ms of delivery latency decides whether road-edge,
+    # path and yaw context exist for a scan.
+    last_pose, last_model = getattr(self, '_bosch_last_pose', (None, 0)), getattr(self, '_bosch_last_model', (None, 0))
+    if pose is not None and pose_ns > now_ns:
+      pose, pose_ns = last_pose
+    else:
+      self._bosch_last_pose = (pose, pose_ns)
+    if model is not None and model_ns > now_ns:
+      model, model_ns = last_model
+    else:
+      self._bosch_last_model = (model, model_ns)
     yaw = None
     angular = getattr(pose, 'angularVelocityDevice', None)
     if (pose is not None and 0 <= now_ns - pose_ns <= 200_000_000 and

@@ -172,3 +172,65 @@ def test_cached_coordinates_preserve_signed_zero_and_own_input_values():
   after = f.model_edges[-1][1][0][0][0]
   assert math.copysign(1., before[0]) == -1.
   assert math.copysign(1., after[0]) == 1.
+
+
+def _context_interface():
+  recorder = NS(models=[], poses=[])
+  b5 = NS(ingest_pose=lambda ns, yaw: recorder.poses.append((ns, yaw)),
+          ingest_model=lambda m, ns: recorder.models.append(('b5', ns)))
+  mirror = NS(ingest_model=lambda m, ns: recorder.models.append(('mirror', ns)))
+  bosch = NS(road_edge_filter=BoschRoadEdgePublicationFilter(), b5_birth_defer=b5, mirror_m3_shadow=mirror)
+  interface = NS(bosch=bosch, _bosch_path_ns=None, _bosch_path=(), _bosch_path_source_ns=0)
+  return interface, recorder
+
+
+def _context_model(x0=0.0):
+  sample = model()
+  sample.leadsV3 = [NS(x=[30.0], y=[0.5], prob=.9)]
+  sample.position = NS(x=[x0, 50.0], y=[0.0, 0.0])
+  sample.timestampEof = T - 50_000_000
+  return sample
+
+
+def _pose(z=.1):
+  return NS(inputsOK=True, sensorsOK=True, angularVelocityDevice=NS(valid=True, z=z))
+
+
+def test_future_model_keeps_previous_context_instead_of_invalidating():
+  # A modelV2 stamped a few ms after the radar batch receive time is not current
+  # yet: the road-edge model, path and cue of the previous model stay in use.
+  interface, recorder = _context_interface()
+  first = _context_model()
+  RadarInterface.set_bosch_context(interface, T, model=first, model_ns=T - 10_000_000)
+  now, _, cues, path, path_ns, _ = interface._bosch_context
+  assert interface.bosch.road_edge_filter.model_edges and cues and path and path_ns == T - 10_000_000
+  RadarInterface.set_bosch_context(interface, T + 10_000_000, model=_context_model(1.0), model_ns=T + 13_000_000)
+  _, _, cues, path, path_ns, _ = interface._bosch_context
+  assert interface.bosch.road_edge_filter.model_edges          # not invalidated
+  assert cues and path and path_ns == T - 10_000_000            # previous model still current
+  # The first call that reaches the newer stamp takes it.
+  RadarInterface.set_bosch_context(interface, T + 20_000_000, model=_context_model(1.0), model_ns=T + 13_000_000)
+  assert interface._bosch_context[4] == T + 13_000_000
+  assert recorder.models[-1] == ('mirror', T + 13_000_000)
+
+
+def test_stale_or_missing_model_still_invalidates():
+  interface, _ = _context_interface()
+  RadarInterface.set_bosch_context(interface, T, model=_context_model(), model_ns=T - 10_000_000)
+  RadarInterface.set_bosch_context(interface, T + 300_000_000, model=_context_model(), model_ns=T - 10_000_000)
+  assert not interface.bosch.road_edge_filter.model_edges
+  assert interface._bosch_context[2] == () and interface._bosch_context[3] == ()
+  interface, _ = _context_interface()
+  RadarInterface.set_bosch_context(interface, T, model=None, model_ns=0)
+  assert not interface.bosch.road_edge_filter.model_edges
+
+
+def test_future_pose_keeps_previous_yaw():
+  interface, recorder = _context_interface()
+  RadarInterface.set_bosch_context(interface, T, pose=_pose(.1), pose_ns=T - 5_000_000)
+  assert interface._bosch_context[1] == -.1
+  RadarInterface.set_bosch_context(interface, T + 10_000_000, pose=_pose(.3), pose_ns=T + 12_000_000)
+  assert interface._bosch_context[1] == -.1                     # newer pose not current yet
+  assert all(ns <= T + 10_000_000 for ns, _ in recorder.poses)
+  RadarInterface.set_bosch_context(interface, T + 20_000_000, pose=_pose(.3), pose_ns=T + 12_000_000)
+  assert interface._bosch_context[1] == -.3
