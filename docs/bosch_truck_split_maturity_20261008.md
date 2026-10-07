@@ -51,6 +51,30 @@ Lockstep replay against stage 1, with criteria frozen first (`analysis/20261008_
 - **Cut-in risk:** the same bus was dropped for 6 frames (0.3 s). Its lateral position stayed at −3.1 m and it did not cut in.
 - **Tests:** 692 Bosch tests pass. The boundary test now accepts 10.75 m and 12.00 m and rejects 12.01 m.
 
+## Stage 3: far-member footprint association
+After stage 2, 153 split scans had a far member no camera object explained. In 151 of them, the far member failed only the A0 bearing gate (by 0.016–0.11 rad). The camera bearing span describes the rear face of the vehicle; the front of a long body in an adjacent lane sits farther away, so its bearing moves toward the centre.
+
+For strict pairs only, the far member is now associated with the near member's camera object when all of the following hold:
+- the near member is A0-assigned to a large object (class 1, or class 6 with width ≥ 2.40 m);
+- the far member is A0 UNRESOLVED, so no camera object passed all of its gates;
+- it lies behind the rear face by at most 12 m;
+- it is laterally within `min(1.75, width/2 + 0.5)`;
+- its speed is within 0.5 m/s of the near member.
+
+The exported `last_associations` (used by companion deferral and other consumers) keep the A0 verdicts. For this geometry, the footprint now precedes the class-6 A0 near-miss recovery. The recovery remains for cases the footprint does not cover.
+
+Lockstep replay against stage 2, with criteria frozen first (`analysis/20261008_truck_fix/GO_CRITERIA_B3.md`):
+- **Tracker output:** identical.
+- **Large-vehicle split scans:** 357 → 232.
+- **Pairs the camera sees as two vehicles:** newly collapsed 0.
+- **New collapses:** 15 scans in two episodes, both checked by video and numbers. One was a tank/box truck at a toll gate, the other a box truck in a tunnel. Each was one class-1 camera object, with the far point 6–7 m behind the rear face.
+- **lead_one / lead_two / cut-in risk:** unchanged.
+- **Tests:** 701 Bosch tests pass.
+
+**Known residual risk:** an occluded vehicle that the camera does not see, travelling at the same speed within 12 m ahead of a short large vehicle, can be merged with it. The representative stays the nearest surface, so lead_one is unaffected. lead_two could be hidden.
+
+Over all three stages, large-vehicle split scans on these drives fell from 598 to 232.
+
 ## Limits
 - This is recorded-input replay only. Device timing, closed-loop behaviour and vehicle display are unvalidated.
 - 478 split scans remain. They belong to the truck-P2 and association-window stages, which have their own frozen criteria.

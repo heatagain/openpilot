@@ -11,6 +11,13 @@
   docs/bosch_truck_split_maturity_20261008.md. Stage 2 raises the class-6 truck-P2
   range spread limit from 9.0 to 12.0 m (other P2 gates unchanged): split scans
   fell 478->357, all new collapses were one adjacent-lane bus, and leads were unchanged.
+  Stage 3 adds a strict-pair-only footprint association. A far member is A0
+  UNRESOLVED only on bearing, its near member is A0-assigned to a large camera
+  object, and it lies <=12 m behind that object's rear face, laterally within
+  min(1.75, w/2+0.5), at |dv|<=0.5. Exported A0 verdicts are unchanged.
+  Split scans fell 357->232, with no new two-vehicle collapse and no lead change.
+  Residual risk: an unseen same-speed vehicle just ahead of a short large vehicle
+  can be merged (lead_one unaffected; lead_two may hide).
 
 - On 2026-10-05, the user clarified that instructions such as "작업해" or
   "진행해" include committing and pushing the completed task unless explicitly

@@ -369,6 +369,13 @@ BOSCH_TRUCK_P2_DV_MAX_MPS = 0.50
 BOSCH_TRUCK_A0_RECOVERY_HOLD_SCANS = 2
 BOSCH_TRUCK_A0_RECOVERY_BEARING_EXCESS_RAD = 0.010
 BOSCH_TRUCK_A0_RECOVERY_COST_MARGIN = 0.15
+# Footprint association for the far member of a camera-confirmed large vehicle.
+# The camera bearing span describes the rear face; the front of a long body in
+# an adjacent lane sits farther away, so its bearing moves toward the centre and
+# fails A0 by 0.016-0.11 rad while range/lateral gates pass (P1 drives: 151 of
+# 153 unassociated far members). Used for strict pairs only, never exported.
+BOSCH_LARGE_FOOTPRINT_LENGTH_M = 12.0
+BOSCH_LARGE_FOOTPRINT_LAT_MARGIN_M = 0.5
 # Shared camera episode와 OEM selection은 physical identity proof가 아니다.
 # 기존 rigid-pair opportunity 안에서도 prior raw/group split과 representative handoff가
 # 모두 확인된 경우에만 먼 표면의 publication을 미룬다. 근거가 없으면 fail open한다.
@@ -712,6 +719,7 @@ class BoschCameraExtendedGrouping:
     self.last_groups: tuple[tuple[int, ...], ...] = ()
     self.last_association_count = 0
     self.last_associations = {}
+    self.last_footprint_associations = ()
     self.last_candidate_count = 0
     self.last_coast_count = 0
     self.max_state_count = 0
@@ -973,6 +981,38 @@ class BoschCameraExtendedGrouping:
                                  anchor)
 
   @staticmethod
+  def _large_footprint_associations(geometry, associations, by_pid, camera_by_episode):
+    """Far member of a pair whose near member A0 assigned to a large camera object.
+
+    Only a far member no camera object explains (A0 UNRESOLVED) qualifies, and
+    only inside that object's body footprint: behind its rear face by at most
+    BOSCH_LARGE_FOOTPRINT_LENGTH_M, laterally within half its width plus a
+    margin, at the near member's speed. The bearing gate is the one A0 test it
+    is allowed to miss.
+    """
+    out = {}
+    for key, (dd, dy, dv) in sorted(geometry.items()):
+      a, b = by_pid[key[0]], by_pid[key[1]]
+      near, far = (a, b) if (a.d_rel, a.physical_track_id) <= (b.d_rel, b.physical_track_id) else (b, a)
+      verdict = associations.get(near.physical_track_id)
+      far_verdict = associations.get(far.physical_track_id)
+      if (verdict is None or verdict[0] != BOSCH_CAMERA_ASSOC_ASSIGNED or far_verdict is None or
+          far_verdict[0] != BOSCH_CAMERA_ASSOC_UNRESOLVED or far.physical_track_id in out or dv > BOSCH_TRUCK_P2_DV_MAX_MPS):
+        continue
+      camera = camera_by_episode.get(verdict[1])
+      if camera is None or not (verdict[2] == 1 or (verdict[2] == BOSCH_TRUCK_P2_CLASS and
+                                                     camera.width_m >= BOSCH_TRUCK_P2_WIDTH_MIN_M)):
+        continue
+      _, l_neg = _bosch_camera_long_window(_bosch_camera_range_span(far.d_rel), camera.width_m)
+      d_long = camera.long_m - far.d_rel
+      d_lat = camera.lat_m + far.y_rel
+      if not (-l_neg <= d_long < 0. and -d_long <= BOSCH_LARGE_FOOTPRINT_LENGTH_M and
+              abs(d_lat) <= min(BOSCH_CAMERA_LAT_MAX_M, camera.width_m * .5 + BOSCH_LARGE_FOOTPRINT_LAT_MARGIN_M)):
+        continue
+      out[far.physical_track_id] = (BOSCH_CAMERA_ASSOC_ASSIGNED, verdict[1], verdict[2])
+    return out
+
+  @staticmethod
   def _truck_pair_continuous(prior, timestamp_ns, dd, dy, dv, camera):
     dt = (timestamp_ns - prior.last_ns) * 1e-9
     return (
@@ -1186,6 +1226,12 @@ class BoschCameraExtendedGrouping:
     self.last_camera_by_episode = camera_by_episode
     self.last_v_ego = v_ego
     self.last_yaw_rate = yaw_rate
+    # Strict pairs may also use footprint verdicts; every other consumer keeps
+    # the frozen A0 verdicts stored above.
+    footprint = self._large_footprint_associations(geometry, associations, by_pid, camera_by_episode)
+    self.last_footprint_associations = tuple(sorted(footprint))
+    if footprint:
+      associations = {**associations, **footprint}
 
     strict = {}
     strict_classes = {}

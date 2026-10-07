@@ -1167,8 +1167,68 @@ class TestBoschTruckAwareP2:
     assert grouping.truck_pair_histories == {}
 
 
+class TestBoschLargeFootprintAssociation:
+  """The far member of a camera-confirmed large vehicle may miss only the A0
+  bearing gate (front of a long body in an adjacent lane) and still form the
+  strict pair, when nothing else explains it and it lies in the body footprint."""
+  IDS = TestBoschTruckAwareP2.IDS
+
+  def run(self, *, near_class=1, far_status=None, width=2.45, camera_d=24., camera_y=0., far_d=28., far_y=0.,
+          far_v=0.):
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = 1_000_000_000
+    mapping = {self.IDS[0]: (BOSCH_CAMERA_ASSOC_ASSIGNED, 186, near_class),
+               self.IDS[1]: far_status or (BOSCH_CAMERA_ASSOC_UNRESOLVED, -1, -1)}
+    TestBoschTruckAwareP2.statuses(grouping, ns, mapping, width=width, camera_d=camera_d, camera_y=camera_y)
+    grouping.update(ns, TestBoschTruckAwareP2.objects(ns, far_d=far_d, far_y=far_y, far_v=far_v), 10.)
+    return grouping
+
+  def test_far_member_inside_the_footprint_forms_the_class1_pair(self):
+    grouping = self.run()
+    assert grouping.last_footprint_associations == (self.IDS[1],)
+    assert grouping.last_groups == (self.IDS,)
+    # The exported A0 verdicts are unchanged for every other consumer.
+    assert grouping.last_associations[self.IDS[1]][0] == BOSCH_CAMERA_ASSOC_UNRESOLVED
+
+  @pytest.mark.parametrize('case, kwargs', (
+    ('beyond_body_length', {'camera_d': 15.}),             # 13 m behind the rear face
+    ('lateral_outside_body', {'camera_y': .5, 'far_y': 1.4}),
+    ('speed_differs', {'far_v': .75}),
+    ('small_camera_object', {'near_class': 2}),
+    ('narrow_class6', {'near_class': 6, 'width': 2.35}),
+    ('explained_by_other_camera', {'far_status': (BOSCH_CAMERA_ASSOC_ASSIGNED, 187, 2)}),
+    ('ambiguous_far', {'far_status': (BOSCH_CAMERA_ASSOC_AMBIGUOUS, -1, -1)}),
+  ))
+  def test_no_footprint_outside_its_conditions(self, case, kwargs):
+    grouping = self.run(**kwargs)
+    assert grouping.last_footprint_associations == (), case
+    assert grouping.last_groups == (), case
+
+  def test_footprint_precedes_a0_recovery_for_a_far_bearing_miss(self):
+    # The A0-recovery near-miss geometry: far member 3 m behind the rear face of
+    # a wide class-6 camera object. The footprint associates it at once, so the
+    # truck-P2 pair starts counting confirmations without a recovery seed.
+    recovery = TestBoschLargeVehicleA0Recovery
+    grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
+    ns = 1_000_000_000
+    recovery.configure(grouping, ns, recovery.one_sided())
+    grouping.update(ns, recovery.objects(ns), 10.)
+    assert grouping.last_footprint_associations == (recovery.IDS[1],)
+    assert grouping.truck_pair_histories[recovery.IDS].confirmations == 1
+    assert grouping.last_truck_recovery_count == 0
+
+
 class TestBoschLargeVehicleA0Recovery:
   IDS = (1_004_581, 1_004_624)
+
+  @pytest.fixture(autouse=True)
+  def _isolate_a0_recovery(self, monkeypatch):
+    # The far member of these fixtures also lies inside the large-vehicle
+    # footprint, which now associates it before A0 recovery is consulted (see
+    # TestBoschLargeFootprintAssociation). Recovery still covers what the
+    # footprint does not (e.g. a missing near member), so test it in isolation.
+    monkeypatch.setattr(BoschCameraExtendedGrouping, '_large_footprint_associations',
+                        staticmethod(lambda *_a, **_k: {}))
 
   @classmethod
   def objects(cls, ns, *, far_pid=None, far_d=26., far_y=-4.5, far_v=0.):
