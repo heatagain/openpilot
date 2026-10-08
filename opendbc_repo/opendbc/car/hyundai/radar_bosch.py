@@ -365,7 +365,10 @@ BOSCH_TRUCK_P2_CLASS = 6
 # truck geometry; five delayed most truck merges by another 0.2 s (P1 drives).
 BOSCH_TRUCK_P2_CONFIRMATIONS = 3
 BOSCH_TRUCK_P2_STATE_MAX = 16
-BOSCH_TRUCK_P2_WIDTH_MIN_M = 2.40
+# Buses, box trucks and car carriers also report 2.25-2.40 m (2026-09-11 study:
+# a car carrier at 2.30-2.35 m never formed a pair). The 5.5 m spacing floor stays:
+# a 5.0-5.5 m pair can be a parked car and the object just past it.
+BOSCH_TRUCK_P2_WIDTH_MIN_M = 2.25
 BOSCH_TRUCK_P2_DD_MIN_M = 5.50
 # Long trucks/buses put their two strongest returns 9-11 m apart (P1 drives: 105 of
 # 162 unmerged class-6 scans); 12 m matches the geometry candidate and class-1 limit.

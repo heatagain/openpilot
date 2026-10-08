@@ -1124,7 +1124,7 @@ class TestBoschTruckAwareP2:
     grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
     for i in range(20):
       ns = 1_000_000_000 + i * 100_000_000
-      self.statuses(grouping, ns, self.assigned(), width=2.35)
+      self.statuses(grouping, ns, self.assigned(), width=2.20)
       grouping.update(ns, self.objects(ns), 10.)
     assert grouping.last_groups == ()
     assert grouping.truck_pair_histories == {}
@@ -1152,7 +1152,7 @@ class TestBoschTruckAwareP2:
     assert mature.index(True) == strict_at + 2
 
   @pytest.mark.parametrize(('field', 'value', 'accepted'), (
-    ('width', 2.40, True), ('width', 2.35, False),
+    ('width', 2.25, True), ('width', 2.20, False),
     ('dd', 5.50, True), ('dd', 5.49, False), ('dd', 10.75, True), ('dd', 12.00, True), ('dd', 12.01, False),
     ('dy', .875, True), ('dy', .876, False), ('dv', .50, True), ('dv', .501, False),
   ))
@@ -1210,7 +1210,7 @@ class TestBoschLargeFootprintAssociation:
     ('lateral_outside_body', {'camera_y': .5, 'far_y': 1.4}),
     ('speed_differs', {'far_v': .75}),
     ('small_camera_object', {'near_class': 2}),
-    ('narrow_class6', {'near_class': 6, 'width': 2.35}),
+    ('narrow_class6', {'near_class': 6, 'width': 2.20}),
     ('explained_by_other_camera', {'far_status': (BOSCH_CAMERA_ASSOC_ASSIGNED, 187, 2)}),
     ('ambiguous_far', {'far_status': (BOSCH_CAMERA_ASSOC_AMBIGUOUS, -1, -1)}),
   ))
@@ -1427,7 +1427,7 @@ class TestBoschLargeVehicleA0Recovery:
     grouping = BoschCameraExtendedGrouping(BOSCH_CAMERA_EXTENDED_ACTIVE)
     for i in range(12):
       ns = 1_000_000_000 + i * 100_000_000
-      self.configure(grouping, ns, self.assigned(), width=2.35)
+      self.configure(grouping, ns, self.assigned(), width=2.20)
       grouping.update(ns, self.objects(ns), 10.)
     assert grouping.last_groups == () and grouping.truck_pair_histories == {}
 
@@ -1959,7 +1959,7 @@ class TestBoschCameraScaleCorrection:
     assert module.BOSCH_CAMERA_EXTENDED_MODE == module.BOSCH_CAMERA_EXTENDED_PUBLICATION
     # Confirmations 5 -> 3 by the 2026-10-08 truck-split stage 5 (frozen criteria in
     # docs/bosch_truck_split_maturity_20261008.md); the width gate is unchanged.
-    assert (module.BOSCH_TRUCK_P2_WIDTH_MIN_M, module.BOSCH_TRUCK_P2_CONFIRMATIONS) == (2.40, 3)
+    assert (module.BOSCH_TRUCK_P2_WIDTH_MIN_M, module.BOSCH_TRUCK_P2_CONFIRMATIONS) == (2.25, 3)
 
   def test_new_constants_are_read_only_by_the_bosch_camera_path(self):
     from pathlib import Path

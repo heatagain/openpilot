@@ -98,6 +98,19 @@ Lockstep replay against stage 4:
 
 Over the five stages, large-vehicle split scans on these drives fell from 598 to 182.
 
+## Stage 6: class-6 truck-P2 width floor 2.25 m
+`BOSCH_TRUCK_P2_WIDTH_MIN_M` goes from 2.40 to 2.25 m. Buses, box trucks and car carriers often report 2.25–2.35 m wide class-6 camera objects and never formed a pair. The 5.5 m spacing floor, the confirmations and every other gate are unchanged.
+
+Lockstep replay against stage 5 over 885 segments (the 2f1/2f2/2f4/2f6/2f7 drives and the side-pass corpus; `analysis/20261008_lv_c3/GO_CRITERIA_LV_C3.md`):
+- **Tracker output:** identical.
+- **Large-vehicle split scans:** 3,494 → 3,174 (−9.2 %).
+- **Pairs the camera sees as two vehicles:** newly collapsed 0.
+- **New collapses:** 26 episodes, all confirmed by video as one bus, car carrier, tanker or truck (spacing 5.5–8.8 m).
+- **Leads:** one scene changed. A car carrier cutting in from the right got its nearer rear face (7–10 m) as lead_one, where stage 5 held the farther deck (14–17 m). No lead was farther or lost.
+- **Cut-in:** no real entry was later; false risks unchanged.
+- **Rejected alongside it:** a 5.0 m spacing floor merged a parked car with the object 5.25 m beyond it, and a class-1 12–16 m range merged a same-lane car just ahead of a medium truck. The camera reports width, not length.
+- **Not fixed:** the car carrier on the 2f7 drive still flickers. Its physical PIDs live about 0.2 s, so the pair keeps re-confirming; short publications on that carrier rose 39 → 50 (negligible over the corpus).
+
 ## Limits
 - This is recorded-input replay only. Device timing, closed-loop behaviour and vehicle display are unvalidated.
 - 478 split scans remain. They belong to the truck-P2 and association-window stages, which have their own frozen criteria.

@@ -41,6 +41,11 @@
   farther or lost. Stage 5 lowers truck-P2 confirmations 5->3 (other P2 gates
   unchanged): split scans fell 199->182, and the only new collapse was the
   adjacent bus.
+  Stage 6 (2026-10-09) lowers the class-6 truck-P2 width floor 2.40->2.25 m (the
+  5.5 m spacing floor is unchanged): over 885 replay segments split scans fell
+  3,494->3,174, no new two-vehicle collapse, leads never farther or lost. Rejected:
+  a 5.0 m spacing floor (merged a parked car) and a 16 m class-1 range (merged a car
+  ahead of a medium truck); the camera reports width, not length.
 
 - On 2026-10-05, the user clarified that instructions such as "작업해" or
   "진행해" include committing and pushing the completed task unless explicitly
