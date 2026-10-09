@@ -2442,3 +2442,23 @@ def test_native_surface_helper_uses_published_member_measurement_time():
   bosch_append_points(msg, (obj,), 20., ns)
   assert [struct.pack('<f', v) for v in bosch_native_surface_coordinates(obj, ns)] == [
     struct.pack('<f', getattr(msg.points[0], field)) for field in ('dRel', 'yRel', 'vRel')]
+
+
+def test_append_keeps_earlier_points_and_writes_what_fill_point_writes():
+  # bosch_append_points copies earlier (SCC) points before re-initializing the
+  # list and writes Bosch points through cached schema fields.
+  ns = 1_000_000_000
+  obj = physical(1_000_001, 16.25, .5, 2., ns)
+  msg = structs.RadarData.new_message()
+  scc = msg.init('points', 1)[0]
+  scc.trackId, scc.dRel, scc.vRel, scc.aRel, scc.measured, scc.radarSource = 0, 10., -1., math.nan, True, 'scc'
+  bosch_append_points(msg, (obj,), 10., ns + 10_000_000, alias={obj.physical_track_id: 7},
+                      a_lead_by_pid={obj.physical_track_id: .5})
+  assert len(msg.points) == 2
+  kept = msg.points[0]
+  assert (kept.trackId, kept.dRel, kept.vRel, kept.radarSource, kept.measured) == (0, 10., -1., 'scc', True)
+  assert math.isnan(kept.aRel)
+  expected = structs.RadarData.new_message().init('points', 1)[0]
+  bosch_fill_point(expected, obj, 10., {obj.physical_track_id: 7}, .5)
+  expected.dRel += expected.vRel * (10_000_000 * 1e-9)
+  assert msg.points[1].copy().to_bytes() == expected.copy().to_bytes()

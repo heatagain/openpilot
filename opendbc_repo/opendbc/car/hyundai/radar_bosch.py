@@ -1,5 +1,6 @@
 import bisect
 import copy
+import itertools
 import math
 import struct
 from collections import Counter, deque
@@ -1172,7 +1173,7 @@ class BoschCameraExtendedGrouping:
     geometry = {}
     candidate_nodes = set()
     for i, a in enumerate(ordered):
-      for b in ordered[i + 1:]:
+      for b in itertools.islice(ordered, i + 1, None):
         dd = b.d_rel - a.d_rel
         if dd > 12.0:
           break
@@ -5097,14 +5098,11 @@ class BoschBirthB5Defer:
     return x, y, heading
 
   @staticmethod
-  def _transform(points, dx, dy, heading):
-    cosine, sine = math.cos(heading), math.sin(heading)
-    transformed = []
-    for model_x, model_y in points:
-      x = model_x - BOSCH_B5_RADAR_TO_DEVICE_X_M - dx
-      y = -model_y - dy
-      transformed.append((cosine * x + sine * y, -sine * x + cosine * y))
-    return tuple(sorted(transformed))
+  def _transform(points, dx, dy, heading, trig=None):
+    cosine, sine = (math.cos(heading), math.sin(heading)) if trig is None else trig
+    neg_sine = -sine
+    return tuple(sorted([(cosine * (x := model_x - BOSCH_B5_RADAR_TO_DEVICE_X_M - dx) + sine * (y := -model_y - dy),
+                          neg_sine * x + cosine * y) for model_x, model_y in points]))
 
   @staticmethod
   def _interp(points, x):
@@ -5112,7 +5110,7 @@ class BoschBirthB5Defer:
       return math.nan
     # Search the sorted geometry directly instead of allocating its x list
     # for every edge/lane interpolation.
-    index = bisect.bisect_left(points, x, key=lambda point: point[0])
+    index = bisect.bisect_left(points, x, key=_bosch_sample_ns)
     if index <= 0:
       return points[0][1]
     if index >= len(points):
@@ -5128,10 +5126,11 @@ class BoschBirthB5Defer:
     if motion is None:
       return None
     dx, dy, heading = motion
+    trig = (math.cos(heading), math.sin(heading))
     return {
-      'edges': tuple(self._transform(edge, dx, dy, heading) for edge in context.road_edges),
-      'lanes': tuple(self._transform(lane, dx, dy, heading) for lane in context.lane_lines),
-      'path': self._transform(context.path, dx, dy, heading),
+      'edges': tuple(self._transform(edge, dx, dy, heading, trig) for edge in context.road_edges),
+      'lanes': tuple(self._transform(lane, dx, dy, heading, trig) for lane in context.lane_lines),
+      'path': self._transform(context.path, dx, dy, heading, trig),
       'edge_stds': context.road_edge_stds, 'lane_probs': context.lane_probs,
       'lane_stds': context.lane_stds, 'source_ns': context.source_ns,
     }
@@ -5587,7 +5586,12 @@ class BoschLeadAccelerationEstimator:
     }
 
 
+_BOSCH_POINT_FIELD_NAMES = ('trackId', 'dRel', 'yRel', 'vRel', 'aRel', 'yvRel', 'jLead', 'aLead', 'vLead',
+                            'radarSource', 'trackState', 'measured')
+
+
 def bosch_fill_point(point, obj, v_ego, alias=None, a_lead=math.nan):
+  # bosch_append_points repeats these writes through cached fields; keep both equal.
   point.trackId = obj.physical_track_id if alias is None else alias[obj.physical_track_id]
   _, d_rel, y_rel, v_rel = bosch_published_surface(obj)
   point.dRel, point.yRel, point.vRel = d_rel, y_rel, v_rel
@@ -5599,13 +5603,19 @@ def bosch_fill_point(point, obj, v_ego, alias=None, a_lead=math.nan):
   point.measured = True
 
 
+_BOSCH_FLOAT32 = struct.Struct('<f')
+
+
+def _bosch_float32(value):
+  return _BOSCH_FLOAT32.unpack(_BOSCH_FLOAT32.pack(value))[0]
+
+
 def bosch_native_surface_coordinates(obj, now_ns):
   """Coordinates after the same Float32 writes used by bosch_append_points."""
   raw_id, d_rel, y_rel, v_rel = bosch_published_surface(obj)
   representative = obj.members[0] if len(obj.members) == 1 else next(
     member for member in obj.members if member.raw_track_id == raw_id)
-  def f32(value):
-    return struct.unpack('<f', struct.pack('<f', value))[0]
+  f32 = _bosch_float32
   d_rel, y_rel, v_rel = f32(d_rel), f32(y_rel), f32(v_rel)
   return f32(d_rel + v_rel * ((now_ns - representative.timestamp_ns) * 1e-9)), y_rel, v_rel
 
@@ -5614,28 +5624,47 @@ def bosch_append_points(radar, objects, v_ego, now_ns, alias=None, a_lead_by_pid
   """Append directly to the final native list, retaining SCC aliasing safety."""
   if not objects:
     return
-  previous = [point.to_dict() for point in radar.points]
+  # Independent struct copies survive re-initializing the list, like the dicts did.
+  previous = [point.copy() for point in radar.points]
   offset = len(previous)
   points = radar.init('points', offset + len(objects))
   for index, values in enumerate(previous):
     points[index] = values
+  # The same writes as bosch_fill_point, through schema fields looked up once
+  # per publication instead of an attribute lookup per field and point.
+  fields = points[offset].schema.fields
+  (f_track, f_d, f_y, f_v, f_a_rel, f_yv, f_jerk, f_a_lead, f_v_lead, f_source, f_state,
+   f_measured) = (fields[name] for name in _BOSCH_POINT_FIELD_NAMES)
+  nan = math.nan
   for index, obj in enumerate(objects, offset):
     point = points[index]
-    a_lead = math.nan if a_lead_by_pid is None else a_lead_by_pid.get(obj.physical_track_id, math.nan)
-    bosch_fill_point(point, obj, v_ego, alias, a_lead)
+    put, get = point._set_by_field, point._get_by_field
+    a_lead = nan if a_lead_by_pid is None else a_lead_by_pid.get(obj.physical_track_id, nan)
+    published_id, d_rel, y_rel, v_rel = bosch_published_surface(obj)
+    put(f_track, obj.physical_track_id if alias is None else alias[obj.physical_track_id])
+    put(f_d, d_rel)
+    put(f_y, y_rel)
+    put(f_v, v_rel)
+    put(f_a_rel, nan)
+    put(f_yv, nan)
+    put(f_jerk, nan)
+    put(f_a_lead, a_lead)
+    put(f_v_lead, v_ego + v_rel)
+    put(f_source, 'frontRadar')
+    put(f_state, 0)
+    put(f_measured, True)
     members = obj.members
     if len(members) == 1:
       representative = members[0]
     else:
       # The age the published range is extrapolated over is the surface's own
       # measurement age, not the anchor's.
-      published_id = bosch_published_surface(obj)[0]
       representative = next(member for member in members
                             if member.raw_track_id == published_id)
     # Read the native Float32 fields before projection, exactly as the original
     # temporary RadarData path did. This also preserves rounding for test inputs.
     age_s = (now_ns - representative.timestamp_ns) * 1e-9
-    point.dRel += point.vRel * age_s
+    put(f_d, get(f_d) + get(f_v) * age_s)
 
 
 def bosch_to_native_radar_data(objects: Sequence[BoschPhysicalObject], timestamp_ns: int, *, v_ego=math.nan,
@@ -5970,16 +5999,14 @@ class BoschMirrorBirthHold:
         dt = delta_ns * 1e-9
         theta = (yaw_rate_left or 0.0) * dt
         cos_theta, sin_theta = math.cos(theta), math.sin(theta)
-        moved = []
-        for scan_ns, points in self.hist:
-          transformed = []
-          for x, y, raw_id in points:
-            x1 = x - v_ego * dt
-            transformed.append((cos_theta * x1 + sin_theta * y,
-                                -sin_theta * x1 + cos_theta * y, raw_id))
-          moved.append((scan_ns, transformed))
-        self.hist = (moved[-(BOSCH_MIRROR_BIRTH_HIST_SCANS - 1):]
-                     if BOSCH_MIRROR_BIRTH_HIST_SCANS > 1 else [])
+        neg_sin, travel = -sin_theta, v_ego * dt
+        # Move only the scans that stay in history; the per-point arithmetic is unchanged.
+        kept = (self.hist[-(BOSCH_MIRROR_BIRTH_HIST_SCANS - 1):]
+                if BOSCH_MIRROR_BIRTH_HIST_SCANS > 1 else [])
+        self.hist = [(scan_ns, [(cos_theta * (x1 := x - travel) + sin_theta * y,
+                                 neg_sin * x1 + cos_theta * y, raw_id)
+                                for x, y, raw_id in points])
+                     for scan_ns, points in kept]
     self.last_ns = timestamp_ns
 
     # Physical IDs are never reused. Keep birth guards for coasting live IDs,
