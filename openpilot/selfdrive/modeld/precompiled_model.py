@@ -15,6 +15,7 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from openpilot.selfdrive.modeld.big_model import active_manifest, model_cache_dir, model_path
+from openpilot.selfdrive.modeld.precompiled_artifact import SERIALIZATIONS
 
 PROTOCOL = 1
 MAX_CATALOG = 64 * 1024
@@ -28,6 +29,9 @@ def sha256(path: Path) -> str:
 
 def validate_catalog(value: dict, model_sha: str, catalog_url: str) -> dict:
   generic = value.get('format') == 'comma-generic-onnx'
+  serialization = value.get('serialization', 'oob-v1')
+  if serialization not in SERIALIZATIONS or (serialization != 'oob-v1' and not generic):
+    raise ValueError('unsupported precompiled serialization')
   identity = 'model_sha256' if generic else 'onnx_sha256'
   if value.get('protocol') != PROTOCOL or value.get(identity) != model_sha:
     raise ValueError('precompiled model does not match the selected ONNX/protocol')
@@ -117,6 +121,27 @@ def installed(model=None, cache_dir: Path | None = None) -> Path | None:
     return None
 
 
+def retry_usb_rejection(root: Path, pickle_sha256: str) -> bool:
+  """Migrate the old USB-I/O misclassification only after a device reboot.
+
+  This grants another verified load attempt, never a validation receipt.
+  Missing/mismatched diagnostics and actual model errors remain rejected.
+  """
+  from openpilot.selfdrive.modeld.egpu_worker_progress import boot_identity
+  try:
+    failure = json.loads((root / 'last_failure.json').read_text())
+    current_boot = boot_identity()
+    return (isinstance(failure, dict) and failure.get('rejected') is True and
+            failure.get('pickle_sha256') == pickle_sha256 and
+            failure.get('phase') in ('load', 'boot_validation') and
+            isinstance(failure.get('boot_id'), str) and bool(failure['boot_id']) and
+            bool(current_boot) and failure['boot_id'] != current_boot and
+            isinstance(failure.get('error'), str) and
+            'bulk out 0x02 failed: input/output error' in failure['error'].lower())
+  except (OSError, ValueError, TypeError):
+    return False
+
+
 def ensure_precompiled(model=None, cache_dir: Path | None = None, progress=None) -> Path | None:
   model = model or active_manifest()
   if model is None:
@@ -135,7 +160,10 @@ def ensure_precompiled(model=None, cache_dir: Path | None = None, progress=None)
   value = validate_catalog(json.loads(data), model.sha256, catalog_url)
   # A runtime rejected on this device must use the local compiler until the artifact changes.
   if (root / 'rejected').exists() and (root / 'rejected').read_text() == value['pickle']['sha256']:
-    return None
+    if not retry_usb_rejection(root, value['pickle']['sha256']):
+      return None
+    (root / 'boot_validation.json').unlink(missing_ok=True)
+    print('Retrying model rejected by an earlier-boot USB transfer failure; revalidating artifacts.')
   root.mkdir(parents=True, exist_ok=True)
   target = root / 'model.pkl'
   if value['format'] == 'comma-generic-onnx' and not target.exists():

@@ -321,7 +321,9 @@ Onroad에서는 본체 UI가 CPU 6번, 외부 HUD가 CPU 7번을 일반 스케�
 
 `ShowRouteInfo` 설명에 남아 있는 APN 표기는 경로 정보 입력 상태를 뜻합니다. 이를 CarrotMan 또는 CarrotLink 지원 안내로 해석하면 안 됩니다.
 
-`ShowCustomBrightness=0`은 주변 밝기에 따른 자동 조절이고, `ShowModelView`는 카메라와 모델 표시 조합을 선택합니다. `ShowCameraWithCluster=0`은 외부 HUD 연결 중 본체 카메라를 숨기는 기존 기본 동작이고, `1`은 본체 카메라 영상을 표시합니다. `ClusterHud` 계열은 지원되는 외부 HUD를 연결한 경우에만 사용하세요.
+`ShowCustomBrightness=0`은 주변 밝기에 따른 자동 조절입니다. `ShowCameraWithCluster=0`은 외부 HUD 연결 중 본체 카메라를 숨기는 기존 기본 동작이고, `1`은 본체 카메라 영상을 표시합니다. `ClusterHud` 계열은 지원되는 외부 HUD를 연결한 경우에만 사용하세요.
+
+`ShowModelView`(주행화면 구성)는 C4에서 `0` 카메라 + 차선·경로, `1` 카메라만, `2` 검은 배경에 차선·경로만, `3` 둘 다 숨김을 선택합니다. 차선·경로 그림에는 앞차 표시도 포함됩니다. 자동 밝기와 100%를 포함한 모든 밝기 설정에서 적용되며, 주행 시작 후 별도의 대기 시간은 없습니다. 주행 중 변경하면 재부팅 없이 약 5초 안에 반영됩니다. 속도·경고·운전자 상태는 계속 표시되고, 카메라 촬영·주행 판단·차량 제어는 바뀌지 않습니다. C3/C3X에는 적용되지 않습니다. 외부 HUD 연결 중 `ShowCameraWithCluster=0`이면 이 선택과 관계없이 본체의 카메라와 차선·경로를 모두 숨깁니다.
 
 `ClusterHudBrightness=0`은 카메라 노출값을 따르는 자동 밝기이고, `1~100`은 고정 밝기입니다. `ClusterHudOrientation`은 `0`(0도)과 `2`(180도)만 지원하며 `1`, `3`은 무시합니다. 실행 중인 TURZX 프로세스는 두 저장값을 100ms마다 확인합니다. 밝기는 실행 중 적용되고, 관리형 H.264의 회전값이 바뀌면 HUD가 자동 재시작되어 캡처와 동일한 스트림 설정 절차로 적용됩니다.
 
@@ -369,14 +371,12 @@ Carrot Vision에는 `carrot_settings.json` 카탈로그와 별도로 **AR 표시
 | 중분류 | 파라미터 | 용도 |
 |---|---|---|
 | 녹화·전원 | `RecordRoadCam`, `MaxTimeOffroadMin` | 도로 카메라 저장과 시동 OFF 후 자동 전원 종료 시간 |
-| YouTube 라이브 | `CarrotYouTubeLive`, `CarrotYouTubeQuality`, `CarrotYouTubeTimestamp` | 카메라 영상 송출, 품질과 타임스탬프 |
 | 네트워크·지도 | `HotspotOnBoot`, `MapboxStyle` | 부팅 시 핫스팟과 지도 배경 스타일 |
 | 사운드 | `SoundLanguageSetting`, `SoundVolumeAdjust`, `SoundVolumeAdjustEngage` | 안내음 언어와 일반·인게이지 볼륨 |
 | 소프트웨어 | `SoftwareMenu` | Carrot Web의 소프트웨어 메뉴 활성화 |
 
 - `RecordRoadCam`: `0` 녹화 안 함, `1` 일반 카메라, `2` 일반+광각 카메라입니다. 저장 공간 사용량을 확인하세요.
 - `MaxTimeOffroadMin`: 시동이 꺼진 뒤 장치가 자동으로 꺼질 때까지의 시간입니다.
-- `CarrotYouTubeLive`: 네트워크 사용량, 발열과 개인정보 노출 가능성을 함께 확인하세요.
 - `HotspotOnBoot`: USIM을 장착한 장치에서 자동 핫스팟을 사용할 때의 설정입니다.
 - `SoftwareMenu`: 메모리 문제가 있을 때 끌 수 있는 Carrot Web 메뉴 설정입니다.
 
