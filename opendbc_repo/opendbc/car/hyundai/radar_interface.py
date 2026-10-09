@@ -486,6 +486,7 @@ from opendbc.car.hyundai.radar_bosch import (  # noqa: E402
   _bosch_raw_assignment,
   BoschRawTrackManager,
   BoschGroupingConfig,
+  BoschModelSnapshot,
   BoschVisionCue,
   BoschPublishedSurface,
   BoschPhysicalObject,
@@ -701,23 +702,34 @@ class RadarInterface(RadarInterfaceBase):
     else:
       self._bosch_last_model = (model, model_ns)
     yaw = None
-    angular = getattr(pose, 'angularVelocityDevice', None)
-    if (pose is not None and 0 <= now_ns - pose_ns <= 200_000_000 and
-        pose.inputsOK and pose.sensorsOK and angular is not None and angular.valid and math.isfinite(angular.z)):
-      yaw = -float(angular.z)
+    if pose is not None and 0 <= now_ns - pose_ns <= 200_000_000:
+      # pose is an immutable message reused at 100 Hz; read its fields once.
+      cached = getattr(self, '_bosch_pose_yaw', None)
+      if cached is None or cached[0] is not pose:
+        angular = getattr(pose, 'angularVelocityDevice', None)
+        pose_yaw = None
+        if pose.inputsOK and pose.sensorsOK and angular is not None and angular.valid and math.isfinite(angular.z):
+          pose_yaw = -float(angular.z)
+        cached = self._bosch_pose_yaw = (pose, pose_yaw)
+      yaw = cached[1]
     self.bosch.b5_birth_defer.ingest_pose(int(pose_ns), yaw)
     cues = ()
     path = ()
     source_ns = 0
     if model is not None and 0 <= now_ns - model_ns <= 200_000_000:
-      self.bosch.road_edge_filter.ingest_model(model, int(model_ns))
-      self.bosch.b5_birth_defer.ingest_model(model, int(model_ns))
-      self.bosch.mirror_m3_shadow.ingest_model(model, int(model_ns))
-      if model.leadsV3:
-        lead = model.leadsV3[0]
-        if lead.x and lead.y:
-          # Same model-to-radar coordinates as the existing primary matcher.
-          cues = (BoschVisionCue(float(lead.x[0]) - 1.52, -float(lead.y[0]), float(lead.prob)),)
+      # One plain snapshot per message, keyed like the path cache below by its
+      # stamp (and object). Keeping two covers a held-back newer message
+      # (model_ns > now_ns above) alternating with the accepted one.
+      snapshots = getattr(self, '_bosch_model_snapshots', ())
+      snapshot = next((snap for source, ns, snap in snapshots if source is model and ns == model_ns), None)
+      if snapshot is None:
+        snapshot = BoschModelSnapshot(model)
+        self._bosch_model_snapshots = snapshots[-1:] + ((model, model_ns, snapshot),)
+      self.bosch.road_edge_filter.ingest_model(snapshot, int(model_ns))
+      self.bosch.b5_birth_defer.ingest_model(snapshot, int(model_ns))
+      self.bosch.mirror_m3_shadow.ingest_model(snapshot, int(model_ns))
+      cues = snapshot.cues
+      model = snapshot
       if self._bosch_path_ns != model_ns:
         position = getattr(model, 'position', None)
         self._bosch_path = tuple(zip(position.x, position.y)) if position is not None else ()

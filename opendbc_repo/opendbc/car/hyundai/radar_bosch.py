@@ -2307,6 +2307,47 @@ class BoschVisionCue:
   lateral_tolerance_m: float = 1.5
 
 
+def _bosch_sample_ns(row):
+  return row[0]
+
+
+class _BoschModelLine:
+  __slots__ = ('x', 'y')
+
+  def __init__(self, line):
+    self.x = tuple(line.x)
+    self.y = tuple(line.y)
+
+
+class BoschModelSnapshot:
+  """Plain copy of the modelV2 fields Bosch reads, taken once per message.
+
+  The context is set at 100 Hz while modelV2 changes at 20 Hz, and three
+  consumers read the same road edges. Reading the capnp lists once leaves the
+  values unchanged; only the repeated capnp access goes away. Never modified
+  after construction; consumers may rely on that for the same object.
+  """
+  __slots__ = ('timestampEof', 'roadEdges', 'laneLines', 'position', 'roadEdgeStds',
+               'laneLineProbs', 'laneLineStds', 'cues')
+
+  def __init__(self, model):
+    self.timestampEof = getattr(model, 'timestampEof', 0)
+    self.roadEdges = tuple(_BoschModelLine(edge) for edge in getattr(model, 'roadEdges', ()))
+    self.laneLines = tuple(_BoschModelLine(lane) for lane in getattr(model, 'laneLines', ()))
+    position = getattr(model, 'position', None)
+    self.position = _BoschModelLine(position) if position is not None else None
+    self.roadEdgeStds = tuple(getattr(model, 'roadEdgeStds', ()))
+    self.laneLineProbs = tuple(getattr(model, 'laneLineProbs', ()))
+    self.laneLineStds = tuple(getattr(model, 'laneLineStds', ()))
+    cues = ()
+    if model.leadsV3:
+      lead = model.leadsV3[0]
+      if lead.x and lead.y:
+        # Same model-to-radar coordinates as the existing primary matcher.
+        cues = (BoschVisionCue(float(lead.x[0]) - 1.52, -float(lead.y[0]), float(lead.prob)),)
+    self.cues = cues
+
+
 @dataclass(frozen=True)
 class BoschPublishedSurface:
   """The one member whose geometry downstream receives for a physical object.
@@ -4954,7 +4995,7 @@ class BoschBirthB5Defer:
     else:
       samples.append(sample)
     cutoff = timestamp_ns - horizon_ns
-    first = bisect.bisect_left([row[0] for row in samples], cutoff)
+    first = bisect.bisect_left(samples, cutoff, key=_bosch_sample_ns)
     if first:
       del samples[:first]
     if len(samples) > maximum:
@@ -4990,7 +5031,12 @@ class BoschBirthB5Defer:
       return
 
     def points(polyline):
-      return tuple((float(x), float(y)) for x, y in zip(polyline.x, polyline.y, strict=False)
+      xs, ys = polyline.x, polyline.y
+      # A non-finite member makes the sum non-finite, so this path only skips
+      # a filter that would have removed nothing.
+      if math.isfinite(sum(xs) + sum(ys)):
+        return tuple(zip(map(float, xs), map(float, ys), strict=False))
+      return tuple((float(x), float(y)) for x, y in zip(xs, ys, strict=False)
                    if math.isfinite(x) and math.isfinite(y))
 
     context = BoschB5ModelContext(
@@ -6064,6 +6110,7 @@ class BoschRoadEdgePublicationFilter:
     self.model_edges.clear()
     self.publication_model_edges.clear()
     self._validated_lines = None
+    self._last_ingest = None
     self.source_model_ns = None
     self.would_suppress = frozenset()
 
@@ -6072,6 +6119,16 @@ class BoschRoadEdgePublicationFilter:
     self.last_ns = None
 
   def ingest_model(self, model, model_ns):
+    # The context arrives at 100 Hz with the same 20 Hz message. A snapshot is
+    # never modified after construction, so repeating the last ingest of the
+    # same one rebuilds identical lists; only its clearing of would_suppress
+    # for an unusable sample has an effect. Other inputs are compared by content.
+    last = getattr(self, '_last_ingest', None)
+    if (last is not None and last[0] is model and last[1] == model_ns and
+        type(model) is BoschModelSnapshot):
+      if last[2]:
+        self.would_suppress = frozenset()
+      return
     # Keep invalid samples too: an uncertain current edge must not silently
     # fall back to a previously confident one.
     sample = publication_sample = None
@@ -6107,6 +6164,7 @@ class BoschRoadEdgePublicationFilter:
     self.model_edges = self.model_edges[-4:]
     if sample is None:
       self.would_suppress = frozenset()
+    self._last_ingest = (model, model_ns, sample is None)
 
   def update(self, objects, timestamp_ns, *, valid=True, camera_associations=None, word0_pids=()):
     self.would_suppress = frozenset()

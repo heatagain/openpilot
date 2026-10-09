@@ -1304,6 +1304,21 @@ class TestBoschB5BirthDefer:
     assert b5.pose_samples[-1] is pose_sample
     assert b5.model_contexts[-1] is model_context
 
+  def test_model_context_drops_only_non_finite_points(self):
+    b5 = BoschBirthB5Defer(BOSCH_B5_ACTIVE)
+
+    def line(y, x=(0., 10., 20.)):
+      return SimpleNamespace(x=x, y=(y, y, y))
+
+    model = SimpleNamespace(
+      timestampEof=self.START_NS - 30_000_000, roadEdges=(line(-3.), line(3.)),
+      roadEdgeStds=(.1, .1), laneLines=(line(-2.), line(-.7, (0., math.nan, 20.)), line(.7), line(2.)),
+      laneLineProbs=(1., 1., 1., 1.), laneLineStds=(.1, .1, .1, .1), position=line(0.))
+    b5.ingest_model(model, self.START_NS)
+    context = b5.model_contexts[-1]
+    assert context.lane_lines[0] == ((0., -2.), (10., -2.), (20., -2.))
+    assert context.lane_lines[1] == ((0., -.7), (20., -.7))
+
   def test_249_is_fail_open_and_250_is_eligible(self):
     _, _, before = self.birth(self.prime(248), scan_index=249)
     _, _, at = self.birth(self.prime(249), scan_index=250)

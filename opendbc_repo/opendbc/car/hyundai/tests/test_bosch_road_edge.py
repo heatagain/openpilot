@@ -4,7 +4,8 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from opendbc.car.hyundai.radar_bosch import BoschPhysicalObject, BoschRoadEdgePublicationFilter
+from opendbc.car.hyundai.radar_bosch import (BoschModelSnapshot, BoschPhysicalObject, BoschRoadEdgePublicationFilter,
+                                             BoschVisionCue)
 from opendbc.car.hyundai.radar_interface import RadarInterface
 
 
@@ -234,3 +235,36 @@ def test_future_pose_keeps_previous_yaw():
   assert all(ns <= T + 10_000_000 for ns, _ in recorder.poses)
   RadarInterface.set_bosch_context(interface, T + 20_000_000, pose=_pose(.3), pose_ns=T + 12_000_000)
   assert interface._bosch_context[1] == -.3
+
+
+def test_context_reads_each_model_message_once():
+  # The context runs at 100 Hz with the same 20 Hz modelV2. One snapshot serves
+  # every consumer; repeating it leaves the road-edge lists untouched.
+  interface, _ = _context_interface()
+  sample = _context_model()
+  RadarInterface.set_bosch_context(interface, T, model=sample, model_ns=T - 10_000_000)
+  first = interface._bosch_context
+  edges = interface.bosch.road_edge_filter.model_edges
+  RadarInterface.set_bosch_context(interface, T + 10_000_000, model=sample, model_ns=T - 10_000_000)
+  assert interface.bosch.road_edge_filter.model_edges is edges
+  assert interface._bosch_context[1:] == first[1:]
+  assert first[2] == (BoschVisionCue(30.0 - 1.52, -0.5, .9),)
+  assert first[3] == ((0.0, 0.0), (50.0, 0.0))
+  assert len(interface._bosch_model_snapshots) == 1
+  RadarInterface.set_bosch_context(interface, T + 20_000_000, model=_context_model(1.0), model_ns=T + 15_000_000)
+  assert interface.bosch.road_edge_filter.model_edges is not edges
+  assert interface._bosch_context[3][0] == (1.0, 0.0)
+
+
+def test_repeated_snapshot_still_clears_for_unusable_edges():
+  f = BoschRoadEdgePublicationFilter()
+  bad = _context_model()
+  bad.roadEdgeStds = (2., 2.)
+  bad = BoschModelSnapshot(bad)
+  f.ingest_model(bad, T)
+  f.would_suppress = frozenset({1})
+  f.ingest_model(bad, T)
+  assert not f.would_suppress
+  f.invalidate_model()
+  f.ingest_model(bad, T)
+  assert f.model_edges == [(T, None)]
