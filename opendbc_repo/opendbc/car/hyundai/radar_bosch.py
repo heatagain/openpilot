@@ -5588,6 +5588,22 @@ class BoschLeadAccelerationEstimator:
 
 _BOSCH_POINT_FIELD_NAMES = ('trackId', 'dRel', 'yRel', 'vRel', 'aRel', 'yvRel', 'jLead', 'aLead', 'vLead',
                             'radarSource', 'trackState', 'measured')
+# (schema, fields) of the last RadarPoint schema written. Every `.schema` access
+# builds a new wrapper whose `fields` dict refers back to it; radarcan runs with
+# gc disabled, so reading `fields` per publication leaked that cycle (2.5 kB, 185 MB/h
+# on device). Fields are read once per loaded schema; a field of another loaded
+# schema would be rejected by the setter, hence the schema comparison.
+_bosch_point_fields_cache = None
+
+
+def _bosch_point_fields(point):
+  global _bosch_point_fields_cache
+  schema = point.schema
+  cache = _bosch_point_fields_cache
+  if cache is None or not cache[0] == schema:
+    fields = schema.fields
+    cache = _bosch_point_fields_cache = (schema, tuple(fields[name] for name in _BOSCH_POINT_FIELD_NAMES))
+  return cache[1]
 
 
 def bosch_fill_point(point, obj, v_ego, alias=None, a_lead=math.nan):
@@ -5630,11 +5646,10 @@ def bosch_append_points(radar, objects, v_ego, now_ns, alias=None, a_lead_by_pid
   points = radar.init('points', offset + len(objects))
   for index, values in enumerate(previous):
     points[index] = values
-  # The same writes as bosch_fill_point, through schema fields looked up once
-  # per publication instead of an attribute lookup per field and point.
-  fields = points[offset].schema.fields
+  # The same writes as bosch_fill_point, through cached schema fields instead of
+  # an attribute lookup per field and point.
   (f_track, f_d, f_y, f_v, f_a_rel, f_yv, f_jerk, f_a_lead, f_v_lead, f_source, f_state,
-   f_measured) = (fields[name] for name in _BOSCH_POINT_FIELD_NAMES)
+   f_measured) = _bosch_point_fields(points[offset])
   nan = math.nan
   for index, obj in enumerate(objects, offset):
     point = points[index]

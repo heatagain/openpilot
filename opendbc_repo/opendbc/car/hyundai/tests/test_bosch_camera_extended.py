@@ -1,3 +1,4 @@
+import gc
 import math
 import sys
 from dataclasses import replace
@@ -2462,3 +2463,19 @@ def test_append_keeps_earlier_points_and_writes_what_fill_point_writes():
   bosch_fill_point(expected, obj, 10., {obj.physical_track_id: 7}, .5)
   expected.dRel += expected.vRel * (10_000_000 * 1e-9)
   assert msg.points[1].copy().to_bytes() == expected.copy().to_bytes()
+
+
+def test_append_points_leaves_no_reference_cycle():
+  # radarcan runs with gc disabled, so a reference cycle per publication is never
+  # freed; reading schema.fields per publication leaked 185 MB/h on device.
+  ns = 1_000_000_000
+  obj = physical(1_000_001, 16.25, .5, 2., ns)
+  bosch_append_points(structs.RadarData.new_message(), (obj,), 10., ns)
+  gc.collect()
+  gc.disable()
+  try:
+    for _ in range(20):
+      bosch_append_points(structs.RadarData.new_message(), (obj,), 10., ns)
+    assert gc.collect() == 0
+  finally:
+    gc.enable()
