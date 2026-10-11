@@ -1,9 +1,15 @@
-# Bosch mature group retention: inactive experimental port
+# Bosch mature group retention: world-robust guard, default ON
+
+**현재 상태 (2026-10-04부터):** `BoschRadarProvider(..., mature_group_retention=True)`가 기본값이며,
+world-robust surface guard가 함께 적용됩니다. 내용은 아래
+[2026-10-04 world-robust surface guard and default activation](#2026-10-04-world-robust-surface-guard-and-default-activation)
+절을 보세요. bare `BoschGroupingConfig`는 계속 `mature_retention_enabled=False`이고, 명시적 opt-out도 유지됩니다.
+바로 아래 2026-10-03 절은 처음 이식할 때(기본 OFF)의 기록입니다.
 
 2026-10-03, `heatagain/bosch-radar-tracks`, pre-edit HEAD
 `c75fc0ae5a6ea6b2cf084d99d42017069148db23`.
 
-## 적용 범위와 기본 동작
+## 2026-10-03 최초 이식: 적용 범위와 기본 동작 (당시 기본 OFF)
 
 `SHAPE_MEMORY_2000` 연구 후보를 `radar_bosch.py`의 명시적 인증서 타입과
 `_BoschMatureGroupRetention`으로 이식했습니다. 기본값은
