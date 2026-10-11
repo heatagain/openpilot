@@ -16,7 +16,8 @@ The patch is based on `ajouatom/openpilot.wiki.git` commit
 `d7117c2db74a5e683f9e8d4d2338ac68bebabff0` and corresponds to Wiki commit
 `6fba8803dec100aeaecd9d4751bc205402699f78`. The Bosch behavior was verified on
 the Bosch code branch; the text explicitly applies to versions supporting this
-receiver.
+receiver. The candidate-platform wording (Elantra AD plus unvalidated i30 PD, Kona,
+Kona Electric and K3 BD/Forte) was added on 2026-10-12, after that Wiki commit.
 
 From a Wiki checkout, use the absolute path to this patch:
 

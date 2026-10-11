@@ -48,7 +48,7 @@ from opendbc.car.hyundai.radar_interface import (
   deduplicate_corner_candidates,
 )
 from opendbc.car.radar_tracks import MyTrack
-from opendbc.car.hyundai.values import CAR, HyundaiExtFlags, HyundaiFlags
+from opendbc.car.hyundai.values import BOSCH_MRREVO14F_CAR, CAR, HyundaiExtFlags, HyundaiFlags, bosch_mrrevo14f_bus
 
 
 class TestBoschRectangularCertificate:
@@ -3596,3 +3596,43 @@ def test_recursive_matching_releases_closure_with_gc_disabled(solver, outcome):
     sys.setprofile(previous_profile)
     if previously_enabled:
       gc.enable()
+
+
+class TestBoschMrrevo14fDetection:
+  CAM, ACAN = 2, 1
+
+  @staticmethod
+  def _objects(dlc=8, skip=None):
+    return {addr: dlc for addr in range(0x601, 0x613) if addr != skip}
+
+  @pytest.mark.parametrize("candidate", sorted(BOSCH_MRREVO14F_CAR))
+  def test_candidates_select_the_camera_bus(self, candidate):
+    fingerprint = {0: {0x100: 8}, self.CAM: self._objects()}
+    assert bosch_mrrevo14f_bus(candidate, 0, fingerprint, (self.CAM, self.ACAN)) == self.CAM
+
+  def test_acan_wiring_and_camera_preference(self):
+    only_acan = {self.ACAN: self._objects()}
+    both = {self.CAM: self._objects(), self.ACAN: self._objects()}
+    assert bosch_mrrevo14f_bus(CAR.KIA_FORTE, 0, only_acan, (self.CAM, self.ACAN)) == self.ACAN
+    assert bosch_mrrevo14f_bus(CAR.KIA_FORTE, 0, both, (self.CAM, self.ACAN)) == self.CAM
+
+  @pytest.mark.parametrize("objects", [dict(skip=0x612), dict(skip=0x601), dict(dlc=7)])
+  def test_incomplete_object_set_is_not_bosch(self, objects):
+    fingerprint = {self.CAM: self._objects(**objects)}
+    assert bosch_mrrevo14f_bus(CAR.HYUNDAI_ELANTRA, 0, fingerprint, (self.CAM, self.ACAN)) is None
+
+  def test_objects_split_across_buses_are_not_bosch(self):
+    fingerprint = {self.CAM: {a: 8 for a in range(0x601, 0x60a)}, self.ACAN: {a: 8 for a in range(0x60a, 0x613)}}
+    assert bosch_mrrevo14f_bus(CAR.HYUNDAI_ELANTRA, 0, fingerprint, (self.CAM, self.ACAN)) is None
+
+  @pytest.mark.parametrize("candidate", [CAR.HYUNDAI_KONA_HEV, CAR.KIA_NIRO_EV, CAR.HYUNDAI_SONATA])
+  def test_other_platforms_stay_off(self, candidate):
+    assert candidate not in BOSCH_MRREVO14F_CAR
+    assert bosch_mrrevo14f_bus(candidate, 0, {self.CAM: self._objects()}, (self.CAM, self.ACAN)) is None
+
+  def test_canfd_flag_stays_off(self):
+    fingerprint = {self.CAM: self._objects()}
+    assert bosch_mrrevo14f_bus(CAR.HYUNDAI_ELANTRA, int(HyundaiFlags.CANFD), fingerprint, (self.CAM, self.ACAN)) is None
+
+  def test_candidates_are_not_canfd_platforms(self):
+    assert all(not car.config.flags & HyundaiFlags.CANFD for car in BOSCH_MRREVO14F_CAR)

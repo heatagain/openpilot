@@ -270,7 +270,7 @@ VW MEB(ID.4 포함)에도 수동 조향비와 학습 비율이 적용됩니다. 
 
 `RadarTrackFlip`은 `0: 정상`(기본값), `1: 좌우 반전`입니다. 전방 레이더 트랙의 좌우 위치·횡속도를 함께 반전하여 선행차 선택과 표시에 적용하며 SCC·코너·비전은 그대로 유지합니다. 차종별 자동 반전은 없고, 실제 좌우 불일치가 확인된 차량에서만 사용합니다. 변경 후 재시동 또는 재부팅하면 다음 OnRoad 시작부터 적용됩니다. [레이더 좌우 반전](radar.md#radar-track-flip)을 참고하세요.
 
-Bosch MRRevo14F 수신을 지원하는 버전에서 아반떼 AD의 Bosch 메시지 그룹이 감지되고 `EnableRadarTracks=1`~`3`이면, 이미 전송 중인 트랙을 passive 방식으로 수신하며 시작 시 레이더 활성화 UDS 쓰기와 SCC ECU 통신 비활성화를 건너뜁니다. `EnableRadarTracksResult`는 갱신하지 않으므로 실제 수신·CAN 유효성·레이더 오류로 확인하세요. passive는 차량 제어 전체가 꺼진다는 뜻이 아닙니다. [Bosch passive 수신 예외](radar.md#bosch-passive-reception)를 참고하세요.
+Bosch MRRevo14F 수신을 지원하는 버전에서 Bosch MRRevo14F 후보 차종(실차 검증은 아반떼 AD뿐)의 Bosch 메시지 그룹이 감지되고 `EnableRadarTracks=1`~`3`이면, 이미 전송 중인 트랙을 passive 방식으로 수신하며 시작 시 레이더 활성화 UDS 쓰기와 SCC ECU 통신 비활성화를 건너뜁니다. `EnableRadarTracksResult`는 갱신하지 않으므로 실제 수신·CAN 유효성·레이더 오류로 확인하세요. passive는 차량 제어 전체가 꺼진다는 뜻이 아닙니다. [Bosch passive 수신 예외](radar.md#bosch-passive-reception)를 참고하세요.
 
 `EnableRadarTracks=1`~`3`에서는 확인된 프런트 선행차의 바깥쪽 레이더 움직임과 비전의 먼 차량 전환이 일치하면 ACC의 미래 추종 거리 요구를 제한적으로 완화합니다. [CUT-OUT 예측 처리](radar.md)를 참고하세요.
 - `CarrotRadarMode`: 전방·코너 레이더로 차량의 움직임을 계속 추적해 끼어드는 차량을 감지하고, 카메라 영상과 레이더 정보를 새로운 방식으로 맞춰 앞차를 선택합니다. 코너 레이더와 레이더 트랙 기능이 모두 없는 차량에서는 기존 방식과 동일하게 동작합니다. 가감속 동작이 달라질 수 있으므로 검증을 마친 동일 차량에서만 켭니다. 변경값은 다음 OnRoad가 시작될 때 고정되므로, 변경 후 현재 주행을 끝내고 차량을 재시동하거나 기기를 재부팅해야 적용됩니다. 기존 `RadarMotionMode` 값은 업데이트 후 처음 시작할 때 새 이름으로 한 번 자동 이관됩니다.

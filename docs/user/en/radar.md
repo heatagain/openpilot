@@ -29,7 +29,7 @@ On non-CAN FD Hyundai/Kia vehicles, a positive value normally attempts to enable
 <a id="bosch-passive-reception"></a>
 ### Bosch MRRevo14F passive reception exception
 
-In versions supporting Bosch MRRevo14F reception, the Bosch path is selected for a non-CAN FD Elantra AD (`HYUNDAI_ELANTRA`) when startup CAN detection finds every message from `0x601` through `0x612`, each eight bytes long, on the same receive bus. Detection prefers the camera wiring bus and also supports the alternate ACAN bus; harness connector names alone do not identify the receive bus.
+In versions supporting Bosch MRRevo14F reception, the Bosch path is selected for a non-CAN FD Bosch MRRevo14F candidate platform (Elantra AD `HYUNDAI_ELANTRA`, i30 PD `HYUNDAI_ELANTRA_GT_I30`, Kona `HYUNDAI_KONA`, Kona Electric `HYUNDAI_KONA_EV`/`HYUNDAI_KONA_EV_2022`, K3 BD/Forte `KIA_FORTE`) when startup CAN detection finds every message from `0x601` through `0x612`, each eight bytes long, on the same receive bus. Only the Elantra AD is vehicle-validated; the other platforms are unvalidated candidates that enable this path only when the same messages are detected. Detection prefers the camera wiring bus and also supports the alternate ACAN bus; harness connector names alone do not identify the receive bus.
 
 With this Bosch path and `EnableRadarTracks=1`, `2`, or `3`, the provider passively receives object messages the radar already transmits. Startup skips both the UDS configuration write used to enable radar tracks and the request to disable SCC ECU communication.
 

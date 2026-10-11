@@ -29,7 +29,7 @@
 <a id="bosch-passive-reception"></a>
 ### Bosch MRRevo14F의 passive 수신 예외
 
-Bosch MRRevo14F 수신을 지원하는 버전에서는 비-CAN FD 아반떼 AD(`HYUNDAI_ELANTRA`)의 시작 시 CAN 메시지 감지에서 `0x601~0x612` 전체가 같은 수신 버스에 각각 8바이트로 확인되면 Bosch 경로를 선택합니다. 카메라 연결 버스를 먼저 확인하고 대체 ACAN 버스도 지원하며, 하네스 커넥터 이름만으로 수신 버스를 판단하지 않습니다.
+Bosch MRRevo14F 수신을 지원하는 버전에서는 비-CAN FD Bosch MRRevo14F 후보 차종(아반떼 AD `HYUNDAI_ELANTRA`, i30 PD `HYUNDAI_ELANTRA_GT_I30`, 코나 `HYUNDAI_KONA`, 코나 일렉트릭 `HYUNDAI_KONA_EV`·`HYUNDAI_KONA_EV_2022`, K3 BD/Forte `KIA_FORTE`)의 시작 시 CAN 메시지 감지에서 `0x601~0x612` 전체가 같은 수신 버스에 각각 8바이트로 확인되면 Bosch 경로를 선택합니다. 실차로 검증한 차종은 아반떼 AD뿐이며, 나머지는 같은 메시지가 감지될 때만 켜지는 미검증 후보입니다. 카메라 연결 버스를 먼저 확인하고 대체 ACAN 버스도 지원하며, 하네스 커넥터 이름만으로 수신 버스를 판단하지 않습니다.
 
 이 Bosch 경로에서 `EnableRadarTracks=1`·`2`·`3`을 선택하면 레이더가 이미 전송하는 객체 메시지를 passive 방식으로 수신합니다. 시작 시 레이더 트랙 활성화를 위한 UDS 설정 쓰기와 SCC ECU 통신 비활성화 요청을 건너뜁니다.
 

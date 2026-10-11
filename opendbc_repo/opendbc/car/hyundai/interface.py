@@ -4,7 +4,7 @@ from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, CANFD_RADAR_SCC_C
                                                    CANFD_UNSUPPORTED_LONGITUDINAL_CAR, \
                                                    UNSUPPORTED_LONGITUDINAL_CAR, HyundaiSafetyFlags, HyundaiExtFlags, \
                                                    CANFD_HYBRID_STATUS_ADDR, CANFD_HYBRID_STATUS_DLC, \
-                                                   EV_MODE_STATUS_ADDR, EV_MODE_STATUS_DLC
+                                                   EV_MODE_STATUS_ADDR, EV_MODE_STATUS_DLC, bosch_mrrevo14f_bus
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.disable_ecu import disable_ecu
@@ -47,16 +47,12 @@ class CarInterface(CarInterfaceBase):
     hda2 = hda2 or params.get_int("CanfdHDA2") > 0
     CAN = CanBus(None, fingerprint, hda2)
 
-    # Bosch already streams objects on the rewired radar/camera bus. Select one
-    # observed receive bus; Panda connector names must not be treated as src IDs.
     # Prefer the current camera wiring, while supporting recorded src=1 wiring.
-    if candidate == CAR.HYUNDAI_ELANTRA and not ret.flags & HyundaiFlags.CANFD:
-      for bus in (CAN.CAM, CAN.ACAN):
-        if all(fingerprint.get(bus, {}).get(addr) == 8 for addr in range(0x601, 0x613)):
-          ret.extFlags |= HyundaiExtFlags.BOSCH_RADAR.value
-          if bus == CAN.ACAN:
-            ret.extFlags |= HyundaiExtFlags.BOSCH_RADAR_BUS1.value
-          break
+    bosch_bus = bosch_mrrevo14f_bus(candidate, ret.flags, fingerprint, (CAN.CAM, CAN.ACAN))
+    if bosch_bus is not None:
+      ret.extFlags |= HyundaiExtFlags.BOSCH_RADAR.value
+      if bosch_bus == CAN.ACAN:
+        ret.extFlags |= HyundaiExtFlags.BOSCH_RADAR_BUS1.value
 
     if ret.flags & HyundaiFlags.CANFD:
       # Shared configuration for CAN-FD cars
